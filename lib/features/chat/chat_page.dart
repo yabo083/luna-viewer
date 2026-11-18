@@ -171,6 +171,37 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   LiveState _live = LiveState.idle;
 
+  /// 中止请求在途：按钮暂时置灰，避免连点发出两次 cancel。
+  bool _cancelling = false;
+
+  /// 本轮生成计时：从本轮开始（首个 running 事件 / 首个 active snapshot）到 settled。
+  /// `null` = 信息栏不显示计时；结束后冻结 [_clockHold] 再消失，让用户看到总耗时。
+  /// 只有订阅它的那个小 Text 重建，列表与页面不随每秒 tick 刷新。
+  final ValueNotifier<Duration?> _elapsed = ValueNotifier<Duration?>(null);
+  Timer? _clockTick;
+  Timer? _clockHoldTimer;
+  DateTime? _roundStart;
+
+  /// 结束后总耗时停留的时间：够看清一眼，又不至于一直占着信息栏。
+  static const _clockHold = Duration(seconds: 2);
+
+  /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
+  /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
+  Timer? _probeDelay;
+  Timer? _probeTimer;
+  Timer? _probeDeadline;
+  DateTime? _probeStartedAt;
+
+  /// 最近一次收到 `/live` 帧（含 snapshot）：探测用它判断流是不是真的在说话。
+  DateTime? _lastLiveAt;
+
+  static const _probeDelaySpan = Duration(seconds: 6);
+  static const _probeInterval = Duration(seconds: 3);
+  static const _probeSpan = Duration(seconds: 45);
+
+  /// 打开页面前几秒收到的是平台流回放的历史消息，不参与本轮起止判断。
+  static const _replayWindow = Duration(seconds: 3);
+
   bool _awayFromBottom = false;
   final ValueNotifier<int> _unseen = ValueNotifier<int>(0);
 
@@ -204,6 +235,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     );
     // 列表页的 running 只做乐观值：首个 snapshot 到达后一律以服务端为准。
     _live = (_session?.running ?? false) ? LiveState.thinking : LiveState.idle;
+    // 打开页面时已经在跑：本轮从打开这一刻开始计时，之后的事件不重置起点。
+    if (_live.generating) _clockStart();
     _scroll.addListener(_onScroll);
     WidgetsBinding.instance.addObserver(this);
     _load();
@@ -232,6 +265,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     // `ModalRoute.of` 依赖路由状态：被别的路由盖住（含弹层、左缘右滑返回）时
     // isCurrent 变化会重走进来，据此停表 / 重新起表，不需要全局 RouteObserver。
     _ensurePolling();
+    // 被别的路由盖住：兜底探测也停（没有屏幕可看）。
+    if (!_routeVisible) _stopProbe();
     // 重新露出来时立刻把 `/live` 接回来：轮询只是兜底，别让它长期替代真实阶段。
     if (_loaded && _polling && !_liveStarted) _startLive();
   }
@@ -241,10 +276,15 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _foreground = state == AppLifecycleState.resumed;
     if (_foreground) {
       _ensurePolling();
+      // 回前台接着算同一轮：后台的那段时间也是真实耗时。
+      _clockResume();
       // 回前台立刻补一拍，不等下一个 3s；`/live` 掉了也在这里接回来。
       if (_pollTimer != null) unawaited(_pollTick());
-      if (_loaded && _polling && !_liveStarted) _startLive();
+      if (_loaded) _restartLive();
     } else {
+      // 切后台停表：没有屏幕可看，定时器不该继续空转。
+      _clockPause();
+      _stopProbe();
       _stopPolling();
     }
   }
@@ -252,12 +292,15 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _clockDispose();
+    _stopProbe();
     _pollTimer?.cancel();
     _liveRetryTimer?.cancel();
     _scroll.removeListener(_onScroll);
     _flushTimer?.cancel();
     _streamingText.dispose();
     _unseen.dispose();
+    _elapsed.dispose();
     _liveSub?.cancel();
     _eventsSub?.cancel();
     _streamSub?.cancel();
@@ -303,16 +346,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
     _pollInFlight = true;
     try {
-      final page = await widget.repo.list(limit: _pollPageSize);
+      final match = await _lookupSession();
       if (!mounted) return;
-      final key = normalizeConversationKey(widget.conversationKey);
-      SessionSummary? match;
-      for (final item in page.items) {
-        if (normalizeConversationKey(item.id) == key) {
-          match = item;
-          break;
-        }
-      }
       if (!_loaded) {
         if (match != null) _attach(match);
         return;
@@ -331,15 +366,99 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
   }
 
+  /// 列表第一页里按归一化会话键找这条会话：未加载时确认它是否已被 agent 认领，
+  /// 兜底时读它的 `running`。
+  Future<SessionSummary?> _lookupSession() async {
+    final page = await widget.repo.list(limit: _pollPageSize);
+    final key = normalizeConversationKey(widget.conversationKey);
+    for (final item in page.items) {
+      if (normalizeConversationKey(item.id) == key) return item;
+    }
+    return null;
+  }
+
+  // -------------------------------------------------------------- 生成兜底探测
+
+  /// 这条会话有新消息进来：给 `/live` [_probeDelaySpan] 证明自己还活着。
+  /// 一帧都没有就开一段兜底轮询——服务端说在跑就亮「思考中」，说没跑就回待机。
+  /// 这样即使流是半死的，状态灯与中止按钮也不会永远停在待机。
+  void _armRoundProbe() {
+    if (!_foreground || !_routeVisible) return;
+    final armedAt = DateTime.now();
+    _probeDelay?.cancel();
+    _probeDelay = Timer(_probeDelaySpan, () {
+      _probeDelay = null;
+      final last = _lastLiveAt;
+      if (!mounted || (last != null && last.isAfter(armedAt))) return;
+      _startProbe();
+    });
+  }
+
+  void _startProbe() {
+    _probeTimer?.cancel();
+    _probeDeadline?.cancel();
+    _probeStartedAt = DateTime.now();
+    _probeTimer = Timer.periodic(_probeInterval, (_) => unawaited(_probeTick()));
+    _probeDeadline = Timer(_probeSpan, _stopProbe);
+    unawaited(_probeTick());
+  }
+
+  void _stopProbe() {
+    _probeDelay?.cancel();
+    _probeDelay = null;
+    _probeTimer?.cancel();
+    _probeTimer = null;
+    _probeDeadline?.cancel();
+    _probeDeadline = null;
+    _probeStartedAt = null;
+  }
+
+  /// 兜底读一次 `running`：`/live` 一旦恢复出帧就立刻让位（帧能分思考/回复，比它细）。
+  Future<void> _probeTick() async {
+    if (!mounted || !_foreground || !_routeVisible) {
+      _stopProbe();
+      return;
+    }
+    final startedAt = _probeStartedAt;
+    final last = _lastLiveAt;
+    if (startedAt != null && last != null && last.isAfter(startedAt)) {
+      _stopProbe();
+      return;
+    }
+    if (_pollInFlight) return;
+    _pollInFlight = true;
+    try {
+      final match = await _lookupSession();
+      if (!mounted) return;
+      // 流已掉线：3s 轮询接管状态，这里不用插手。
+      if (_polling || !_liveStarted) {
+        _stopProbe();
+        return;
+      }
+      // `running` 只能分出「在跑 / 没跑」，所以报「思考中」；恢复出帧后由帧细化。
+      // 已经有正文在流时保持现状：不要把「回复中」降级成「思考中」。
+      final running = match?.running ?? false;
+      if (!running) {
+        _setLive(LiveState.idle);
+      } else if (_streaming.isEmpty) {
+        _setLive(LiveState.thinking);
+      }
+    } on ApiFailure {
+      // 兜底也是尽力而为：网络抖动等下一拍。
+    } finally {
+      _pollInFlight = false;
+    }
+  }
+
   /// 探测命中：会话刚被 agent 认领，补上信息栏、操作菜单、`/live`、框架块与事件流。
   void _attach(SessionSummary session) {
     if (!mounted) return;
     setState(() {
       _session = session;
       _model = session.model;
-      // 服务端说在跑：先挂乐观的「思考中」，首个 snapshot 会纠正。
-      if (session.running) _live = LiveState.thinking;
     });
+    // 服务端说在跑：先挂乐观的「思考中」，首个 snapshot 会纠正。
+    if (session.running) _setLive(LiveState.thinking);
     // 已加载：探测表该收了（`/live` 在线后不会再打开）。
     _ensurePolling();
     unawaited(_loadFramework());
@@ -597,6 +716,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final message = event.message;
     // 分页/重载/重连回放都会送到同一条：id 是唯一去重键。
     if (!_ids.add(message.id)) return;
+    // 有人在这条会话里说话 = 这一轮可能要开始了：给 `/live` 一次证明自己的机会。
+    // bot 的发言落成气泡 = 这一轮结束，兜底探测可以收工。
+    // 页面刚打开时平台流会回放最近几条：那是历史，不参与本轮的起止判断。
+    if (_since() > _replayWindow.inMilliseconds) {
+      if (message.outbound) {
+        _stopProbe();
+        _setLive(LiveState.idle);
+      } else {
+        _armRoundProbe();
+      }
+    }
     var atEnd = false;
     setState(() {
       atEnd = _insertMessage(message);
@@ -649,17 +779,25 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final session = _session;
     if (_liveStarted || session == null || !mounted) return;
     _liveStarted = true;
+    // 新连接=新握手：重连后的第一个 snapshot 必须重新等，否则看门狗从此失效。
+    _snapshotSeen = false;
     _liveRetryTimer?.cancel();
     _liveRetryTimer = null;
-    // 8s 内既没有 snapshot 也没有任何事件：乐观的 running 收回去，空闲会话绝不播动画。
+    // 8s 连首个 snapshot 都没到：这条流不可信（手机切网 / 待机后常见的半死连接）。
+    // 退回 3s 轮询兜底并安排重连，绝不挂着一条永远不说话的流——那会让状态灯永远停在
+    // 「待机」、中止按钮永远点不了，而服务端其实已经在生成。
     _snapshotTimer?.cancel();
     _snapshotTimer = Timer(const Duration(seconds: 8), () {
       if (!mounted || _snapshotSeen) return;
-      _setLive(LiveState.idle);
+      _liveDown();
     });
+    _liveSub?.cancel();
     _liveSub = widget.repo.live(session.id).listen(
       (event) {
         if (!mounted) return;
+        _lastLiveAt = DateTime.now();
+        // 流在说话：兜底探测立刻让位。
+        if (_probeStartedAt != null || _probeDelay != null) _stopProbe();
         _liveMs ??= _since();
         switch (event.kind) {
           case LiveEventKind.snapshot:
@@ -739,10 +877,23 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     );
   }
 
+  /// 重建 `/live`：手机切网或长时间待机后，旧连接常常收不到 FIN，
+  /// 客户端只看到「一直很安静」——重开一条拿新快照，比等心跳超时快也更确定。
+  void _restartLive() {
+    _liveSub?.cancel();
+    _liveSub = null;
+    _liveStarted = false;
+    _startLive();
+  }
+
   /// `/live` 掉线：轮询接管状态，9s 后再试一次流。
   /// 轮询的停止条件与探测共用一张表：页面不可见、或流重新接上（snapshot）即停。
   void _liveDown() {
     _liveStarted = false;
+    _stopProbe();
+    // 先掐掉旧连接：半死连接可能还在吐帧，不能让它和新连接同时改状态。
+    _liveSub?.cancel();
+    _liveSub = null;
     _snapshotTimer?.cancel();
     _flushTimer?.cancel();
     _flushTimer = null;
@@ -764,10 +915,75 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     });
   }
 
-  /// 唯一的写入口：相同状态不触发重建。
+  /// 唯一的写入口：相同状态不触发重建。本轮计时跟着状态一起进出。
   void _setLive(LiveState next) {
     if (_live == next) return;
+    if (next.generating) {
+      _clockStart();
+    } else {
+      _clockFinish();
+    }
     setState(() => _live = next);
+  }
+
+  // ---------------------------------------------------------------- 本轮计时
+
+  /// 本轮开始：首个 running 事件（poll 的 `running` / 乐观值）或首个 active snapshot。
+  /// 重复调用不改起点——同一轮里思考 → 回复不该重新计时。
+  void _clockStart() {
+    if (_roundStart != null) return;
+    _clockHoldTimer?.cancel();
+    _clockHoldTimer = null;
+    _roundStart = DateTime.now();
+    _elapsed.value = Duration.zero;
+    _startTicker();
+  }
+
+  void _startTicker() {
+    _clockTick ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      final start = _roundStart;
+      if (start == null) return;
+      _elapsed.value = DateTime.now().difference(start);
+    });
+  }
+
+  /// 本轮结束：停表、把总耗时冻在原地 [_clockHold]，然后消失。
+  void _clockFinish() {
+    final start = _roundStart;
+    if (start == null) return;
+    _roundStart = null;
+    _clockTick?.cancel();
+    _clockTick = null;
+    _elapsed.value = DateTime.now().difference(start);
+    _clockHoldTimer?.cancel();
+    _clockHoldTimer = Timer(_clockHold, () {
+      _clockHoldTimer = null;
+      _elapsed.value = null;
+    });
+  }
+
+  /// 页面不可见时停表：起点保留，回前台接着算同一轮的真实耗时。
+  void _clockPause() {
+    _clockTick?.cancel();
+    _clockTick = null;
+    final start = _roundStart;
+    if (start != null) _elapsed.value = DateTime.now().difference(start);
+  }
+
+  /// 回前台：这一轮还在跑就接着走表，否则把冻结值留着等它自己消失。
+  void _clockResume() {
+    if (_roundStart == null) return;
+    _startTicker();
+    _elapsed.value = DateTime.now().difference(_roundStart!);
+  }
+
+  /// 销毁 / 收表：定时器与 notifier 都必须停，否则页面关掉后还在空转。
+  void _clockDispose() {
+    _clockTick?.cancel();
+    _clockTick = null;
+    _clockHoldTimer?.cancel();
+    _clockHoldTimer = null;
+    _roundStart = null;
   }
 
   void _scheduleStreamFlush() {
@@ -818,9 +1034,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   // ---------------------------------------------------------------- 会话操作
 
+  /// 中止本轮生成：失败必须让用户看见原因（code + message），成功立刻回待机。
+  /// 状态灯与按钮都由 [_live] 驱动，所以成功后先把本地状态收干净，不等服务端的 settled。
   Future<void> _cancel() async {
     final session = _session;
-    if (session == null) return;
+    if (session == null || _cancelling) return;
+    setState(() => _cancelling = true);
     try {
       await widget.repo.cancel(session.id);
       if (!mounted) return;
@@ -831,6 +1050,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _setLive(LiveState.idle);
     } on ApiFailure catch (e) {
       _toast('取消失败 ${e.code}：${e.message}');
+    } catch (e) {
+      _toast('取消失败：$e');
+    } finally {
+      if (mounted) setState(() => _cancelling = false);
     }
   }
 
@@ -1012,7 +1235,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           // 会话级操作只对已加载会话开放：未加载的会话在服务端没有日志与 agent。
           if (_loaded) ...[
             IconButton(
-              onPressed: _live.generating ? _cancel : null,
+              // 生成中（思考或回复）就能按；请求在途时置灰，避免连点两次 cancel。
+              onPressed: _live.generating && !_cancelling ? _cancel : null,
               icon: const Icon(Icons.stop_circle_outlined),
               tooltip: '中止当前生成',
             ),
@@ -1058,6 +1282,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             ChatInfoBar(
               session: _summary,
               light: _statusLight,
+              elapsed: _elapsed,
               botName: _botName,
               avatarUrl: _botAvatar,
               debugMetrics: _debugMetrics(),

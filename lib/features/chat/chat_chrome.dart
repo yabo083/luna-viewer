@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -140,12 +141,26 @@ enum StatusLight {
   final String label;
 }
 
+/// 本轮生成耗时：`3.2s`（不足一分钟）/ `1m04s` / `1h04m`。
+/// 调用方只在有本轮计时时渲染（见 [ChatInfoBar.elapsed]）。
+String formatElapsed(Duration elapsed) {
+  final ms = elapsed.isNegative ? 0 : elapsed.inMilliseconds;
+  if (ms < 60000) return '${(ms / 1000).toStringAsFixed(1)}s';
+  final seconds = ms ~/ 1000;
+  if (seconds < 3600) {
+    return '${seconds ~/ 60}m${(seconds % 60).toString().padLeft(2, '0')}s';
+  }
+  final minutes = seconds ~/ 60;
+  return '${minutes ~/ 60}h${(minutes % 60).toString().padLeft(2, '0')}m';
+}
+
 /// 会话信息栏：一行可横向滚动的轻量 pills，不再用整条灰底色块。
 class ChatInfoBar extends StatelessWidget {
   const ChatInfoBar({
     super.key,
     required this.session,
     required this.light,
+    this.elapsed,
     this.botName,
     this.avatarUrl,
     this.debugMetrics = const [],
@@ -157,6 +172,10 @@ class ChatInfoBar extends StatelessWidget {
 
   /// 常驻状态灯：待机也留一盏静灯，用户随时能确认会话没有卡住。
   final StatusLight light;
+
+  /// 本轮生成耗时（状态灯右侧的等宽小字）：`null` 不占位。
+  /// 自己监听刷新，页面不随每秒的 tick 重建。
+  final ValueListenable<Duration?>? elapsed;
   final String? botName;
   final String? avatarUrl;
   final List<String> debugMetrics;
@@ -199,7 +218,7 @@ class ChatInfoBar extends StatelessWidget {
               icon: Icons.memory_outlined,
               onTap: onModelTap,
             ),
-          _StatusPill(light: light),
+          _StatusSlot(light: light, elapsed: elapsed),
           if (showDeveloperInfo)
             for (final metric in debugMetrics) _InfoPill(label: metric),
         ],
@@ -414,6 +433,59 @@ class _StatusPill extends StatelessWidget {
               style: _pillLabelStyle(context, foreground),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 状态灯 + 本轮计时：计时出现/消失时整格（连同 6dp 间距）一起进出，
+/// 待机时信息栏不留一个空档。刷新范围只有这一枚胶囊加一个小字。
+class _StatusSlot extends StatelessWidget {
+  const _StatusSlot({required this.light, this.elapsed});
+
+  final StatusLight light;
+  final ValueListenable<Duration?>? elapsed;
+
+  @override
+  Widget build(BuildContext context) {
+    final listenable = elapsed;
+    if (listenable == null) return _StatusPill(light: light);
+    return ValueListenableBuilder<Duration?>(
+      valueListenable: listenable,
+      builder: (context, value, _) => Row(
+        mainAxisSize: MainAxisSize.min,
+        spacing: _PillSurface.gap,
+        children: [
+          _StatusPill(light: light),
+          if (value != null) _ElapsedText(value: value),
+        ],
+      ),
+    );
+  }
+}
+
+/// 本轮耗时小字：等宽数字，秒数跳动时整行不抖。
+class _ElapsedText extends StatelessWidget {
+  const _ElapsedText({required this.value});
+
+  final Duration value;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = formatElapsed(value);
+    return Semantics(
+      label: '本轮已用时 $text',
+      excludeSemantics: true,
+      child: Text(
+        text,
+        maxLines: 1,
+        style: _pillLabelStyle(
+          context,
+          Theme.of(context).colorScheme.onSurfaceVariant,
+        ).copyWith(
+          fontFeatures: const [FontFeature.tabularFigures()],
+          letterSpacing: 0.4,
         ),
       ),
     );
