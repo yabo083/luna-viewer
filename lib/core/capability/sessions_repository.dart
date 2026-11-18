@@ -147,6 +147,16 @@ class SessionsRepository {
         if (message.id.isEmpty) return null;
         return SessionEvent.message(message, id);
       default:
+        // `kind:"cut"`：历史被压缩的边界。它不是 mark，但带 `n`，
+        // 必须让续传游标前进——否则重连会从旧位置重放，把上一轮的 mark 当成新轮。
+        if (frame != null && frame['kind'] == 'cut' && id != null) {
+          return SessionEvent.mark(
+            'cut',
+            const <String, Object?>{},
+            id: id,
+            time: _frameTime(frame['time']),
+          );
+        }
         // `kind:"mark"`：帧名就是 mark 名（`prompt` / `engine/activity` / …），`cut` 不是 mark。
         if (frame == null || frame['kind'] != 'mark') return null;
         final name = frame['name'];

@@ -477,13 +477,25 @@ class _TurnPhasesSheet extends StatelessWidget {
                 style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
               )
             else
-              for (final phase in view.recent)
+              for (final group in aggregatePhases(view.recent))
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(child: Text(phase.name, style: mono)),
-                      Text(formatElapsed(phase.elapsed), style: mono),
+                      Row(
+                        children: [
+                          Expanded(child: Text(group.name, style: mono)),
+                          Text(phaseGroupLabel(group), style: mono),
+                        ],
+                      ),
+                      if (group.count > 1)
+                        Text(
+                          group.spans.map(formatElapsed).join(' · '),
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
                     ],
                   ),
                 ),

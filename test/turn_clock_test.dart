@@ -419,5 +419,34 @@ void main() {
       turn.start();
       expect(turn.view.value!.round, first + 1);
     });
+
+    test('finishTool 按名字关表，不误关之后重新开的「思考」', () {
+      var clock = Duration.zero;
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start();
+      clock = const Duration(seconds: 2);
+      turn.phase('draw');
+      clock = const Duration(seconds: 3);
+      turn.phase(thinkingPhase); // prompt 在 tool-input 之后到达，思考重新成为当前
+      clock = const Duration(seconds: 12);
+      final closed = turn.finishTool('draw');
+
+      expect(closed, 'draw');
+      expect(turn.view.value!.active.map((p) => p.name), [thinkingPhase]);
+      expect(turn.view.value!.recent.single.elapsed, const Duration(seconds: 10));
+    });
+
+    test('标签里工具优先于「思考」', () {
+      const view = TurnClockView(
+        total: Duration(seconds: 24),
+        active: [
+          TurnPhaseRecord('思考', Duration(seconds: 3)),
+          TurnPhaseRecord('draw', Duration(seconds: 12)),
+        ],
+      );
+      expect(turnLineLabel(view), '24.0s · draw 12.0s · 思考 3.0s');
+    });
   });
 }

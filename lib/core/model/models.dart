@@ -859,16 +859,18 @@ class LiveEvent {
     : kind = LiveEventKind.snapshot,
       delta = null,
       toolName = null,
+      toolCallId = null,
       reason = null;
 
   const LiveEvent.delta(this.delta, int index)
     : kind = LiveEventKind.delta,
       parts = const [],
       toolName = null,
+      toolCallId = null,
       reason = null,
       active = true;
 
-  const LiveEvent.tool(this.toolName)
+  const LiveEvent.tool(this.toolName, [this.toolCallId])
     : kind = LiveEventKind.tool,
       parts = const [],
       delta = null,
@@ -881,6 +883,7 @@ class LiveEvent {
       parts = const [],
       delta = null,
       toolName = null,
+      toolCallId = null,
       reason = null,
       active = true;
 
@@ -889,6 +892,7 @@ class LiveEvent {
       parts = const [],
       delta = null,
       toolName = null,
+      toolCallId = null,
       active = false;
 
   const LiveEvent.lagged()
@@ -896,6 +900,7 @@ class LiveEvent {
       parts = const [],
       delta = null,
       toolName = null,
+      toolCallId = null,
       reason = null,
       active = false;
 
@@ -903,6 +908,9 @@ class LiveEvent {
   final List<Map<String, Object?>> parts;
   final String? delta;
   final String? toolName;
+
+  /// 工具调用 id：把 `tool-input` 帧与落库的 `tool-result` 一一配对（同名工具重试不会串段）。
+  final String? toolCallId;
   final String? reason;
 
   /// 该事件是否代表「有生成在进行中」：snapshot 看有没有 attempt，delta/tool/reasoning 恒为真。
@@ -934,7 +942,11 @@ class LiveEvent {
         if (type == 'reasoning') return const LiveEvent.reasoning();
         if (type == 'tool-input') {
           final name = part['toolName'];
-          return LiveEvent.tool(name is String ? name : 'tool');
+          final callId = part['toolCallId'];
+          return LiveEvent.tool(
+            name is String ? name : 'tool',
+            callId is String ? callId : null,
+          );
         }
         return null;
       case 'agent/assistant-settled':

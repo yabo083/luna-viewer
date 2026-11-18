@@ -76,9 +76,16 @@ String formatElapsed(Duration elapsed) {
 String turnLineLabel(TurnClockView view, {bool aborted = false}) {
   final total = formatElapsed(view.total);
   if (aborted) return '已中止 $total';
-  final phases = view.active.isNotEmpty
+  // 工具优先于「思考」：工具才是用户在等的那个可见步骤。
+  final ordered = [
+    for (final phase in view.active)
+      if (phase.name != thinkingPhase) phase,
+    for (final phase in view.active)
+      if (phase.name == thinkingPhase) phase,
+  ];
+  final phases = ordered.isNotEmpty
       ? [
-          for (final phase in view.active.take(2))
+          for (final phase in ordered.take(2))
             '${phase.name} ${formatElapsed(phase.elapsed)}',
         ]
       : [
@@ -408,6 +415,20 @@ class TurnClock {
     _phases.leaveLatest(_now());
     _publish();
     return name;
+  }
+
+  /// 某个具名工具结束（`tool-result` 落库）：按名字关表，关不到才退回「后开先关」。
+  /// 返回实际被关掉的阶段名（`reply` 之外要接着开「思考」）。
+  String? finishTool(String? name) {
+    if (_end != null) return null;
+    final wanted = name == null ? null : normalizeTurnPhase(name);
+    final target = wanted != null && _phases.startOf(wanted) != null
+        ? wanted
+        : _phases.current;
+    if (target == null) return null;
+    _phases.leave(_now(), target);
+    _publish();
+    return target;
   }
 
   /// 这一次尝试结束了（`agent/assistant-settled`）：阶段收尾，但**不是**整轮终点——

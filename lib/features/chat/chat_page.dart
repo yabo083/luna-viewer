@@ -131,6 +131,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 不带它会把整段历史重放一遍，上一轮的 mark 会被当成这一轮的起点。
   String? _eventsSince;
 
+  /// 订阅开始的本地时刻：重放的历史帧按它的时间戳丢掉，不能把旧 mark 当成本轮。
+  DateTime? _eventsOpenedAt;
+
   /// 会话日志是否已经取过（成败都算）：`/events` 等它决定从哪儿接。
   bool _transcriptLoaded = false;
 
@@ -209,6 +212,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 骨架当前对应的轮次号（[TurnClockView.round]）：换轮才清空本轮的外发标记。
   int _skeletonRound = -1;
+
+  /// 在跑的工具调用：`callId → 阶段名`。`tool-result` 按 callId 精确配对，
+  /// 同名工具重试或与前一步的「思考」并存时不会关错段。
+  final Map<String, String> _openToolCalls = <String, String>{};
+
+  /// 没有 callId 的老帧：按先进先出配对。
+  final List<String> _openToolNames = <String>[];
 
   /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
   /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
@@ -597,9 +607,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     try {
       final transcript = await widget.repo.transcript(session.id);
       if (!mounted) return;
-      // 日志 head：`/events` 从这里续传，否则整段历史重放会被当成本轮（见 [_startEvents]）。
-      _eventsSince =
-          '${session.id}:${transcript.length > 0 ? transcript.length - 1 : 0}';
+      // 不带游标订阅：`/messages` 的 `length` 不是日志 `n`（实测 167 vs 380），
+      // 拿它当 Last-Event-ID 会让服务端卡在空窗口里什么都不发。
+      // 历史重放由 [_onSessionEvent] 按帧时间过滤。
+      _eventsSince = null;
       final log = transcript.messages;
       // 平台消息正文 → 时间：日志里的平台消息有时没时戳，框架块也要靠它定锚。
       final platformTimes = <String, DateTime>{};
@@ -692,6 +703,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final session = _session;
     if (_eventsStarted || session == null || !_transcriptLoaded) return;
     _eventsStarted = true;
+    _eventsOpenedAt = DateTime.now();
     _eventsSub = widget.repo
         .events(session.id, since: _eventsSince)
         .listen(
@@ -705,7 +717,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
               _onSessionEvent(event);
             } catch (_) {}
           },
-          onError: (Object _) {
+          onError: (Object error) {
             _eventsSub = null;
             _restartEvents();
           },
@@ -735,17 +747,37 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     // mark：轮次与阶段的权威打点（`agent/input-enqueued` / `engine/activity` / …）。
     final mark = event.name;
     if (mark != null) {
+      // 重放的历史 mark：按帧时间丢掉，免得上一轮的 enqueued/prompt 把表重新拉起来。
+      final openedAt = _eventsOpenedAt;
+      final at = event.time;
+      if (openedAt != null &&
+          at != null &&
+          at.isBefore(openedAt.subtract(const Duration(seconds: 5)))) {
+        return;
+      }
       _onMark(mark, event.data ?? const <String, Object?>{}, event.time);
       return;
     }
     final message = event.message;
     if (message == null) return;
-    // tool-result 落库 = 那次工具调用真的结束了：阶段耗时按这一刻收尾。
-    // 工具之后模型还要再想一步，所以除 reply 外都接着开「思考」——
-    // reply 之后这一轮就该收尾了，再挂个思考是假的。
+    // tool-result 落库 = 那次工具调用真的结束了：按 `toolCallId`/`toolName` 关掉对应阶段，
+    // 不能关「最近打开的那个」——工具跑的同时可能已经重新开了「思考」。
+    // 工具之后模型还要再想一步，所以除 reply 外都接着开「思考」。
     for (final block in message.blocks) {
       if (block.type != 'tool-result') continue;
-      final closed = _clock.phaseFinished();
+      final callId = block.data['toolCallId'];
+      final rawName = block.data['toolName'];
+      String? target;
+      if (callId is String && callId.isNotEmpty) {
+        target = _openToolCalls.remove(callId);
+      }
+      if (target == null && rawName is String && rawName.isNotEmpty) {
+        target = normalizeTurnPhase(rawName);
+      }
+      if (target == null && _openToolNames.isNotEmpty) {
+        target = _openToolNames.removeAt(0);
+      }
+      final closed = _clock.finishTool(target);
       if (closed != null && closed != replyPhase) _clock.phase(thinkingPhase);
     }
     if (!message.isFramework) return;
@@ -983,7 +1015,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 // 计时在 `tool-result` 落库那一帧收尾（见 [_startEvents]）。
                 _clock.endPhase(thinkingPhase);
                 final tool = event.toolName;
-                _clock.phase(tool == null || tool.isEmpty ? 'tool' : tool);
+                final name = (tool == null || tool.isEmpty) ? 'tool' : tool;
+                _clock.phase(name);
+                final callId = event.toolCallId;
+                if (callId != null && callId.isNotEmpty) {
+                  _openToolCalls[callId] = normalizeTurnPhase(name);
+                } else {
+                  _openToolNames.add(normalizeTurnPhase(name));
+                }
                 if (_streaming.isEmpty) _setLive(LiveState.thinking);
               case LiveEventKind.settled:
                 // 收尾时立刻 flush，避免最后一段 delta 卡在定时器里被丢掉。
@@ -1140,7 +1179,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _verifyTurnEnd();
       case 'agent/input-admitted' || 'request/context':
         // 输入被 agent 收下 / 请求已装配：这一轮真的开跑了（也是中止冻结的解锁点）。
+        // 开表后立刻挂「思考」：`engine/activity prepare` 可能先于解锁到达、被冻结点掉。
         _clock.start(lead: lead, force: true);
+        _clock.phase(thinkingPhase);
     }
   }
 
@@ -1159,6 +1200,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _skeletonRound = view.round;
         _outboundInRound = false;
         _roundOutboundIds.clear();
+        _openToolCalls.clear();
+        _openToolNames.clear();
       }
       // 本轮已经出过真实气泡：不再补骨架（等 running=false 收表即可）。
       if (_skeleton == _SkeletonPhase.none && !_outboundInRound) _startSkeleton();
@@ -1206,24 +1249,25 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   bool _stampTurnEnd(TurnClockView view) {
     if (_roundOutboundIds.isEmpty) return false;
     if (view.total < const Duration(milliseconds: 200)) return false;
-    PlatformMessage? last;
-    for (final id in _roundOutboundIds.reversed) {
+    final end = DateTime.now();
+    final start = end.subtract(view.total);
+    var changed = false;
+    // 本轮所有外发气泡都盖同一个总时长：多消息轮次里，任何一条都能解释「等了多久」。
+    for (final id in _roundOutboundIds) {
       for (var i = _messages.length - 1; i >= 0; i--) {
         final message = _messages[i];
-        if (message.id == id) {
-          last = message;
-          break;
+        if (message.id != id) continue;
+        if (message.turnEndedAt == null) {
+          message.turnEndedAt = end;
+          message.turnStartedAt = start;
+          // 缓存键含脚注：丢掉这条消息的旧 Widget，脚注才会出现在气泡右下。
+          _itemCache.removeWhere((key, _) => key.startsWith('m:${message.id}:'));
+          changed = true;
         }
+        break;
       }
-      if (last != null) break;
     }
-    if (last == null || last.turnEndedAt != null) return false;
-    final end = DateTime.now();
-    last.turnEndedAt = end;
-    last.turnStartedAt = end.subtract(view.total);
-    // 缓存键含脚注：丢掉这条消息的旧 Widget，脚注才会出现在气泡右下。
-    _itemCache.removeWhere((key, _) => key.startsWith('m:${last!.id}:'));
-    return true;
+    return changed;
   }
 
   String? _lastInboundText() {
