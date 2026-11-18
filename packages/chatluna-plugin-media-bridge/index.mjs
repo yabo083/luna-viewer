@@ -8,8 +8,9 @@
 //   1. ChatLuna 会话日志（`data/chatluna.db` 的 `chatluna_session_entry`）——进过 agent 的
 //      普通消息，重启后仍在，是普通消息的真源；
 //   2. 事件层捕获——指令回复、群聊里没 @bot 的消息等「不进日志」的消息，落盘保存增量。
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { readFile, stat } from 'node:fs/promises'
+import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
+import { readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openStream } from '@chatluna/server'
@@ -24,13 +25,23 @@ const MIME = {
   '.webp': 'image/webp',
   '.gif': 'image/gif',
   '.svg': 'image/svg+xml',
+  '.bmp': 'image/bmp',
   '.mp4': 'video/mp4',
   '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.m4a': 'audio/mp4',
   '.mp3': 'audio/mpeg',
   '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.amr': 'audio/amr',
+  '.silk': 'audio/silk',
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
   '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/plain; charset=utf-8',
-  '.json': 'application/json'
+  '.json': 'application/json',
+  '.bin': 'application/octet-stream'
 }
 
 // 每个会话独立环形缓冲：300 条足够 App 翻最近几屏；会话表 200 个，淘汰最久未活跃的。
@@ -638,6 +649,401 @@ export function apply(ctx) {
     return url
   }
 
+  // ── 媒体自托管 ───────────────────────────────────────────────────────
+  // 平台 CDN 的地址带时效签名（QQ `rkey`）过期后永久 404，`storage://` 的临时文件也会被
+  // 清理：消息里能渲染的东西先落到实例本地，客户端拿到的是不会失效的
+  // `/api/platform/media/<file>`。文件名是内容 sha256 的前 16 位 + 扩展名，同一张图重复
+  // 出现只占一份。
+  const mediaDir = resolve(
+    process.env.CHATLUNA_MEDIA_CACHE ?? join(process.cwd(), 'data/chatluna/platform-media')
+  )
+  const mediaIndexFile = join(mediaDir, 'index.json')
+  const MEDIA_CACHE_ROUTE = '/api/platform/media/'
+  // 默认 500MB；`CHATLUNA_MEDIA_LIMIT_BYTES` 只用于运维/验证时缩小上限。
+  const mediaLimitSetting = Number(process.env.CHATLUNA_MEDIA_LIMIT_BYTES)
+  const MEDIA_CACHE_LIMIT_BYTES = Number.isFinite(mediaLimitSetting) && mediaLimitSetting > 0
+    ? Math.floor(mediaLimitSetting)
+    : 500 * 1024 * 1024
+  const MEDIA_DOWNLOAD_CONCURRENCY = 2
+  const MEDIA_DOWNLOAD_LIMIT_BYTES = 15 * 1024 * 1024
+  const MEDIA_DOWNLOAD_TIMEOUT = 20_000
+  // 新消息等本地地址的预算：超时的下载继续在后台跑（完成后再改写同一个 media 对象），
+  // 消息本体先按原地址发出去，不让一次慢下载拖住入站事件。
+  const MEDIA_LOCALIZE_BUDGET = 4000
+  // 下载失败的 URL 在 10 分钟内不再尝试：过期签名重试多少次都是 404。
+  const MEDIA_FAILURE_TTL = 10 * 60_000
+  // `storage://<id>` → `/files/<id>` 的存在性检查结果；临时文件 24h 过期，缓存 5 分钟够用。
+  const STORAGE_CHECK_TTL = 5 * 60_000
+  const STORAGE_CHECK_TIMEOUT = 3000
+
+  const MEDIA_EXT_BY_MIME = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+    'image/bmp': '.bmp',
+    'image/svg+xml': '.svg',
+    'video/mp4': '.mp4',
+    'video/webm': '.webm',
+    'video/quicktime': '.mov',
+    'audio/mpeg': '.mp3',
+    'audio/mp4': '.m4a',
+    'audio/wav': '.wav',
+    'audio/x-wav': '.wav',
+    'audio/ogg': '.ogg',
+    'audio/amr': '.amr',
+    'audio/silk': '.silk',
+    'application/pdf': '.pdf',
+    'application/zip': '.zip'
+  }
+
+  mkdirSync(mediaDir, { recursive: true })
+  // 原始 URL → {file, mime, size, at}；重启时从 index.json 恢复，之后先查它再下载。
+  const mediaByUrl = new Map()
+  // 目录里实际存在的文件名（内容哈希命名）；用它做「落盘命中」，不每条消息都 stat。
+  const mediaFiles = new Set()
+  const mediaFailures = new Map()
+
+  const isMediaFile = (name) => /^[0-9a-f]{16}\.[a-z0-9]{2,5}$/i.test(name)
+
+  const loadMediaCache = () => {
+    try {
+      for (const entry of readdirSync(mediaDir, { withFileTypes: true })) {
+        if (entry.isFile() && isMediaFile(entry.name)) mediaFiles.add(entry.name)
+      }
+    } catch {}
+    try {
+      const index = parseJsonText(readFileSync(mediaIndexFile, 'utf8'))
+      for (const [url, entry] of Object.entries(index?.urls ?? {})) {
+        const file = textOf(entry?.file)
+        if (!isMediaFile(file) || !mediaFiles.has(file)) continue
+        mediaByUrl.set(url, {
+          file,
+          mime: textOf(entry.mime),
+          size: Number(entry.size) || 0,
+          at: Number(entry.at) || 0
+        })
+      }
+    } catch {}
+  }
+  loadMediaCache()
+
+  let mediaIndexTimer = null
+  const flushMediaIndex = () => {
+    if (mediaIndexTimer !== null) {
+      clearTimeout(mediaIndexTimer)
+      mediaIndexTimer = null
+    }
+    const urls = {}
+    for (const [url, entry] of mediaByUrl) {
+      urls[url] = { file: entry.file, mime: entry.mime, size: entry.size, at: entry.at }
+    }
+    try {
+      mkdirSync(mediaDir, { recursive: true })
+      const temp = mediaIndexFile + '.tmp'
+      writeFileSync(temp, JSON.stringify({ version: 1, savedAt: Date.now(), urls }))
+      renameSync(temp, mediaIndexFile)
+    } catch (error) {
+      logger.warn('platform media index flush failed (%s): %s', mediaIndexFile, error?.message ?? error)
+    }
+  }
+  const markMediaIndexDirty = () => {
+    if (mediaIndexTimer !== null) return
+    mediaIndexTimer = setTimeout(flushMediaIndex, 1000)
+    mediaIndexTimer.unref?.()
+  }
+
+  // 下载队列：并发 2，排队的是 Promise 工厂；单文件 15MB / 20s 上限在 fetchMedia 里。
+  let downloadsActive = 0
+  const downloadQueue = []
+  const downloadPending = new Map()
+  const pumpDownloads = () => {
+    while (downloadsActive < MEDIA_DOWNLOAD_CONCURRENCY && downloadQueue.length) {
+      const job = downloadQueue.shift()
+      downloadsActive += 1
+      job.run()
+        .then(job.resolve, () => job.resolve(null))
+        .finally(() => {
+          downloadsActive -= 1
+          pumpDownloads()
+        })
+    }
+  }
+  const withDownloadSlot = (run) => new Promise((resolve) => {
+    downloadQueue.push({ run, resolve })
+    pumpDownloads()
+  })
+
+  const extensionFor = (mime, url) => {
+    const type = textOf(mime).split(';')[0].trim().toLowerCase()
+    if (MEDIA_EXT_BY_MIME[type]) return MEDIA_EXT_BY_MIME[type]
+    try {
+      const ext = extname(new URL(url).pathname).toLowerCase()
+      if (/^\.[a-z0-9]{2,5}$/.test(ext)) return ext
+    } catch {}
+    return '.bin'
+  }
+
+  // 流式下载 → 按内容哈希命名落盘。任何失败（状态码、超 15MB、超时、网络）都返回 null，
+  // 由调用方保留原 URL 并标 `cached:false`。
+  const fetchMedia = async (url) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), MEDIA_DOWNLOAD_TIMEOUT)
+    timer.unref?.()
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'user-agent': 'chatluna-media-bridge/1.0' }
+      })
+      if (!response.ok || !response.body) return null
+      const declared = Number(response.headers.get('content-length'))
+      if (Number.isFinite(declared) && declared > MEDIA_DOWNLOAD_LIMIT_BYTES) return null
+      const reader = response.body.getReader()
+      const chunks = []
+      let total = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value?.byteLength) continue
+        total += value.byteLength
+        if (total > MEDIA_DOWNLOAD_LIMIT_BYTES) {
+          await reader.cancel().catch(() => {})
+          return null
+        }
+        chunks.push(value)
+      }
+      if (!total) return null
+      const body = Buffer.concat(
+        chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)),
+        total
+      )
+      const digest = createHash('sha256').update(body).digest('hex').slice(0, 16)
+      const file = digest + extensionFor(response.headers.get('content-type'), response.url || url)
+      if (!mediaFiles.has(file)) {
+        const temp = join(mediaDir, `.${digest}-${process.pid}-${Date.now()}.tmp`)
+        await writeFile(temp, body)
+        await rename(temp, join(mediaDir, file))
+        mediaFiles.add(file)
+      }
+      const entry = {
+        file,
+        mime: textOf(response.headers.get('content-type')),
+        size: total,
+        at: Date.now()
+      }
+      mediaByUrl.set(url, entry)
+      markMediaIndexDirty()
+      void enforceMediaLimit()
+      return entry
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }
+
+  // 同一个 URL 只下一次：进行中的请求共用同一个 Promise；成功结果留在 mediaByUrl 里，
+  // 重启后由 index.json 恢复，命中即不再发请求。
+  const downloadMedia = async (url) => {
+    const known = mediaByUrl.get(url)
+    if (known && mediaFiles.has(known.file)) return known
+    const failedAt = mediaFailures.get(url)
+    if (failedAt !== undefined && Date.now() - failedAt < MEDIA_FAILURE_TTL) return null
+    let pending = downloadPending.get(url)
+    if (!pending) {
+      pending = withDownloadSlot(() => fetchMedia(url))
+      downloadPending.set(url, pending)
+      void pending.then(
+        (entry) => {
+          downloadPending.delete(url)
+          if (entry) {
+            mediaFailures.delete(url)
+            return
+          }
+          if (mediaFailures.size > 1024) {
+            for (const [key, at] of mediaFailures) {
+              if (Date.now() - at >= MEDIA_FAILURE_TTL) mediaFailures.delete(key)
+            }
+          }
+          mediaFailures.set(url, Date.now())
+        },
+        () => downloadPending.delete(url)
+      )
+    }
+    return pending
+  }
+
+  // 磁盘上限：超过 500MB 按 mtime 淘汰最旧的；索引里指向被删文件的条目一并清掉。
+  let mediaLimitRunning = false
+  const enforceMediaLimit = async () => {
+    if (mediaLimitRunning) return
+    mediaLimitRunning = true
+    try {
+      const entries = []
+      for (const entry of await readdir(mediaDir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue
+        if (entry.name.startsWith('.') && entry.name.endsWith('.tmp')) {
+          // 写盘被中断留下的临时文件：一小时后清掉，不参与上限计算。
+          const info = await stat(join(mediaDir, entry.name)).catch(() => undefined)
+          if (info && Date.now() - info.mtimeMs > 3_600_000) {
+            await unlink(join(mediaDir, entry.name)).catch(() => {})
+          }
+          continue
+        }
+        if (!isMediaFile(entry.name)) continue
+        const info = await stat(join(mediaDir, entry.name)).catch(() => undefined)
+        if (info === undefined) {
+          mediaFiles.delete(entry.name)
+          continue
+        }
+        entries.push({ name: entry.name, size: info.size, at: info.mtimeMs })
+      }
+      let total = entries.reduce((sum, entry) => sum + entry.size, 0)
+      if (total <= MEDIA_CACHE_LIMIT_BYTES) return
+      entries.sort((a, b) => a.at - b.at)
+      let removed = 0
+      for (const entry of entries) {
+        if (total <= MEDIA_CACHE_LIMIT_BYTES) break
+        await unlink(join(mediaDir, entry.name)).catch(() => {})
+        total -= entry.size
+        removed += 1
+        mediaFiles.delete(entry.name)
+        for (const [url, cached] of mediaByUrl) {
+          if (cached.file === entry.name) mediaByUrl.delete(url)
+        }
+      }
+      markMediaIndexDirty()
+      logger.info('platform media cache trimmed: %d files, now %d bytes', removed, total)
+    } catch (error) {
+      logger.warn('platform media cache trim failed: %s', error?.message ?? error)
+    } finally {
+      mediaLimitRunning = false
+    }
+  }
+  void enforceMediaLimit()
+
+  // `storage://<id>` 是 24h 临时文件：只把还存在的换成实例内 `/files/<id>`，过期的保留
+  // `ref`（客户端显示占位），别给一个必然 404 的 URL。检查走本机 `/files/<id>`。
+  const storageState = new Map()
+  const storagePending = new Map()
+  // 启动全量投影可能一次遇到很多 `storage://`：检查也排队（并发 4），别把本机端口打满。
+  let storageActive = 0
+  const storageQueue = []
+  const pumpStorage = () => {
+    while (storageActive < 4 && storageQueue.length) {
+      const job = storageQueue.shift()
+      storageActive += 1
+      job.run()
+        .then(job.resolve, () => job.resolve(false))
+        .finally(() => {
+          storageActive -= 1
+          pumpStorage()
+        })
+    }
+  }
+  const withStorageSlot = (run) => new Promise((resolve) => {
+    storageQueue.push({ run, resolve })
+    pumpStorage()
+  })
+  const instanceOrigin = () => {
+    const explicit = textOf(process.env.CHATLUNA_MEDIA_ORIGIN).trim()
+    if (explicit) return explicit.replace(/\/+$/, '')
+    const port = ctx.server?.port ?? ctx.server?.config?.port
+    if (port) return `http://127.0.0.1:${port}`
+    return textOf(ctx.server?.baseUrl).replace(/\/+$/, '')
+  }
+  const storageIdOf = (value) => {
+    const raw = textOf(value).trim()
+    if (!/^storage:\/\//i.test(raw)) return ''
+    return raw.slice('storage://'.length)
+  }
+  const storageExists = async (id) => {
+    const checked = storageState.get(id)
+    if (checked && Date.now() - checked.at < STORAGE_CHECK_TTL) return checked.ok
+    // 服务器还没起来（apply 早期）：这次不缓存，等有地址了再查。
+    const origin = instanceOrigin()
+    if (!origin) return false
+    let pending = storagePending.get(id)
+    if (!pending) {
+      pending = withStorageSlot(async () => {
+        try {
+          const response = await fetch(`${origin}/files/${encodeURIComponent(id)}`, {
+            signal: AbortSignal.timeout(STORAGE_CHECK_TIMEOUT)
+          })
+          const ok = response.status === 200
+          await response.body?.cancel?.()
+          return ok
+        } catch {
+          return false
+        }
+      })
+      storagePending.set(id, pending)
+      void pending.then((ok) => {
+        storagePending.delete(id)
+        if (storageState.size > 512) {
+          const oldest = storageState.keys().next().value
+          if (oldest !== undefined) storageState.delete(oldest)
+        }
+        storageState.set(id, { ok, at: Date.now() })
+      }, () => storagePending.delete(id))
+    }
+    return pending
+  }
+
+  const mediaRouteOf = (file) => MEDIA_CACHE_ROUTE + file
+
+  const localizeItem = async (item, { downloads = true, deadline = 0 } = {}) => {
+    if (!item || typeof item !== 'object') return item
+    const storageId = storageIdOf(item.ref) || storageIdOf(item.url)
+    if (storageId) {
+      if (await storageExists(storageId)) {
+        item.url = '/files/' + encodeURIComponent(storageId)
+        delete item.ref
+        item.cached = true
+      }
+      // 过期/未知时保留 ref，不再尝试当 CDN 链接下载。
+      return item
+    }
+    const url = textOf(item.url)
+    if (!/^https?:\/\//i.test(url)) return item
+    const known = mediaByUrl.get(url)
+    if (known && mediaFiles.has(known.file)) {
+      item.url = mediaRouteOf(known.file)
+      item.cached = true
+      return item
+    }
+    // 历史回填策略：只在「消息产出」时下载；启动全量投影只做索引命中与 storage 校验，
+    // 不把几百条旧消息里的过期 CDN 地址重新拉一遍。
+    if (!downloads) return item
+    const pending = downloadMedia(url).then((entry) => {
+      if (entry) {
+        item.url = mediaRouteOf(entry.file)
+        item.cached = true
+      } else {
+        item.cached = false
+      }
+      return entry
+    })
+    if (deadline > 0) {
+      const remaining = deadline - Date.now()
+      // 预算已经用完：不 await，后台下载完成后再改写同一个对象。
+      if (remaining > 0) await withTimeout(() => pending, remaining)
+    } else {
+      await pending
+    }
+    return item
+  }
+
+  // 对一组 media 原地改写。同步段会先把「落盘命中」的地址换掉（调用方不 await 也有用），
+  // 下载在后台继续并修改同一个对象。
+  const localizeMedia = async (items, options) => {
+    if (!Array.isArray(items) || !items.length) return items
+    await Promise.all(items.map((item) => localizeItem(item, options))).catch(() => {})
+    return items
+  }
+
   // 入站/出站统一入口：元素优先，其次 `event.message` 的原始附件与标记串，
   // 最后退回 `content`（老适配器只给序列化文本）。同一个 URL 只留一条。
   const collectMedia = async (source) => {
@@ -701,6 +1107,8 @@ export function apply(ctx) {
       for (const descriptor of rawMediaTags(textOf(eventMessage.content))) await add(descriptor)
     }
     for (const descriptor of rawMediaTags(textOf(source?.content))) await add(descriptor)
+    // 能落地的立刻换成本实例地址（下载受队伍/上限约束；超预算的部分后台继续）。
+    await localizeMedia(items, { deadline: Date.now() + MEDIA_LOCALIZE_BUDGET })
     return items
   }
 
@@ -1103,6 +1511,8 @@ export function apply(ctx) {
     }
     restored.sort((a, b) => Number(a.message.time) - Number(b.message.time))
     for (const { key, message } of restored) {
+      // 上次落盘的媒体地址可能还是原 CDN 地址：索引里有就能直接换成本地地址（不再下载）。
+      void localizeMedia(Array.isArray(message.media) ? message.media : [], { downloads: false })
       record(key, {
         id: textOf(message.id),
         time: Number(message.time),
@@ -1125,7 +1535,10 @@ export function apply(ctx) {
     captureTimer.unref?.()
   }
   // 退出前把没落盘的增量刷掉：daemon 正常停止走 dispose，强杀走 exit。
-  const flushOnExit = () => flushCapture()
+  const flushOnExit = () => {
+    flushCapture()
+    flushMediaIndex()
+  }
   process.once('exit', flushOnExit)
 
   // ── 会话日志投影 ──────────────────────────────────────────────────────
@@ -1346,6 +1759,8 @@ export function apply(ctx) {
         : []
     let count = 0
     for (const item of items) {
+      // 历史只做索引命中与 storage 校验；只有增量（实时流要立刻发出去的）才触发新下载。
+      void localizeMedia(item.media, { downloads: publish })
       const recorded = record(session.key, item, 'log')
       count += 1
       if (recorded && publish) notify(session.key, recorded)
@@ -1554,6 +1969,7 @@ export function apply(ctx) {
     clearInterval(pollTimer)
     process.removeListener('exit', flushOnExit)
     flushCapture()
+    flushMediaIndex()
     try {
       logDb?.close()
     } catch {}
@@ -1608,6 +2024,39 @@ export function apply(ctx) {
   // 路径参数里的 `/` 在部分路由实现下拿不到，查询参数作为稳定形态。
   ctx.server.get('/api/workspace', async (req, res) => {
     return serve(query(req, 'path'), res)
+  })
+
+  // 自托管媒体：文件名是内容 sha256 前 16 位 + 扩展名，只允许 platform-media 目录内的
+  // 直接子文件。内容不可变（同一文件名永远是同一份字节），可以长缓存。
+  ctx.server.get('/api/platform/media/:file', async (req, res) => {
+    const raw = req.params?.file ?? ''
+    let name
+    try {
+      name = decodeURIComponent(raw)
+    } catch {
+      name = raw
+    }
+    if (!name || name === '.' || name === '..' || name.startsWith('.') || !isMediaFile(name)) {
+      res.status = 400
+      res.body = 'invalid file name'
+      return
+    }
+    const target = resolve(mediaDir, name)
+    if (dirname(target) !== mediaDir) {
+      res.status = 400
+      res.body = 'path outside platform media'
+      return
+    }
+    const info = await stat(target).catch(() => undefined)
+    if (info === undefined || !info.isFile()) {
+      res.status = 404
+      res.body = 'file not found'
+      return
+    }
+    res.status = 200
+    res.headers.set('content-type', MIME[extname(name).toLowerCase()] ?? 'application/octet-stream')
+    res.headers.set('cache-control', 'public, max-age=31536000, immutable')
+    res.body = await readFile(target)
   })
 
   // 会话列表：按最后一条消息倒序；count 是当前环形缓冲里的条数（cap 300）。

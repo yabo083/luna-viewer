@@ -10,6 +10,7 @@ import '../../core/capability/sessions_repository.dart';
 import '../../core/model/models.dart';
 import 'chat_chrome.dart';
 import 'message_view.dart';
+import 'timeline.dart';
 
 /// 实时生成的唯一状态来源：`/live` 只提供「是否在跑、跑到哪一步」，
 /// 消息本体一律来自插件（`platform/messages` + `platform/stream`）。
@@ -104,14 +105,12 @@ class _ChatPageState extends State<ChatPage> {
 
   /// 框架消息（wake/memory/工具摘要等）：只对已加载会话从 `/api/sessions/:id/messages`
   /// 与 `/events` 取。平台消息里没有这些，所以单独一条时间线，渲染成居中单卡片。
-  List<_FrameworkEntry> _framework = const [];
+  /// 列表按时间升序维护（[orderNotices]），渲染时与平台消息合并排序。
+  List<TimelineNotice> _framework = const [];
   final Set<String> _frameworkIds = {};
 
   /// 框架块上限：长开页面只留最近的，避免无限增长。
   static const int _frameworkCap = 400;
-
-  /// 与平台消息对齐的时间窗：同一段正文在这个窗口内算同一条。
-  static const Duration _dedupeWindow = Duration(seconds: 3);
 
   StreamSubscription<SessionEvent>? _eventsSub;
   bool _eventsStarted = false;
@@ -267,23 +266,39 @@ class _ChatPageState extends State<ChatPage> {
     try {
       final transcript = await widget.repo.transcript(session.id);
       if (!mounted) return;
-      final entries = <_FrameworkEntry>[];
-      // 日志里平台消息也在：它给后面的框架块当时间锚点（服务端没给时戳时仍能落在正确位置）。
-      DateTime? anchor;
-      for (final message in transcript.messages) {
+      final log = transcript.messages;
+      // 平台消息正文 → 时间：日志里的平台消息有时没时戳，框架块也要靠它定锚。
+      final platformTimes = <String, DateTime>{};
+      for (final message in _messages) {
+        final key = noticeKey(message.content);
+        if (key.isNotEmpty) platformTimes.putIfAbsent(key, () => message.time);
+      }
+      // 日志每一行可用的时间：平台消息没给时戳时，用已加载消息的正文对齐补上。
+      final at = List<DateTime?>.filled(log.length, null);
+      for (var i = 0; i < log.length; i++) {
+        final message = log[i];
+        if (message.isFramework) continue;
+        at[i] = message.time ?? platformTimes[noticeKey(message.bodyMarkdown.trim())];
+      }
+      // 反向扫一遍：每条日志后面第一条平台消息的时间，给「前面还没有消息」的框架块当锚点。
+      final following = List<DateTime?>.filled(log.length, null);
+      DateTime? upcoming;
+      for (var i = log.length - 1; i >= 0; i--) {
+        following[i] = upcoming;
+        upcoming = at[i] ?? upcoming;
+      }
+      // 日志顺序就是聊天顺序：框架块没有时戳时，夹在前后两条平台消息之间（±1ms）。
+      final entries = <TimelineNotice>[];
+      DateTime? previous;
+      for (var i = 0; i < log.length; i++) {
+        final message = log[i];
         final text = message.bodyMarkdown.trim();
         if (text.isEmpty) continue;
-        if (!message.isFramework) {
-          anchor = _platformTimeOf(text) ?? anchor;
-          continue;
+        if (message.isFramework) {
+          entries.add(_notice(message.id, text, message.time ?? _anchor(previous, following[i])));
+        } else {
+          previous = at[i] ?? previous;
         }
-        entries.add(
-          _FrameworkEntry(
-            id: message.id.isNotEmpty ? message.id : 'framework-${_squeeze(text).hashCode}',
-            text: text,
-            time: message.time ?? anchor,
-          ),
-        );
       }
       setState(() {
         // 保留日志返回之前就通过 `/events` 进来的条目：同一 id 以日志为准。
@@ -292,15 +307,36 @@ class _ChatPageState extends State<ChatPage> {
           for (final entry in _framework)
             if (!ids.contains(entry.id)) entry,
         ];
-        _framework = [...entries, ...tail];
+        _framework = orderNotices([...entries, ...tail]);
         _frameworkIds
           ..clear()
-          ..addAll(entries.map((entry) => entry.id))
-          ..addAll(tail.map((entry) => entry.id));
+          ..addAll(_framework.map((entry) => entry.id));
       });
     } on ApiFailure {
       // 框架块只是补充：拿不到就只显示平台消息，不弹错。
     }
+  }
+
+  /// 框架块没有时戳时的锚点：贴在前一条平台消息之后 1ms，但不越过后一条；
+  /// 前面没消息就贴在后一条之前 1ms。锚点是一个固定时间，翻页重排也不会漂。
+  static DateTime? _anchor(DateTime? previous, DateTime? following) {
+    if (previous == null) return following?.subtract(anchorTick);
+    final after = previous.add(anchorTick);
+    // 两条平台消息挨得太近（同秒）时退回前一条的时间：同刻排序是「平台消息在前」，顺序仍对。
+    return following == null || after.isBefore(following) ? after : previous;
+  }
+
+  static TimelineNotice _notice(String id, String text, DateTime? time) => TimelineNotice(
+    // 服务端 id 优先：日志与 `/events` 同一条消息靠它去重。
+    id: id.isNotEmpty ? id : 'framework-${noticeKey(text).hashCode}',
+    text: text,
+    time: time,
+  );
+
+  /// 增量框架块没有时戳时的锚点：最近一条平台消息之后 1ms（一条消息都没有才用本机时钟）。
+  DateTime _afterLatest() {
+    final last = _messages.isEmpty ? null : _messages.last.time;
+    return last?.add(anchorTick) ?? DateTime.now();
   }
 
   /// `/events` 增量：只收框架类 entry。平台 `stream` 才是消息本体，两者互不影响。
@@ -320,13 +356,18 @@ class _ChatPageState extends State<ChatPage> {
         if (message == null || !message.isFramework) return;
         final text = message.bodyMarkdown.trim();
         if (text.isEmpty) return;
-        final id = message.id.isNotEmpty ? message.id : 'framework-${_squeeze(text).hashCode}';
+        final id = message.id.isNotEmpty ? message.id : 'framework-${noticeKey(text).hashCode}';
         if (!_frameworkIds.add(id)) return;
-        final time = message.time ?? DateTime.now();
-        // 指令类消息同时是平台发言（`chatluna …`）：已出现在气泡里的不再画第二遍。
-        if (_duplicateOfPlatform(text, time)) return;
+        // 服务端没给时戳时用「最近一条平台消息 + 1ms」，而不是本机时钟：
+        // 它早于这一轮的回复，设备时钟偏快也不会让框架块越过回复落到底部。
+        final time = message.time ?? _afterLatest();
         setState(() {
-          final next = [..._framework, _FrameworkEntry(id: id, text: text, time: time)];
+          // 按时间插进框架列表，而不是无条件追加：补发的旧条目不会跑到最新。
+          // 渲染时由 `mergeTimeline` 与平台消息合并，落在视口上方的不动滚动位置。
+          final next = orderNotices([
+            ..._framework,
+            TimelineNotice(id: id, text: text, time: time),
+          ]);
           _framework = next.length > _frameworkCap
               ? next.sublist(next.length - _frameworkCap)
               : next;
@@ -335,32 +376,6 @@ class _ChatPageState extends State<ChatPage> {
       onError: (Object _) {},
       cancelOnError: true,
     );
-  }
-
-  /// 去重键：正文压掉所有空白（换行/缩进不影响「同一条」判定）。
-  static String _squeeze(String text) => text.replaceAll(RegExp(r'\s+'), '');
-
-  /// 平台消息的正文 → 时间；框架块在服务端没给时戳时用它当锚点。
-  DateTime? _platformTimeOf(String text) {
-    final key = _squeeze(text);
-    if (key.isEmpty) return null;
-    for (final message in _messages) {
-      if (_squeeze(message.content) == key) return message.time;
-    }
-    return null;
-  }
-
-  /// 框架正文与平台消息「压空白后同文 + 时间相差 3s 内」= 同一条，不重复显示。
-  bool _duplicateOfPlatform(String text, DateTime? at) {
-    final key = _squeeze(text);
-    if (key.isEmpty) return true;
-    for (final message in _messages) {
-      if (_squeeze(message.content) != key) continue;
-      // 没有时间戳就没法对齐：正文相同按重复处理，宁少不重。
-      if (at == null) return true;
-      if (message.time.difference(at).abs() <= _dedupeWindow) return true;
-    }
-    return false;
   }
 
   /// 更早一页：游标是最早一条的时间，服务端返回它之前的一页。
@@ -704,96 +719,23 @@ class _ChatPageState extends State<ChatPage> {
     ];
   }
 
-  /// 分组窗口：同一发送者 5 分钟内的连续消息共用一次头像与名字。
-  static const Duration _groupWindow = Duration(minutes: 5);
-
-  /// 时间线：平台消息 + 框架块，按时间插好日期分隔条，并算出每条是否显示头像/名字。
-  /// 分组键 = 发送者（`bot` / `user:<id>`）+ 5 分钟窗口；跨天、跨发送者都重新起组。
-  List<_TimelineItem> _timeline() {
-    final messages = _messages;
-    if (messages.isEmpty && _framework.isEmpty) return const [];
-
-    // 平台正文索引：框架块与它们对齐去重（正文压空白 + 3s 窗口）。
-    final index = <String, List<DateTime>>{};
-    for (final message in messages) {
-      final key = _squeeze(message.content);
-      if (key.isEmpty) continue;
-      (index[key] ??= []).add(message.time);
-    }
-    final notices = <_FrameworkEntry>[
-      for (final entry in _framework)
-        if (!_isDuplicate(index, entry)) entry,
-    ];
-
-    final items = <_TimelineItem>[];
-    DateTime? day;
-    var lastSender = '';
-    DateTime? lastTime;
-
-    // 日期分隔条：跨天时顺带把分组状态清掉，后一条重新显示头像与名字。
-    void separatorFor(DateTime? at) {
-      if (at == null) return;
-      final date = DateTime(at.year, at.month, at.day);
-      if (day != null && _sameDay(day!, date)) return;
-      day = date;
-      lastSender = '';
-      lastTime = null;
-      items.add(_DayItem(date));
-    }
-
-    var next = 0;
-    for (final message in messages) {
-      // 落在这一条之前的框架块先插进去。
-      while (next < notices.length) {
-        final entry = notices[next];
-        final at = entry.time;
-        if (at == null || !at.isBefore(message.time)) break;
-        separatorFor(at);
-        items.add(_NoticeItem(entry));
-        // 框架块打断分组：后面的人重新显示头像与名字。
-        lastSender = '';
-        lastTime = null;
-        next += 1;
-      }
-      separatorFor(message.time);
-      final sender = message.outbound
-          ? 'bot'
-          : 'user:${message.userId.isNotEmpty ? message.userId : (message.userName ?? '')}';
-      final previous = lastTime;
-      final showHeader = sender != lastSender ||
-          previous == null ||
-          message.time.difference(previous).abs() > _groupWindow;
-      items.add(_MessageItem(message, showHeader: showHeader));
-      lastSender = sender;
-      lastTime = message.time;
-    }
-    // 剩下的框架块：没有时戳的排在日志尾部，按取回顺序。
-    for (; next < notices.length; next++) {
-      final entry = notices[next];
-      separatorFor(entry.time);
-      items.add(_NoticeItem(entry));
-      lastSender = '';
-      lastTime = null;
-    }
-    return items;
-  }
-
-  static bool _sameDay(DateTime a, DateTime b) =>
-      a.year == b.year && a.month == b.month && a.day == b.day;
+  /// 时间线：平台消息 + 框架块合并成一条（规则见 [mergeTimeline]）。
+  /// 框架块的锚点在加载时就已经定下，所以这里只做排序与分组，翻页后位置不漂。
+  List<TimelineItem> _timeline() => mergeTimeline(_messages, _framework);
 
   /// 时间线上的一项 → Widget。缓存键包含渲染所需的全部可变输入（id / 是否显示头部），
   /// 因此同一个实例可以安全复用；状态（折叠、图片解码）都在子 widget 自己的 State 里。
-  Widget _itemWidget(_TimelineItem item) {
+  Widget _itemWidget(TimelineItem item) {
     final (cacheKey, build) = switch (item) {
-      _DayItem(:final day) => (
+      DayDividerItem(:final day) => (
         'd:${day.toIso8601String()}',
         () => _DayDivider(day: day),
       ),
-      _NoticeItem(:final entry) => (
-        'n:${entry.id}',
-        () => FrameworkNoticeCard(foldKey: entry.id, text: entry.text, open: _noticeOpen),
+      NoticeItem(:final notice) => (
+        'n:${notice.id}',
+        () => FrameworkNoticeCard(foldKey: notice.id, text: notice.text, open: _noticeOpen),
       ),
-      _MessageItem(:final message, :final showHeader) => (
+      MessageItem(:final message, :final showHeader) => (
         'm:${message.id}:$showHeader',
         () => MessageView(
           key: ValueKey(message.id),
@@ -810,18 +752,6 @@ class _ChatPageState extends State<ChatPage> {
       ),
     };
     return _itemCache[cacheKey] ??= build();
-  }
-
-  static bool _isDuplicate(Map<String, List<DateTime>> index, _FrameworkEntry entry) {
-    final times = index[_squeeze(entry.text)];
-    if (times == null) return false;
-    final at = entry.time;
-    // 没有时间戳就没法对齐：正文相同按重复处理，宁少不重。
-    if (at == null) return true;
-    for (final time in times) {
-      if (time.difference(at).abs() <= _dedupeWindow) return true;
-    }
-    return false;
   }
 
   /// 列表首格：状态胶囊 + 流式正文。只有这一格监听 delta，整页不随 token 重建。
@@ -986,41 +916,6 @@ class _ChatPageState extends State<ChatPage> {
       ),
     );
   }
-}
-
-/// 时间线上的一项。日期分隔条没有时间（它本身就是「哪一天」）。
-sealed class _TimelineItem {
-  const _TimelineItem();
-}
-
-class _DayItem extends _TimelineItem {
-  const _DayItem(this.day);
-
-  final DateTime day;
-}
-
-class _NoticeItem extends _TimelineItem {
-  const _NoticeItem(this.entry);
-
-  final _FrameworkEntry entry;
-}
-
-class _MessageItem extends _TimelineItem {
-  const _MessageItem(this.message, {required this.showHeader});
-
-  final PlatformMessage message;
-
-  /// 同一发送者 5 分钟内的连续消息里只有第一条为 true。
-  final bool showHeader;
-}
-
-/// 一条框架消息：正文、折叠键与对齐用的时间（可能为空）。
-class _FrameworkEntry {
-  const _FrameworkEntry({required this.id, required this.text, this.time});
-
-  final String id;
-  final String text;
-  final DateTime? time;
 }
 
 /// 日期分隔条：今天 / 昨天 / `YYYY-MM-DD`，弱化居中。

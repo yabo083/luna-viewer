@@ -6,6 +6,7 @@
 
 ```powershell
 flutter analyze     # 必须 No issues found
+flutter test        # 必须 All tests passed（含 test/timeline_test.dart 的时间线合并）
 ```
 
 ## 2. 构建（Windows）
@@ -41,6 +42,8 @@ curl -s -H "Authorization: Bearer $T" 'http://127.0.0.1:5028/api/platform/messag
 | 只读 | 打开未加载的会话（`/api/sessions` 没有它）：无信息栏、无中止/压缩/分叉/切模型，只能读消息 |
 | 左右分栏 | bot 的回复（`dir=out`）在右、主色气泡；其他人（`dir=in`）在左、中性气泡；两侧 markdown 与图片都能渲染，图片点开全屏 |
 | 框架块 | 已加载会话里出现 wake / memory 卡片（居中单卡）；`chatluna help` 之类指令只出现一次（气泡，不是卡片）；未加载会话没有框架块 |
+| 框架块位置 | 同一轮里 `[skills update]` / `[tool update]` / `[memory]` 卡片排在这一轮真实对话**之前**，与会话日志的顺序一致（不沉到列表底部）；同一时刻的平台消息在卡片之前 |
+| 框架块翻页 | 向上翻两页后同一条框架卡与相邻两条消息的相对顺序不变（锚点不漂） |
 | 归档 | 最后一条消息超过 72 小时的会话从主列表消失、出现在底部「归档 · N」里；在归档里打开照常可读；收到新消息后自动回到主列表 |
 | 分页 | 长会话向上滚到最早一条：取回更早一页，首条时间不重复，滚到底仍有内容 |
 

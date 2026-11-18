@@ -176,9 +176,12 @@ Authorization: Bearer <实例 token 或登录 session>
 - `kind`：`image` | `video` | `audio` | `file`。由元素类型与 MIME 共同决定：
   `img`/`image`/`mface`/`sticker` 与 `image/*` 是 `image`，`video/*` 是 `video`，
   `audio`/`voice`/`record` 与 `audio/*`（QQ 的 `voice`）是 `audio`，其余是 `file`。
-- `url`：客户端可直接加载的地址。`http(s)://` 原样；QQ 附件常见的 `//host/path`
-  补成 `https://`；`base64://`、`data:` 原样；工作区相对路径（`medialuna/x.png`）原样，
-  客户端按既有约定走 `/api/workspace`。`url` 与 `ref` 至少给一个。
+- `url`：客户端可直接加载的地址。自托管成功的媒体是 `/api/platform/media/<file>`
+  （见下一节）；其余为 `http(s)://` 原样、QQ 附件常见的 `//host/path` 补成 `https://`、
+  `base64://`、`data:` 原样；工作区相对路径（`medialuna/x.png`）原样，客户端按既有约定走
+  `/api/workspace`。`storage://` 引用验证通过时换成 `/files/<id>`。`url` 与 `ref` 至少给一个。
+- `cached`：只有尝试过自托管的条目才有。`true` 表示 `url` 已是实例内永久地址
+  （`/api/platform/media/…` 或 `/files/…`）；`false` 表示下载失败，`url` 保留原平台地址。
 - `ref`：换不到可访问地址时原样给的原始值（`file:///...`、裸文件 id）。先试
   `bot.internal.getFile` → `bot.getFile` → `bot.internal.getFileUrl`（每个 1.2s 超时，
   结果含失败缓存 60s）；`file://` 落在工作区内时直接换成工作区相对路径，不用问平台。
@@ -219,6 +222,38 @@ Authorization: Bearer <实例 token 或登录 session>
   `@chatluna/adapter-web` 直接覆写 `sendMessage` 返回消息 id，既不发 `before-send` 也不发
   `send`，因此 web 平台的出站消息不会出现在本接口里；App 的会话只读，不受影响。
 
+## 媒体自托管（`GET /api/platform/media/<file>`）
+
+平台 CDN 的地址带时效签名（QQ `multimedia.nt.qq.com.cn/...&rkey=...`），`rkey` 过期后永久
+404；`storage://` 背后的临时文件 24h 后也会被清理。插件在消息产出时把媒体落到实例本地，
+消息里的 `url` 换成本实例地址，客户端不再依赖任何平台签名：
+
+- 下载：流式，队列并发 2，单文件上限 15MB、超时 20s；成功后按内容命名
+  `data/chatluna/platform-media/<内容 sha256 前 16 位>.<ext>`（扩展名由 `content-type`
+  推断，其次取 URL 后缀），并把 `media[].url` 改写为 `/api/platform/media/<file>`。
+- 同一 URL 只下一次：内存表记录 URL → 文件，`index.json` 落盘，重启后直接命中；进行中的
+  请求共用同一个 Promise。
+- 失败（非 2xx、超过 15MB、超时、网络）保留原 `url` 并标 `"cached": false`；成功后标
+  `"cached": true`。失败 URL 10 分钟内不再重试。
+- 单条消息最多等 4s：超预算的下载继续在后台跑，完成后再改写同一条消息的 `media`，客户端
+  下一次拉 `/api/platform/messages` 就能拿到本地地址。
+- `storage://<id>`：先 GET 本机 `/files/<id>` 验证（并发 4、3s 超时、结果缓存 5 分钟），
+  存在就把 `url` 写成 `/files/<id>`（实例内地址，客户端直接取）；不存在/已过期保留 `ref`，
+  客户端显示占位。
+- 路由只服务 `platform-media` 目录的直接子文件，文件名必须是 `<16 位十六进制>.<扩展名>`，
+  其余一律 400；文件不存在 404。响应带 `content-type`（按扩展名）与
+  `cache-control: public, max-age=31536000, immutable`（文件名即内容哈希）。未带凭证 → 401
+  （`/api` 前缀统一守卫）。
+- 磁盘上限 500MB：超过时按 mtime 淘汰最旧的媒体文件（索引同步清理），启动时也检查一次。
+  被淘汰的文件再出现会重新下载。
+
+历史消息策略：启动时的全量日志投影**只**做「索引命中」与 `storage://` 校验，不主动回填
+下载旧消息里的 CDN 地址（几百条历史里绝大多数签名早就过期，重拉没有意义）。因此：
+
+- 之前已经缓存过的媒体（`index.json` 里有记录）重启后直接显示本地地址（重启后可访问）；
+- 过期签名且从未缓存过的历史媒体仍是原 URL（没有 `cached` 字段），客户端加载失败；
+- 新产生/新捕获的消息（含实时流增量）会走完整下载流程，之后永久可用。
+
 ## 实时流（`GET /api/platform/stream`）
 
 Server-Sent Events 出口，App 保持长连接即可实时拿到入站与出站消息：
@@ -247,6 +282,9 @@ curl -N -H "Authorization: Bearer <实例 token 或登录 session>" \
 - 会话表 cap 200，超出时淘汰「最后一条消息时间最早」的会话（它的捕获增量仍在落盘文件里）。
 - 日志投影的部分不落盘（重启从 DB 重读）；捕获增量与游标落盘在
   `data/chatluna/platform-capture.json`，详见上面「数据源」的持久化小节。
+- 自托管媒体在 `data/chatluna/platform-media/`：`<sha256 前 16>.<ext>` 是内容寻址的媒体
+  文件（总上限 500MB，按 mtime 淘汰最旧的），`index.json` 是「原 URL → 文件」的索引
+  （原子写，1s 防抖）。索引丢了不影响已落盘的文件，只是要重新下载一次。
 - DB 打不开（文件缺失/被独占）时只降级为捕获路径，每 30s 重试一次；恢复后自动补一次全量。
 
 ## 安装
@@ -270,7 +308,11 @@ curl -N -H "Authorization: Bearer <实例 token 或登录 session>" \
 | `CHATLUNA_WORKSPACE` | `<cwd>/data/chatluna/agents-work` | 工作区根目录 |
 | `CHATLUNA_DB` | `<cwd>/data/chatluna.db` | ChatLuna 会话日志（只读） |
 | `CHATLUNA_PLATFORM_CAPTURE` | `<cwd>/data/chatluna/platform-capture.json` | 捕获增量与游标 |
+| `CHATLUNA_MEDIA_CACHE` | `<cwd>/data/chatluna/platform-media` | 自托管媒体目录（媒体文件 + `index.json`） |
+| `CHATLUNA_MEDIA_LIMIT_BYTES` | `524288000`（500MB） | 媒体缓存磁盘上限；只用于运维/验证时缩小 |
+| `CHATLUNA_MEDIA_ORIGIN` | 由 server 端口推断（`http://127.0.0.1:<port>`） | 校验 `storage://` 时请求 `/files/<id>` 的基址 |
 
 ## 后续
 
-上传（客户端发图）、短时签名 URL、缩略图生成会加在同一个插件里，路由保持在 `/api/workspace*`。
+上传（客户端发图）、缩略图生成会加在同一个插件里，路由保持在 `/api/workspace*`。媒体自托管
+已覆盖「持久可访问」：消息里的媒体由本实例落盘并改写为 `/api/platform/media/<file>`。
