@@ -178,6 +178,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 中止请求在途：按钮暂时置灰，避免连点发出两次 cancel。
   bool _cancelling = false;
 
+  /// 本轮是否在跑：由 [TurnClock] 的收表状态驱动，不依赖 `/live` 有没有出帧。
+  bool _turnActive = false;
+
   /// 整轮 + 分阶段计时：起点是 turn_start（`/events` 入队 mark 与首个 active snapshot 取更早），
   /// 终点是「生成已停 + 最后一条 bot 外发落库」，取更晚者。结束后冻结 2s，
   /// 再弱化成常驻的「上一轮 1m04s」。
@@ -1143,7 +1146,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 计时通知：只在「开轮 / 收表」两个转折上动列表，tick 本身不触发页面重建。
   void _onClockTick() {
     final view = _clock.view.value;
-    if (!mounted || view == null) return;
+    if (!mounted) return;
+    final active = view != null && !view.finished;
+    if (active != _turnActive) setState(() => _turnActive = active);
+    if (view == null) return;
     if (!view.finished) {
       // 新的一轮（读数从 0 起）：上一轮的外发标记不能带进来。
       if (view.total < const Duration(milliseconds: 400)) {
@@ -1539,9 +1545,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           // 会话级操作只对已加载会话开放：未加载的会话在服务端没有日志与 agent。
           if (_loaded) ...[
             IconButton(
-              // 只要有生成在等就保持高亮：`/live` 常常不出帧，不能拿它决定按钮死活。
-              // 没有生成时按下去是幂等的（服务端 `cancel` 返回 ok，界面不动）。
-              onPressed: _cancelling ? null : _cancel,
+              // 只有本轮真的在跑（计时器未收表，或 `/live` 说在生成）才可点；
+              // 空闲时置灰，按下去也不会发生任何事。
+              onPressed: (_turnActive || _live.generating) && !_cancelling
+                  ? _cancel
+                  : null,
               icon: const Icon(Icons.stop_circle_outlined),
               tooltip: '中止当前生成',
             ),
