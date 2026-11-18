@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/capability/sessions_repository.dart';
 import '../../core/model/models.dart';
+import 'chat_chrome.dart';
 import 'message_view.dart';
 
 /// 会话详情：只读历史 + 实时流 + 会话级操作（中止 / 压缩 / 分叉 / 重新载入）。
@@ -247,14 +248,13 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  String? get _debugTiming {
-    if (!kDebugMode) return null;
-    final parts = [
+  List<String> _debugMetrics() {
+    if (!kDebugMode) return const [];
+    return [
       if (_netMs != null) 'net ${_netMs}ms',
       if (_paintMs != null) 'paint ${_paintMs}ms',
       if (_liveMs != null) 'live ${_liveMs}ms',
     ];
-    return parts.isEmpty ? null : parts.join(' · ');
   }
 
   @override
@@ -264,7 +264,10 @@ class _ChatPageState extends State<ChatPage> {
     final streaming = _streaming.isEmpty ? 0 : 1;
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        title: ChatTitle(
+          title: widget.session.title,
+          onTap: () => showSessionDetails(context, widget.session),
+        ),
         actions: [
           IconButton(
             onPressed: _running ? _cancel : null,
@@ -300,12 +303,13 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: Column(
         children: [
-          _Header(
+          ChatInfoBar(
             session: widget.session,
             running: _running,
             liveOk: _liveOk,
             botName: widget.botName,
-            debugTiming: _debugTiming,
+            avatarUrl: widget.avatarUrl,
+            debugMetrics: _debugMetrics(),
           ),
           Expanded(
             child: _loading
@@ -371,42 +375,6 @@ class _ChatPageState extends State<ChatPage> {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _Header extends StatelessWidget {
-  const _Header({
-    required this.session,
-    required this.running,
-    required this.liveOk,
-    this.botName,
-    this.debugTiming,
-  });
-
-  final SessionSummary session;
-  final bool running;
-  final bool liveOk;
-  final String? botName;
-  final String? debugTiming;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final parts = [
-      ?botName,
-      session.origin,
-      if (session.engine.isNotEmpty) session.engine,
-      if (session.model != null) session.model!.toString(),
-      if (running) '运行中',
-      if (!liveOk) '实时流不可用·轮询中',
-      ?debugTiming,
-    ];
-    return Container(
-      width: double.infinity,
-      color: theme.colorScheme.surfaceContainerHighest,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: Text(parts.join(' · '), style: theme.textTheme.bodySmall),
     );
   }
 }

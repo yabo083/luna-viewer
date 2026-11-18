@@ -130,51 +130,10 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   Future<void> _openSettings() async {
-    final mode = widget.themeMode.value;
     final picked = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.brightness_6_outlined),
-              title: const Text('主题'),
-              subtitle: Text(switch (mode) {
-                ThemeMode.light => '浅色',
-                ThemeMode.dark => '深色',
-                ThemeMode.system => '跟随系统',
-              }),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.pop(context, 'theme'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.system_update_alt),
-              title: const Text('检查更新'),
-              onTap: () => Navigator.pop(context, 'update'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.copy_all_outlined),
-              title: const Text('复制诊断信息'),
-              subtitle: const Text('版本 / 地址 / 机器人'),
-              onTap: () => Navigator.pop(context, 'diag'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.info_outline),
-              title: const Text('关于'),
-              subtitle: Text('版本 $appVersion'),
-              onTap: () => Navigator.pop(context, 'about'),
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.link_off),
-              title: const Text('断开连接'),
-              onTap: () => Navigator.pop(context, 'disconnect'),
-            ),
-          ],
-        ),
-      ),
+      builder: (context) => _settingsSheet(context, widget.themeMode.value),
     );
     if (picked == null || !mounted) return;
     switch (picked) {
@@ -207,6 +166,59 @@ class _SessionsPageState extends State<SessionsPage> {
       case 'disconnect':
         await _confirmDisconnect();
     }
+  }
+
+  Widget _settingsSheet(BuildContext context, ThemeMode mode) {
+    final scheme = Theme.of(context).colorScheme;
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const _SheetSectionLabel('外观'),
+            ListTile(
+              leading: const Icon(Icons.brightness_6_outlined),
+              title: const Text('主题'),
+              subtitle: Text(switch (mode) {
+                ThemeMode.light => '浅色',
+                ThemeMode.dark => '深色',
+                ThemeMode.system => '跟随系统',
+              }),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.pop(context, 'theme'),
+            ),
+            const _SheetSectionLabel('更新'),
+            ListTile(
+              leading: const Icon(Icons.system_update_alt),
+              title: const Text('检查更新'),
+              subtitle: Text('当前 $appVersion'),
+              onTap: () => Navigator.pop(context, 'update'),
+            ),
+            const _SheetSectionLabel('关于'),
+            ListTile(
+              leading: const Icon(Icons.copy_all_outlined),
+              title: const Text('复制诊断信息'),
+              subtitle: const Text('版本 / 地址 / 机器人'),
+              onTap: () => Navigator.pop(context, 'diag'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: const Text('关于 ChatLuna'),
+              onTap: () => Navigator.pop(context, 'about'),
+            ),
+            const _SheetSectionLabel('危险区'),
+            ListTile(
+              leading: Icon(Icons.link_off, color: scheme.error),
+              title: Text('断开连接', style: TextStyle(color: scheme.error)),
+              subtitle: const Text('清除本机保存的 token'),
+              onTap: () => Navigator.pop(context, 'disconnect'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _pickTheme() async {
@@ -343,7 +355,6 @@ class _SessionsPageState extends State<SessionsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
         title: const Text('会话'),
@@ -357,34 +368,33 @@ class _SessionsPageState extends State<SessionsPage> {
         child: _loading && _items.isEmpty
             ? const Center(child: CircularProgressIndicator())
             : _error != null && _items.isEmpty
-            ? ListView(
-                children: [
-                  const SizedBox(height: 120),
-                  Center(child: Text(_error!, style: TextStyle(color: theme.colorScheme.error))),
-                  const SizedBox(height: 12),
-                  Center(child: FilledButton(onPressed: _refresh, child: const Text('重试'))),
-                ],
+            ? _StatusView(
+                icon: Icons.cloud_off_outlined,
+                title: '加载失败',
+                message: _error!,
+                tinted: true,
+                action: FilledButton.tonalIcon(
+                  onPressed: () => _refresh(),
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text('重试'),
+                ),
               )
             : _items.isEmpty
-            ? ListView(
-                padding: const EdgeInsets.fromLTRB(32, 96, 32, 32),
-                children: [
-                  Icon(Icons.bolt_outlined, size: 40, color: theme.colorScheme.onSurfaceVariant),
-                  const SizedBox(height: 12),
-                  Text('实例当前没有活跃会话', textAlign: TextAlign.center, style: theme.textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  Text(
-                    'ChatLuna 只把已加载的会话列出来。在聊天软件里发一条消息，或等下一次主动唤醒后再下拉刷新。',
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                  ),
-                  const SizedBox(height: 16),
-                  Center(child: OutlinedButton(onPressed: _refresh, child: const Text('刷新'))),
-                ],
+            ? _StatusView(
+                icon: Icons.forum_outlined,
+                title: '暂无活跃会话',
+                message: '去聊天软件发一条消息，再回来刷新',
+                action: OutlinedButton.icon(
+                  onPressed: () => _refresh(),
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text('刷新'),
+                ),
               )
             : ListView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
                 children: [
-                  for (final row in _rows(context)) row,
+                  for (final row in _rows()) row,
                   SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
                 ],
               ),
@@ -392,48 +402,31 @@ class _SessionsPageState extends State<SessionsPage> {
     );
   }
 
-  List<Widget> _rows(BuildContext context) {
+  List<Widget> _rows() {
     final active = _items.where((item) => item.running).toList();
     final rest = _items.where((item) => !item.running).toList();
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
     return [
       if (active.isNotEmpty) ...[
-        _SectionHeader(label: '运行中会话', count: active.length),
+        _SectionHeader(label: '运行中会话', count: active.length, highlighted: true, topPadding: 8),
         for (final session in active) _tile(session),
       ],
-      _SectionHeader(label: active.isEmpty ? '全部活跃会话' : '其他会话', count: rest.length),
-      for (final session in rest) _tile(session),
+      if (rest.isNotEmpty) ...[
+        _SectionHeader(
+          label: active.isEmpty ? '全部活跃会话' : '其他会话',
+          count: rest.length,
+          topPadding: active.isEmpty ? 8 : 12,
+        ),
+        for (final session in rest) _tile(session),
+      ],
     ];
   }
 
-  Widget _tile(SessionSummary session) => ListTile(
-    leading: AssistantAvatar(size: 36, imageUrl: _bot?.avatar),
+  Widget _tile(SessionSummary session) => _SessionTile(
+    session: session,
+    avatarUrl: _bot?.avatar,
     onTap: () => _open(session),
     onLongPress: () => _actions(session),
-    title: Text(session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-    subtitle: Text(
-      [
-        session.origin,
-        if (session.engine.isNotEmpty) session.engine,
-        if (session.model != null) session.model!.toString(),
-      ].join(' · '),
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-    ),
-    trailing: session.running
-        ? const SizedBox(
-            width: 10,
-            height: 10,
-            child: DecoratedBox(
-              decoration: BoxDecoration(color: Color(0xFF4ADE80), shape: BoxShape.circle),
-            ),
-          )
-        : Text(
-            _relativeTime(session.createdAt),
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
   );
 }
 
@@ -448,25 +441,282 @@ String _relativeTime(DateTime time) {
 }
 
 class _SectionHeader extends StatelessWidget {
-  const _SectionHeader({required this.label, required this.count});
+  const _SectionHeader({
+    required this.label,
+    required this.count,
+    this.highlighted = false,
+    this.topPadding = 8,
+  });
 
   final String label;
   final int count;
+  final bool highlighted;
+  final double topPadding;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(12, topPadding, 12, 8),
+      child: Row(
+        children: [
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              letterSpacing: 1.4,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1),
+            decoration: BoxDecoration(
+              color: highlighted
+                  ? scheme.primary.withValues(alpha: 0.12)
+                  : scheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              '$count',
+              style: theme.textTheme.labelSmall?.copyWith(
+                height: 1.5,
+                fontWeight: FontWeight.w600,
+                color: highlighted ? scheme.primary : scheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 会话行：运行中的左侧留 2px 色条，标题最多两行，时间用更弱的一级字重。
+class _SessionTile extends StatelessWidget {
+  const _SessionTile({
+    required this.session,
+    required this.avatarUrl,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  static const _runningDot = Color(0xFF22C55E);
+
+  final SessionSummary session;
+  final String? avatarUrl;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final detail = [
+      session.origin,
+      if (session.engine.isNotEmpty) session.engine,
+      if (session.model != null) session.model!.toString(),
+    ].join(' · ');
+    return Stack(
+      children: [
+        InkWell(
+          onTap: onTap,
+          onLongPress: onLongPress,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: Row(
+              children: [
+                AssistantAvatar(size: 36, imageUrl: avatarUrl),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        session.title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          height: 1.25,
+                          fontWeight: session.running ? FontWeight.w600 : FontWeight.w500,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        detail,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant.withValues(alpha: 0.85),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                SizedBox(
+                  width: 92,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          _relativeTime(session.createdAt),
+                          maxLines: 1,
+                          softWrap: false,
+                          overflow: TextOverflow.fade,
+                          textAlign: TextAlign.end,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
+                          ),
+                        ),
+                      ),
+                      if (session.running) ...[
+                        const SizedBox(width: 6),
+                        Tooltip(
+                          message: '运行中',
+                          child: Container(
+                            width: 16,
+                            height: 16,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _runningDot.withValues(alpha: 0.16),
+                            ),
+                            child: Container(
+                              width: 7,
+                              height: 7,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: _runningDot,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (session.running)
+          Positioned(
+            left: 0,
+            top: 12,
+            bottom: 12,
+            child: Container(
+              width: 2,
+              decoration: BoxDecoration(
+                color: scheme.primary,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// 空/错误共用的居中状态：一个图标、一句原因、一个动作，垂直居中且可下拉刷新。
+class _StatusView extends StatelessWidget {
+  const _StatusView({
+    required this.icon,
+    required this.title,
+    required this.message,
+    required this.action,
+    this.tinted = false,
+  });
+
+  final IconData icon;
+  final String title;
+  final String message;
+  final Widget action;
+  final bool tinted;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return LayoutBuilder(
+      builder: (context, constraints) => ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: tinted
+                            ? scheme.errorContainer.withValues(alpha: 0.45)
+                            : scheme.surfaceContainerHighest.withValues(alpha: 0.7),
+                      ),
+                      child: Icon(
+                        icon,
+                        size: 26,
+                        color: tinted ? scheme.onErrorContainer : scheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Text(
+                      title,
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 300),
+                      child: Text(
+                        message,
+                        textAlign: TextAlign.center,
+                        maxLines: 4,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    action,
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SheetSectionLabel extends StatelessWidget {
+  const _SheetSectionLabel(this.label);
+
+  final String label;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 6),
-      child: Row(
-        children: [
-          Text(label, style: theme.textTheme.labelLarge),
-          const SizedBox(width: 6),
-          Text(
-            '$count',
-            style: theme.textTheme.labelMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-          ),
-        ],
+      padding: const EdgeInsets.fromLTRB(24, 16, 24, 4),
+      child: Text(
+        label,
+        style: theme.textTheme.labelSmall?.copyWith(
+          letterSpacing: 1.4,
+          fontWeight: FontWeight.w600,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
       ),
     );
   }
