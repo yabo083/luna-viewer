@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/model/models.dart';
+import '../../core/transport/state_socket.dart';
 import 'assistant_avatar.dart';
 
 /// 会话名的紧凑解析结果：可读短名 + 用于区分的 id 尾号。
@@ -204,6 +205,105 @@ class ChatInfoBar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+/// 未加载会话的轻量信息栏：`bot 名 · 平台 · 未加载`。
+/// 这里刻意没有动画与状态灯语义——服务端还没有这个会话的 agent，
+/// 任何「思考中 / 回复中」都是假的；等它被加载后由 [ChatInfoBar] 接管。
+class ChatUnloadedBar extends StatelessWidget {
+  const ChatUnloadedBar({super.key, this.botName, this.avatarUrl, this.origin = ''});
+
+  final String? botName;
+  final String? avatarUrl;
+
+  /// 平台名（`qq` 等）：插件会话键自带的平台，不依赖 `/api/sessions`。
+  final String origin;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final name = botName?.trim() ?? '';
+    final platform = origin.trim();
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.fromLTRB(16, 1, 16, 5),
+      child: Row(
+        spacing: 6,
+        children: [
+          if (name.isNotEmpty)
+            _InfoPill(
+              label: name,
+              leading: AssistantAvatar(
+                size: _PillSurface.contentHeight,
+                imageUrl: avatarUrl,
+              ),
+            ),
+          if (platform.isNotEmpty) _InfoPill(label: platform),
+          _PillSurface(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              spacing: _PillSurface.gap,
+              children: [
+                _Dot(color: scheme.onSurfaceVariant),
+                Text(
+                  '未加载',
+                  maxLines: 1,
+                  style: _pillLabelStyle(context, scheme.onSurfaceVariant),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// bot 身份（名字 + 头像）：`adapters.bots` 取一次就够，会话列表页与详情页共用同一次请求。
+/// 取不到时保持空——头像由 `AssistantAvatar` 渐变占位，名字那一枚胶囊不画。
+class BotIdentity {
+  BotIdentity._();
+
+  static Uri? _base;
+  static BotProfile? _profile;
+  static String? _avatar;
+  static Future<void>? _pending;
+
+  /// 该实例已缓存的 bot 身份；换实例（地址不同）后不复用旧身份。
+  static BotProfile? profileFor(Uri base) => _base == base ? _profile : null;
+
+  /// 该实例的 bot 头像，已补成绝对地址（`user.avatar` 可能是相对路径）。
+  static String? avatarFor(Uri base) => _base == base ? _avatar : null;
+
+  /// 取一次身份并缓存：并发调用共享同一次 WS 请求，失败后下一次再试。
+  static Future<void> load({required Uri base, required String token}) {
+    if (_base != base) {
+      _base = base;
+      _profile = null;
+      _avatar = null;
+      _pending = null;
+    }
+    final pending = _pending;
+    if (pending != null) return pending;
+    if (_profile != null) return Future<void>.value();
+    final future = _fetch(base, token);
+    _pending = future;
+    return future.whenComplete(() => _pending = null);
+  }
+
+  static Future<void> _fetch(Uri base, String token) async {
+    try {
+      final value = await StateSocket(base: base, token: token).fetch('adapters.bots');
+      // 期间换了实例：这次结果作废，别把旧实例的身份写进新缓存。
+      if (_base != base) return;
+      final bot = BotProfile.pick(value);
+      if (bot == null) return;
+      _profile = bot;
+      _avatar = absoluteResourceUrl(base, bot.avatar) ?? _avatar;
+    } catch (_) {
+      // 取不到身份只是少一枚头像/名字：保持占位，等下一次 load 再试。
+    }
   }
 }
 

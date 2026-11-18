@@ -911,8 +911,10 @@ class _MediaBlock extends StatelessWidget {
     String? imageUrlOf(PlatformMedia item) {
       if (!item.isImage) return null;
       if (item.url != null && item.url!.isNotEmpty) return item.url;
-      final ref = item.ref;
+      var ref = item.ref;
       if (ref == null || ref.isEmpty) return null;
+      // 日志侧引用形如 `storage://<id>`，实例按 id 暴露在 `/files/<id>`。
+      if (ref.startsWith('storage://')) ref = ref.substring('storage://'.length);
       return '/files/${Uri.encodeComponent(ref)}';
     }
 

@@ -14,6 +14,7 @@ import '../../core/store/connection_store.dart';
 import '../../core/transport/api_client.dart';
 import '../../core/transport/state_socket.dart';
 import '../../core/update/update_checker.dart';
+import '../chat/assistant_avatar.dart';
 import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
 import '../chat/message_view.dart';
@@ -70,13 +71,23 @@ class _SessionsPageState extends State<SessionsPage> {
 
   bool _searching = false;
   BotProfile? _bot;
+
+  /// bot 自己的头像（`adapters.bots.user.avatar`，已补成绝对地址）：
+  /// 列表顶部与详情页共用，取不到时 `AssistantAvatar` 渐变占位。
+  String? _botAvatar;
   bool _loading = true;
   String? _error;
   bool _showDevInfo = false;
 
+  /// 已加载表最近一次对齐时间：流帧触发的 `/api/sessions` 补齐最多 5s 一次。
+  DateTime? _loadedSyncedAt;
+
   @override
   void initState() {
     super.initState();
+    // 同实例取过一次就直接用，不等 WS 再回一遍；换实例后缓存自动作废。
+    _bot = BotIdentity.profileFor(widget.connection.base);
+    _botAvatar = BotIdentity.avatarFor(widget.connection.base);
     _refresh();
     _startStream();
     _checkUpdate();
@@ -99,12 +110,16 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   Future<void> _loadBot() async {
-    final profile = await StateSocket(
-      base: widget.connection.base,
-      token: widget.connection.token,
-    ).fetch('adapters.bots');
-    final bot = BotProfile.pick(profile);
-    if (bot != null && mounted) setState(() => _bot = bot);
+    final base = widget.connection.base;
+    await BotIdentity.load(base: base, token: widget.connection.token);
+    if (!mounted) return;
+    final bot = BotIdentity.profileFor(base);
+    if (bot == null) return;
+    // 头像可能是相对路径（`/files/…`）：`Image.network` 只吃绝对地址，缓存里已是绝对地址。
+    setState(() {
+      _bot = bot;
+      _botAvatar = BotIdentity.avatarFor(base);
+    });
   }
 
   Future<void> _checkUpdate() async {
@@ -167,6 +182,7 @@ class _SessionsPageState extends State<SessionsPage> {
       });
       // 全量对齐之后算一次「刚同步过」，避免紧接着的流帧再补一遍会话表。
       _syncedAt = DateTime.now();
+      _loadedSyncedAt = DateTime.now();
     } on ApiFailure catch (e) {
       if (e.isUnauthorized) {
         await widget.onDisconnect();
@@ -211,6 +227,39 @@ class _SessionsPageState extends State<SessionsPage> {
     }
   }
 
+  /// `/api/sessions` 对齐：QQ 里发一条消息 → 服务端建会话 → agent 认领，
+  /// 最多 5s 就能把 `session` 挂到对应行上（绿点、状态、操作菜单、进详情的 `/live`），
+  /// 不用下拉刷新。只对齐第一页；分页拿到的旧行原样保留，游标不动。
+  void _syncLoaded({bool force = false}) {
+    final now = DateTime.now();
+    final last = _loadedSyncedAt;
+    if (!force && last != null && now.difference(last) < const Duration(seconds: 5)) {
+      return;
+    }
+    _loadedSyncedAt = now;
+    unawaited(_reloadLoaded());
+  }
+
+  Future<void> _reloadLoaded() async {
+    try {
+      final page = await _repo.list();
+      if (!mounted) return;
+      final fresh = {for (final session in page.items) session.id};
+      setState(() {
+        final merged = <SessionSummary>[
+          ...page.items,
+          for (final session in _loaded)
+            if (!fresh.contains(session.id)) session,
+        ];
+        _loaded
+          ..clear()
+          ..addAll(merged);
+      });
+    } on ApiFailure {
+      // 列表已经有内容：这一拍对齐失败就等下一次流帧或下拉刷新。
+    }
+  }
+
   /// 列表页也订阅实时流：新消息让对应行自己更新，不用下拉刷新。
   void _startStream() {
     final token = widget.connection.token;
@@ -232,6 +281,9 @@ class _SessionsPageState extends State<SessionsPage> {
       // 插件里还没有这个会话（第一条消息刚到）：补一次会话表拿标题等元数据。
       // 这是「新增一行」，不是重排整页——已加载的表与滚动位置都不动。
       _syncConversations();
+      // 同一拍也问一次 `/api/sessions`：agent 往往就在这条消息之后被认领，
+      // 行上得尽快有 `session`，用户点进去才有信息栏与状态流。
+      _syncLoaded();
       return;
     }
     final current = _conversations[index];
@@ -240,6 +292,8 @@ class _SessionsPageState extends State<SessionsPage> {
     // 重连会回放各会话最近 5 条：比手上的最后一条更早就不改这一行。
     if (last != null && !message.time.isAfter(last.time)) return;
     _conversations[index] = current.copyWith(count: current.count + 1, last: message);
+    // 已有会话的新消息同样可能刚把 agent 叫醒：顺手对齐一次已加载表（5s 一次）。
+    _syncLoaded();
     // 同一帧内到多帧只重建一次：回放阶段连续 setState 会把手指下的点击也拖慢。
     if (_beatScheduled) return;
     _beatScheduled = true;
@@ -492,7 +546,7 @@ class _SessionsPageState extends State<SessionsPage> {
           title: row.title,
           origin: row.conversation?.platform ?? row.session?.origin ?? '',
           session: row.session,
-          avatarUrl: _bot?.avatar,
+          avatarUrl: _botAvatar,
           botName: _bot?.name,
           showDeveloperInfo: _showDevInfo,
         ),
@@ -500,7 +554,9 @@ class _SessionsPageState extends State<SessionsPage> {
     );
     if (!mounted) return;
     // 详情页自己订阅了实时流；回来只补一次会话表元数据（计数/最后一条），不整页刷新。
+    // 已加载表也顺手对齐：详情页里会话可能刚被 agent 认领，行上要跟着有绿点与状态。
     unawaited(_syncConversations());
+    _syncLoaded(force: true);
   }
 
   Future<void> _actions(_SessionRow row) async {
@@ -575,7 +631,15 @@ class _SessionsPageState extends State<SessionsPage> {
                 icon: const Icon(Icons.arrow_back),
                 tooltip: '返回会话',
               )
-            : null,
+            // 列表顶部放 bot 自己的真实头像（`adapters.bots`）：这是「哪个实例在跑」的
+            // 唯一身份标识；取不到时就是 AssistantAvatar 的渐变占位。
+            : Tooltip(
+                message: _bot?.name ?? 'ChatLuna',
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: AssistantAvatar(size: 28, imageUrl: _botAvatar),
+                ),
+              ),
         // 标题槽在「会话」与搜索框之间横切切换。AppBar 高度只由 toolbarHeight 决定，
         // 两种标题内容都压在 40dp 以内，所以进出搜索不会改变 AppBar 尺寸。
         title: _archiveOpen
@@ -881,9 +945,10 @@ class _SessionsPageState extends State<SessionsPage> {
     // 固定 key：实时帧引起的重排只移动元素，不会把手指下的 InkWell 重建掉。
     key: ValueKey(row.key),
     row: row,
-    // 会话头像只代表对方/群：插件给 `conversation.avatar` 就用它，缺了由 `_SessionTile`
-    // 按会话形态退回首字/图标占位——**不回退 bot 头像**（那是助手自己，会把会话认错）。
-    avatarUrl: row.conversation?.avatar,
+    // 会话头像只代表对方/群：插件给 `conversation.avatar` 就用它（相对路径补成绝对地址），
+    // 缺了由 `_SessionTile` 按会话形态退回首字/图标占位——**不回退 bot 头像**
+    // （那是助手自己，会把会话认错）。
+    avatarUrl: absoluteResourceUrl(widget.connection.base, row.conversation?.avatar),
     onTap: () => _open(row),
     onLongPress: () => _actions(row),
   );

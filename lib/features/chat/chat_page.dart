@@ -91,11 +91,25 @@ class ChatPage extends StatefulWidget {
   State<ChatPage> createState() => _ChatPageState();
 }
 
-class _ChatPageState extends State<ChatPage> {
+class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 一页的消息条数；向上滚动时按「更早一页」继续取。
   static const _pageSize = 50;
 
+  /// 状态轮询间隔：未加载时探测「agent 被认领了没」，`/live` 断开时兜底读 running。
+  /// 3s 跟得上「QQ 里发一条消息 → 服务端建会话 → agent 加载」，又不至于变成高频请求。
+  static const _pollInterval = Duration(seconds: 3);
+
+  /// 探测页只看第一页：新会话由服务端按最近活动排在最前，一页足够。
+  static const int _pollPageSize = 50;
+
+  /// `/live` 掉线后的重连间隔：轮询先顶上，流晚一点接回来。
+  static const _liveRetryDelay = Duration(seconds: 9);
+
   final _scroll = ScrollController();
+
+  /// 会话是否已被 ChatLuna 加载：进入详情时可能还没加载（QQ 里刚发第一条消息），
+  /// 之后的轮询会把它补上。`widget.session` 只是进入时的快照。
+  SessionSummary? _session;
 
   /// 已加载的消息，时间升序（最新在末尾；倒序列表把它按 index 反过来渲染）。
   List<PlatformMessage> _messages = const [];
@@ -139,6 +153,16 @@ class _ChatPageState extends State<ChatPage> {
   Timer? _snapshotTimer;
   bool _liveStarted = false;
 
+  /// 状态轮询表：未加载时探测会话，`/live` 掉线时兜底读 running。
+  /// 页面不可见（App 后台 / 被别的路由盖住）或已加载且流在线时停表。
+  Timer? _pollTimer;
+  Timer? _liveRetryTimer;
+  bool _pollInFlight = false;
+  bool _foreground = true;
+
+  /// `/live` 不在线：状态来自轮询，信息栏显示「轮询中」。
+  bool _polling = false;
+
   /// 首个 snapshot 是否已到：权威帧之前，`session.running` 只是乐观值。
   bool _snapshotSeen = false;
 
@@ -153,6 +177,11 @@ class _ChatPageState extends State<ChatPage> {
   /// 会话当前模型；切换成功后立即反映到信息栏与详情。
   ModelRef? _model;
 
+  /// bot 身份（名字 + 头像）：列表页取过就原样带上；没带上（WS 慢/失败）时
+  /// 详情页自己从同一份缓存补一次，取不到头像就交给 `AssistantAvatar` 渐变占位。
+  String? _botName;
+  String? _botAvatar;
+
   /// 首屏时间与首个网络/实时事件的耗时，开发者信息里显示。
   late final DateTime _t0;
   int? _netMs;
@@ -165,28 +194,66 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     _t0 = DateTime.now();
-    _model = widget.session?.model;
+    _session = widget.session;
+    _model = _session?.model;
+    // 列表页已经取过 bot 身份：优先用它的缓存，避免详情页再开一次 WS。
+    _botName = widget.botName ?? BotIdentity.profileFor(widget.base)?.name;
+    _botAvatar = absoluteResourceUrl(
+      widget.base,
+      widget.avatarUrl ?? BotIdentity.avatarFor(widget.base),
+    );
     // 列表页的 running 只做乐观值：首个 snapshot 到达后一律以服务端为准。
-    _live = (widget.session?.running ?? false) ? LiveState.thinking : LiveState.idle;
+    _live = (_session?.running ?? false) ? LiveState.thinking : LiveState.idle;
     _scroll.addListener(_onScroll);
+    WidgetsBinding.instance.addObserver(this);
     _load();
     // 首帧先画出来再连实时流：SSE 握手与首个 snapshot 会和首屏排版抢时间。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       // 首帧上屏时间：点击 → 可见反馈的本地耗时，debug 头部显示。
       _paintMs ??= _since();
-      // 未加载的会话没有 agent：`/live` 只会 404，不连。
-      if (widget.session != null) {
+      // 未加载的会话没有 agent：`/live` 只会 404，不连；先起 3s 探测表，
+      // agent 一被加载就接上 `/live` 与操作菜单。
+      if (_loaded) {
         _startLive();
         // 增量事件同样放到首帧之后：它只补充中间块，不能拖慢首屏。
         _startEvents();
       }
       _startStream();
+      _ensurePolling();
+      // 列表页取头像还没回来（或失败）：详情页自己补一次，成功前用渐变占位。
+      if (_botName == null || _botAvatar == null) unawaited(_loadBotIdentity());
     });
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // `ModalRoute.of` 依赖路由状态：被别的路由盖住（含弹层、左缘右滑返回）时
+    // isCurrent 变化会重走进来，据此停表 / 重新起表，不需要全局 RouteObserver。
+    _ensurePolling();
+    // 重新露出来时立刻把 `/live` 接回来：轮询只是兜底，别让它长期替代真实阶段。
+    if (_loaded && _polling && !_liveStarted) _startLive();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground) {
+      _ensurePolling();
+      // 回前台立刻补一拍，不等下一个 3s；`/live` 掉了也在这里接回来。
+      if (_pollTimer != null) unawaited(_pollTick());
+      if (_loaded && _polling && !_liveStarted) _startLive();
+    } else {
+      _stopPolling();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pollTimer?.cancel();
+    _liveRetryTimer?.cancel();
     _scroll.removeListener(_onScroll);
     _flushTimer?.cancel();
     _streamingText.dispose();
@@ -202,7 +269,106 @@ class _ChatPageState extends State<ChatPage> {
 
   int _since() => DateTime.now().difference(_t0).inMilliseconds;
 
-  bool get _loaded => widget.session != null;
+  bool get _loaded => _session != null;
+
+  /// 详情页是否在最前：被别的路由盖住时不算可见（不探测、不轮询）。
+  bool get _routeVisible => ModalRoute.of(context)?.isCurrent ?? true;
+
+  // ------------------------------------------------------------ 加载状态轮询
+
+  /// 轮询表的唯一开关：
+  /// - 未加载 → 每 3s 探一次 `/api/sessions`，一旦命中就接 `/live` 并停表；
+  /// - 已加载但 `/live` 掉线 → 每 3s 兜底读 `running`；
+  /// - 页面不可见（App 后台 / 被别的路由盖住）→ 停表；
+  /// - 已加载且流在线 → 停表。
+  void _ensurePolling() {
+    final needed = _foreground && _routeVisible && (!_loaded || _polling);
+    if (needed) {
+      _pollTimer ??= Timer.periodic(_pollInterval, (_) => unawaited(_pollTick()));
+    } else {
+      _stopPolling();
+    }
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  Future<void> _pollTick() async {
+    if (!mounted || _pollInFlight) return;
+    if (!_foreground || !_routeVisible) {
+      _stopPolling();
+      return;
+    }
+    _pollInFlight = true;
+    try {
+      final page = await widget.repo.list(limit: _pollPageSize);
+      if (!mounted) return;
+      final key = normalizeConversationKey(widget.conversationKey);
+      SessionSummary? match;
+      for (final item in page.items) {
+        if (normalizeConversationKey(item.id) == key) {
+          match = item;
+          break;
+        }
+      }
+      if (!_loaded) {
+        if (match != null) _attach(match);
+        return;
+      }
+      // 已加载、`/live` 不在线：只能从 `running` 判断有没有在生成，
+      // 分不清思考/回复，所以按「思考中」展示——用户至少知道 bot 在干活。
+      if (_polling) {
+        final running = match?.running ?? false;
+        _setLive(running ? LiveState.thinking : LiveState.idle);
+      }
+    } on ApiFailure {
+      // 探测与兜底都是后台补齐：网络抖动等下一拍，不弹错、不影响消息流。
+    } finally {
+      _pollInFlight = false;
+      if (mounted) _ensurePolling();
+    }
+  }
+
+  /// 探测命中：会话刚被 agent 认领，补上信息栏、操作菜单、`/live`、框架块与事件流。
+  void _attach(SessionSummary session) {
+    if (!mounted) return;
+    setState(() {
+      _session = session;
+      _model = session.model;
+      // 服务端说在跑：先挂乐观的「思考中」，首个 snapshot 会纠正。
+      if (session.running) _live = LiveState.thinking;
+    });
+    // 已加载：探测表该收了（`/live` 在线后不会再打开）。
+    _ensurePolling();
+    unawaited(_loadFramework());
+    _startLive();
+    _startEvents();
+  }
+
+  /// `/live` 不掉线时，状态灯的第四种「轮询中」由这里接管。
+  StatusLight get _statusLight {
+    // 有生成在跑就优先报实际阶段——这是 App 的核心信息，不能被兜底模式盖掉。
+    if (_live != LiveState.idle) return _live.statusLight;
+    return _polling ? StatusLight.polling : StatusLight.idle;
+  }
+
+  /// 列表页没拿到 bot 身份时补一次：`adapters.bots` 全进程只取一次（见 [BotIdentity]）。
+  Future<void> _loadBotIdentity() async {
+    final token = _bearer;
+    if (token == null || token.isEmpty) return;
+    await BotIdentity.load(base: widget.base, token: token);
+    if (!mounted) return;
+    final bot = BotIdentity.profileFor(widget.base);
+    if (bot == null) return;
+    setState(() {
+      _botName = bot.name;
+      _botAvatar = absoluteResourceUrl(widget.base, BotIdentity.avatarFor(widget.base));
+    });
+    // 消息头像按消息 id 缓存了 Widget：身份更新后丢一次，右侧气泡才会换上真实头像。
+    _itemCache.clear();
+  }
 
   // ---------------------------------------------------------------- 消息加载
 
@@ -259,7 +425,7 @@ class _ChatPageState extends State<ChatPage> {
   /// （wake / memory / 工具摘要等），渲染成居中单卡片插回时间线。
   /// 未加载的会话没有日志可拉，直接不显示框架块。
   Future<void> _loadFramework({bool force = false}) async {
-    final session = widget.session;
+    final session = _session;
     if (session == null) return;
     if (_frameworkStarted && !force) return;
     _frameworkStarted = true;
@@ -341,7 +507,7 @@ class _ChatPageState extends State<ChatPage> {
 
   /// `/events` 增量：只收框架类 entry。平台 `stream` 才是消息本体，两者互不影响。
   void _startEvents() {
-    final session = widget.session;
+    final session = _session;
     if (_eventsStarted || session == null) return;
     _eventsStarted = true;
     _eventsSub = widget.repo.events(session.id).listen(
@@ -480,9 +646,11 @@ class _ChatPageState extends State<ChatPage> {
 
   /// `/live` 只对已加载会话有意义（未加载的会话没有 agent，只会 404）。
   void _startLive() {
-    final session = widget.session;
+    final session = _session;
     if (_liveStarted || session == null || !mounted) return;
     _liveStarted = true;
+    _liveRetryTimer?.cancel();
+    _liveRetryTimer = null;
     // 8s 内既没有 snapshot 也没有任何事件：乐观的 running 收回去，空闲会话绝不播动画。
     _snapshotTimer?.cancel();
     _snapshotTimer = Timer(const Duration(seconds: 8), () {
@@ -501,6 +669,11 @@ class _ChatPageState extends State<ChatPage> {
             _flushTimer?.cancel();
             _flushTimer = null;
             _streaming.clear();
+            // 流已接上：轮询兜底退场，信息栏回到真实阶段。
+            if (_polling) {
+              setState(() => _polling = false);
+              _ensurePolling();
+            }
             for (final part in event.parts) {
               if (part['type'] == 'text' && part['delta'] is String) {
                 _streaming.write(part['delta'] as String);
@@ -554,17 +727,41 @@ class _ChatPageState extends State<ChatPage> {
       },
       onError: (Object _) {
         if (!mounted) return;
-        // `/live` 断了就没法知道生成状态：回到待机，消息仍由平台流补上。
-        _snapshotTimer?.cancel();
-        _setLive(LiveState.idle);
+        // `/live` 断了就没法知道具体阶段：退回 3s 轮询读 running，
+        // 信息栏显示「轮询中」，消息仍由平台流补上。
+        _liveDown();
       },
       onDone: () {
         if (!mounted) return;
-        _snapshotTimer?.cancel();
-        _setLive(LiveState.idle);
+        _liveDown();
       },
       cancelOnError: true,
     );
+  }
+
+  /// `/live` 掉线：轮询接管状态，9s 后再试一次流。
+  /// 轮询的停止条件与探测共用一张表：页面不可见、或流重新接上（snapshot）即停。
+  void _liveDown() {
+    _liveStarted = false;
+    _snapshotTimer?.cancel();
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _streaming.clear();
+    _streamingText.value = '';
+    if (!_polling) setState(() => _polling = true);
+    _setLive(LiveState.idle);
+    _scheduleLiveRetry();
+    _ensurePolling();
+  }
+
+  void _scheduleLiveRetry() {
+    if (_liveRetryTimer != null) return;
+    _liveRetryTimer = Timer(_liveRetryDelay, () {
+      _liveRetryTimer = null;
+      // 不可见就交回轮询：露出/回前台时 `_ensurePolling` 与这里的那次重连会补上。
+      if (!mounted || !_foreground || !_routeVisible || !_loaded) return;
+      _startLive();
+    });
   }
 
   /// 唯一的写入口：相同状态不触发重建。
@@ -622,7 +819,7 @@ class _ChatPageState extends State<ChatPage> {
   // ---------------------------------------------------------------- 会话操作
 
   Future<void> _cancel() async {
-    final session = widget.session;
+    final session = _session;
     if (session == null) return;
     try {
       await widget.repo.cancel(session.id);
@@ -638,7 +835,7 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _compact() async {
-    final session = widget.session;
+    final session = _session;
     if (session == null) return;
     try {
       final result = await widget.repo.compact(session.id);
@@ -649,7 +846,7 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _fork() async {
-    final session = widget.session;
+    final session = _session;
     if (session == null) return;
     try {
       final child = await widget.repo.fork(session.id);
@@ -661,7 +858,7 @@ class _ChatPageState extends State<ChatPage> {
 
   /// 切换过模型后，标题详情与信息栏都用最新的 `model`。
   SessionSummary get _summary {
-    final session = widget.session;
+    final session = _session;
     if (session == null) {
       // 未加载：只为详情面板拼一份，origin 是平台名，没有引擎与模型。
       return SessionSummary(
@@ -688,7 +885,7 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _pickModel() async {
-    final session = widget.session;
+    final session = _session;
     if (session == null) return;
     final picked = await showModalBottomSheet<ModelRef>(
       context: context,
@@ -744,8 +941,10 @@ class _ChatPageState extends State<ChatPage> {
           headers: widget.headers,
           noticeOpen: _noticeOpen,
           media: message.media,
-          avatarUrl: message.outbound ? widget.avatarUrl : message.avatar,
-          senderName: message.outbound ? widget.botName : message.userName,
+          avatarUrl: message.outbound
+              ? _botAvatar
+              : absoluteResourceUrl(widget.base, message.avatar),
+          senderName: message.outbound ? _botName : message.userName,
           time: message.time,
           showHeader: showHeader,
         ),
@@ -853,16 +1052,23 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: Column(
         children: [
-          // 状态胶囊只属于已加载会话：`/live` 驱动它，未加载时整条信息栏都不出现。
+          // 已加载：`/live` 驱动状态灯与阶段；未加载：一条静态的「bot · 平台 · 未加载」，
+          // 不留空白。两个分支都能在会话被 agent 认领后由 3s 探测自动切换。
           if (_loaded)
             ChatInfoBar(
               session: _summary,
-              light: _live.statusLight,
-              botName: widget.botName,
-              avatarUrl: widget.avatarUrl,
+              light: _statusLight,
+              botName: _botName,
+              avatarUrl: _botAvatar,
               debugMetrics: _debugMetrics(),
               showDeveloperInfo: widget.showDeveloperInfo,
               onModelTap: _pickModel,
+            )
+          else
+            ChatUnloadedBar(
+              botName: _botName,
+              avatarUrl: _botAvatar,
+              origin: widget.origin,
             ),
           Expanded(
             child: _loading

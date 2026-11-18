@@ -358,6 +358,20 @@ String? _optionalText(Object? value) {
   return trimmed.isEmpty ? null : trimmed;
 }
 
+/// 实例返回的资源地址归一：`/files/x.png`、`files/x.png`、`//host/x` 补成绝对地址；
+/// `http(s)://`、`data:`、`base64:` 原样返回；空串返回 null。
+/// bot / 会话头像都可能给相对路径，`Image.network` 只吃绝对地址，取不到就交给占位。
+String? absoluteResourceUrl(Uri? base, String? raw) {
+  final value = raw?.trim() ?? '';
+  if (value.isEmpty) return null;
+  if (value.startsWith('data:') || value.startsWith('base64:')) return value;
+  if (value.startsWith('//')) return base == null ? null : '${base.scheme}:$value';
+  final uri = Uri.tryParse(value);
+  if (uri == null) return null;
+  if (uri.hasScheme) return value;
+  return base?.resolveUri(uri).toString() ?? value;
+}
+
 /// 平台时间戳：毫秒（13 位）/ 秒（10 位）数字或 ISO 串都接受。
 DateTime _platformTime(Object? raw) {
   if (raw is num) {
