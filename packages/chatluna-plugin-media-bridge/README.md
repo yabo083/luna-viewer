@@ -28,7 +28,9 @@ Authorization: Bearer <实例 token 或登录 session>
 ```
 
 - 新 → 旧；`limit` 默认 50（1–200），`platform` / `channelId` 空串表示不过滤。
-- `time` 是毫秒时间戳；`content` 是 `session.content`，截断 500 字。
+- `time` 是毫秒时间戳；`content` 由 `session.elements` 翻译成可读文本（文本原样、`at` → `@尾4位`、
+  `img`/`image` → `[图片]`、`face`/`emoji` → `[表情]`、`quote` → `[引用]`、`file`/`audio`/`video` →
+  `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
 - 只在内存里，重启实例清空；未带凭证 → 401（同上，`/api` 守卫）。
 
 ## 安装

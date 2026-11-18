@@ -268,9 +268,6 @@ String _dayLabel(DateTime time) {
   return '${time.year}-${_two(time.month)}-${_two(time.day)}';
 }
 
-/// 频道 id 很长，列表里只留能区分彼此的前 8 位。
-String _shortChannel(String id) => id.length <= 8 ? id : '${id.substring(0, 8)}…';
-
 class _DayHeader extends StatelessWidget {
   const _DayHeader({required this.label});
 
@@ -305,8 +302,9 @@ class _TrafficTile extends StatelessWidget {
     final scheme = theme.colorScheme;
     final meta = [
       entry.platform,
-      _shortChannel(entry.channelId),
+      entry.channelLabel,
     ].where((part) => part.isNotEmpty).join(' · ');
+    final content = entry.display;
     return InkWell(
       onTap: onTap,
       child: Padding(
@@ -342,7 +340,7 @@ class _TrafficTile extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    entry.content.isEmpty ? '（空消息）' : entry.content,
+                    content.isEmpty ? '（空消息）' : content,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodyMedium?.copyWith(

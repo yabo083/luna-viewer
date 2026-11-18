@@ -46,13 +46,50 @@ class TrafficEntry {
     );
   }
 
+  /// 插件已把元素翻译成可读文本；这里兜底旧实例/旧缓冲里残留的原始标记
+  /// （`<img …>` → `[图片]`、`<at …>` → `@`、`<face …>` → `[表情]`），再压成一行。
+  String get display => _readable(content);
+
+  /// 群聊/私聊 + 频道 id 尾 6 位。服务端拿不到群名，这是唯一能区分会话的信息。
+  /// 群消息的 `guildId` 与 `channelId` 相同，私聊没有 `guildId`。
+  String get channelLabel {
+    final base = guildId != null && guildId == channelId ? '群聊' : '私聊';
+    if (channelId.isEmpty) return base;
+    final tail = channelId.length <= 6
+        ? channelId
+        : channelId.substring(channelId.length - 6);
+    return '$base · $tail';
+  }
+
   /// 复制用的整条文本：身份全带上，便于拿去排查路由/频道。
   String get copyText {
     return '${time.year}-${_two(time.month)}-${_two(time.day)} '
         '${_two(time.hour)}:${_two(time.minute)}:${_two(time.second)} '
         '$platform channel=$channelId user=$userId'
         '${guildId == null || guildId!.isEmpty ? '' : ' guild=$guildId'}'
-        '\n$content';
+        '\n$display';
+  }
+
+  static final RegExp _tag = RegExp(r'<([a-zA-Z][\w:.-]*)[^<>]*>');
+  static final RegExp _spaces = RegExp(r'\s+');
+
+  static String _readable(String raw) {
+    if (raw.isEmpty) return '';
+    final replaced = raw.replaceAllMapped(_tag, (match) {
+      return switch (match.group(1)!.toLowerCase()) {
+        'img' || 'image' => '[图片]',
+        'face' => '[表情]',
+        'emoji' => '[表情]',
+        'quote' => '[引用]',
+        'file' => '[文件]',
+        'audio' => '[语音]',
+        'video' => '[视频]',
+        'at' => '@ ',
+        'br' => ' ',
+        _ => '',
+      };
+    });
+    return replaced.replaceAll(_spaces, ' ').trim();
   }
 
   static String _two(int value) => value.toString().padLeft(2, '0');

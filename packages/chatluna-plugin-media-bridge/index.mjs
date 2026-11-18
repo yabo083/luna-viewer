@@ -32,6 +32,19 @@ const MIME = {
 const TRAFFIC_CAPACITY = 500
 const TRAFFIC_MAX_CONTENT = 500
 
+// `session.content` 是元素序列化后的原始标记（`<img .../>`、`<at id=.../>`），
+// 直接给人看没有意义；按元素类型翻译成可读片段。
+const ELEMENT_LABELS = {
+  img: '[图片]',
+  image: '[图片]',
+  face: '[表情]',
+  emoji: '[表情]',
+  quote: '[引用]',
+  file: '[文件]',
+  audio: '[语音]',
+  video: '[视频]'
+}
+
 function intParam(value, fallback, min, max) {
   const parsed = Number.parseInt(value ?? '', 10)
   if (!Number.isSafeInteger(parsed)) return fallback
@@ -42,8 +55,29 @@ function textOf(value) {
   return typeof value === 'string' ? value : value == null ? '' : String(value)
 }
 
+function describeElements(elements) {
+  if (!Array.isArray(elements)) return ''
+  let text = ''
+  for (const element of elements) {
+    const type = element?.type
+    if (type === 'text') {
+      text += textOf(element.attrs?.content)
+    } else if (type === 'at') {
+      const name = textOf(element.attrs?.name)
+      const id = textOf(element.attrs?.id)
+      text += '@' + (name || id.slice(-4)) + ' '
+    } else {
+      const label = ELEMENT_LABELS[type]
+      if (label) text += label
+    }
+  }
+  return text
+}
+
 function trafficEntry(session) {
-  const content = textOf(session.content)
+  // 元素拿不到时（老适配器）退回 content；两条路都压成一行再截断。
+  const raw = describeElements(session.elements) || textOf(session.content)
+  const content = raw.replace(/\s+/g, ' ').trim()
   return {
     id: textOf(session.messageId ?? session.id),
     time: Number(session.timestamp) || Date.now(),
