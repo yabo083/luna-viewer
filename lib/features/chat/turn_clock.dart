@@ -71,7 +71,7 @@ String formatElapsed(Duration elapsed) {
 
 /// 骨架气泡边框上的读数：整轮总时长在前，当前阶段与它的实时耗时在后。
 /// - 进行中且有阶段：`1m04s · draw 12.3s`
-/// - 阶段间隙（例如工具结果与下一步之间）：只显示 `1m04s`
+/// - 工具刚结束、下一步未开：`1m04s · draw 12.3s`（保留刚结束的工具耗时）
 /// - 中止：`已中止 12.4s`
 String turnLineLabel(TurnClockView view, {bool aborted = false}) {
   final total = formatElapsed(view.total);
@@ -83,19 +83,30 @@ String turnLineLabel(TurnClockView view, {bool aborted = false}) {
     for (final phase in view.active)
       if (phase.name == thinkingPhase) phase,
   ];
-  final phases = ordered.isNotEmpty
-      ? [
-          for (final phase in ordered.take(2))
-            '${phase.name} ${formatElapsed(phase.elapsed)}',
-        ]
-      : [
-          if (view.phase != null)
-            '${view.phase} ${formatElapsed(view.phaseElapsed ?? Duration.zero)}',
-        ];
-  if (phases.isEmpty) return total;
+  final parts = [
+    for (final phase in ordered.take(2))
+      '${phase.name} ${formatElapsed(phase.elapsed)}',
+  ];
+  if (parts.isEmpty && view.phase != null) {
+    parts.add('${view.phase} ${formatElapsed(view.phaseElapsed ?? Duration.zero)}');
+  }
+  // 只开着「思考」时，把刚结束的工具耗时补在后面：读数里始终能看到「刚才那个工具花了多久」。
+  if (parts.length == 1 && ordered.isNotEmpty && view.recent.isNotEmpty) {
+    final last = view.recent.first;
+    if (last.name != ordered.first.name) {
+      parts.add('${last.name} ${formatElapsed(last.elapsed)}');
+    }
+  }
+  if (parts.isEmpty) {
+    if (view.recent.isNotEmpty) {
+      final last = view.recent.first;
+      return '$total · ${last.name} ${formatElapsed(last.elapsed)}';
+    }
+    return total;
+  }
   // 并行的第三阶段起收成 `+1`，避免把边框标签撑破。
   final extra = view.active.length > 2 ? ' +${view.active.length - 2}' : '';
-  return '$total · ${phases.join(' · ')}$extra';
+  return '$total · ${parts.join(' · ')}$extra';
 }
 
 /// 阶段直方的一段：名称、耗时、占整轮的比例。

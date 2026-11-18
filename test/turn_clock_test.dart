@@ -448,5 +448,22 @@ void main() {
       );
       expect(turnLineLabel(view), '24.0s · draw 12.0s · 思考 3.0s');
     });
+
+    test('阶段间隙保留刚结束的工具耗时', () {
+      const view = TurnClockView(
+        total: Duration(milliseconds: 16400),
+        recent: [TurnPhaseRecord('draw', Duration(seconds: 2))],
+      );
+      expect(turnLineLabel(view), '16.4s · draw 2.0s');
+    });
+
+    test('只开着思考时补上刚结束的工具耗时', () {
+      const view = TurnClockView(
+        total: Duration(milliseconds: 26400),
+        active: [TurnPhaseRecord('思考', Duration(seconds: 24))],
+        recent: [TurnPhaseRecord('draw', Duration(seconds: 2))],
+      );
+      expect(turnLineLabel(view), '26.4s · 思考 24.0s · draw 2.0s');
+    });
   });
 }
