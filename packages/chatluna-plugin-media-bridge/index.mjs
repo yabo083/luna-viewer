@@ -1144,6 +1144,7 @@ export function apply(ctx) {
   let dbRetryAt = 0
   let dbWarnAt = 0
   let tickBusy = false
+  let disposed = false
   let fullLoadRunning = false
   let fullLoadDone = false
   let pollTimer = null
@@ -1463,13 +1464,17 @@ export function apply(ctx) {
 
   // 首次全量按批跑：每批 4 个会话，中间让出事件循环，启动时不会长时间卡住 HTTP。
   const startFullLoad = () => {
-    if (fullLoadRunning || fullLoadDone) return
+    if (fullLoadRunning || fullLoadDone || disposed) return
     fullLoadRunning = true
     const startedAt = Date.now()
     let messages = 0
     let restoredCursors = 0
     const pending = logSessions.slice()
     const step = () => {
+      if (disposed) {
+        fullLoadRunning = false
+        return
+      }
       const batch = pending.splice(0, LOG_FULL_LOAD_CHUNK)
       for (const session of batch) {
         if (loadedSessions.has(session.id)) continue
@@ -1504,7 +1509,7 @@ export function apply(ctx) {
   }
 
   const pollLog = async () => {
-    if (tickBusy) return
+    if (tickBusy || disposed) return
     tickBusy = true
     try {
       if (!(await openLogDb())) return
@@ -1533,6 +1538,7 @@ export function apply(ctx) {
 
   void (async () => {
     await openLogDb()
+    if (disposed) return
     try {
       refreshSessions()
     } catch (error) {
@@ -1544,6 +1550,7 @@ export function apply(ctx) {
   })()
 
   ctx.on('dispose', () => {
+    disposed = true
     clearInterval(pollTimer)
     process.removeListener('exit', flushOnExit)
     flushCapture()

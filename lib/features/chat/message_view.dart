@@ -411,8 +411,13 @@ class _Markdown extends StatelessWidget {
 /// 绝对 `http(s)` / `data:` / `base64:` 原样使用；`/files/` 是实例静态附件（不需要 Bearer）；
 /// 其余相对路径是 agent 工作区（data/chatluna/agents-work）里的文件，由 companion 插件以 Bearer 提供。
 Uri _resolveAsset(Uri base, String url) {
-  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
+  if (url.startsWith('http://') || url.startsWith('https://')) {
     return Uri.parse(url);
+  }
+  if (url.startsWith('data:')) {
+    // `Uri.parse` 会校验 data URI 的 base64 载荷：坏载荷直接抛 `FormatException`，
+    // 一条画不出来的图不该把整条消息炸掉。退回不透明 URI，交给占位（「无法解码」）兜住。
+    return Uri.tryParse(url) ?? Uri(scheme: 'data', path: 'invalid');
   }
   // `base64://` 的载荷在调用处已经归一成 `data:`；万一漏进来，只当它是一个不透明 URI。
   if (url.startsWith('base64:')) return Uri(scheme: 'base64', path: url);
