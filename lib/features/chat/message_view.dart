@@ -421,7 +421,8 @@ Uri _resolveAsset(Uri base, String url) {
   }
   // `base64://` 的载荷在调用处已经归一成 `data:`；万一漏进来，只当它是一个不透明 URI。
   if (url.startsWith('base64:')) return Uri(scheme: 'base64', path: url);
-  if (url.startsWith('/files/')) return base.resolve(url.substring(1));
+  // 实例内绝对路径：静态附件与插件自带路由（`/api/platform/media/...`）。
+  if (url.startsWith('/files/') || url.startsWith('/api/')) return base.resolve(url.substring(1));
   final name = url.startsWith('/') ? url.substring(1) : url;
   return base.replace(path: '/api/workspace', queryParameters: {'path': name});
 }
@@ -431,7 +432,7 @@ Uri _resolveAsset(Uri base, String url) {
 bool _needsAuth(Uri base, Uri uri) =>
     uri.host == base.host &&
     uri.port == base.port &&
-    (uri.path.startsWith('/files/') || uri.path == '/api/workspace');
+    (uri.path.startsWith('/files/') || uri.path.startsWith('/api/'));
 
 /// 媒体图片的取头：先把源归一成真实地址（`base64://` → `data:`），再决定要不要带 Bearer。
 Map<String, String> _authHeadersFor(Uri base, String raw, Map<String, String> headers) {
