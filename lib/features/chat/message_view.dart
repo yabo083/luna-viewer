@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
@@ -574,29 +575,21 @@ class _ChatImageState extends State<_ChatImage> {
     return scale < 1 ? natural * scale : natural;
   }
 
+  /// 重试前重新挂一次测量：上一次失败的那条 stream 已经死了，不清掉 `_measured`
+  /// 就不会重新解析；尺寸先留着，重试期间不跳版。
+  void _remeasure() {
+    _detach();
+    _measured = null;
+    if (mounted) setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final source = _source;
     final uri = widget.resolve(source);
     final bytes = _bytes;
     // 声明了 data URI 却解不出来：直接给占位，别让 Image.network 抛 unsupported scheme。
     final broken = source.startsWith('data:') && bytes == null;
-
-    Widget placeholder({double width = 200, double height = 120}) => Container(
-      width: width,
-      height: height,
-      color: theme.colorScheme.surfaceContainerHighest,
-      alignment: Alignment.center,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.broken_image_outlined, color: theme.colorScheme.onSurfaceVariant),
-          const SizedBox(height: 4),
-          Text('图片不可用', style: theme.textTheme.labelSmall),
-        ],
-      ),
-    );
 
     var size = _size ?? const Size(_maxWidth, _maxHeight);
     if (!broken) {
@@ -608,47 +601,9 @@ class _ChatImageState extends State<_ChatImage> {
       }
       size = _size ?? size;
     }
-    final cacheWidth = _cacheWidth(context);
     final double width = broken ? 200 : size.width;
     final double height = broken ? 120 : size.height;
-
-    final Widget preview;
-    if (broken) {
-      preview = placeholder();
-    } else if (bytes != null) {
-      preview = Image.memory(
-        bytes,
-        width: width,
-        height: height,
-        cacheWidth: cacheWidth,
-        fit: BoxFit.cover,
-        errorBuilder: (context, error, stack) => placeholder(width: width, height: height),
-      );
-    } else {
-      preview = Image.network(
-        uri.toString(),
-        headers: widget.headers,
-        width: width,
-        height: height,
-        cacheWidth: cacheWidth,
-        fit: BoxFit.cover,
-        loadingBuilder: (context, child, progress) => progress == null
-            ? child
-            : Container(
-                width: width,
-                height: height,
-                color: theme.colorScheme.surfaceContainerHighest,
-                child: const Center(
-                  child: SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ),
-              ),
-        errorBuilder: (context, error, stack) => placeholder(width: width, height: height),
-      );
-    }
+    final image = _ImageSource(source: source, uri: uri, headers: widget.headers, bytes: bytes);
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -657,17 +612,23 @@ class _ChatImageState extends State<_ChatImage> {
             ? null
             : () => showDialog<void>(
                 context: context,
-                builder: (_) => _ImageViewer(
-                  images: [
-                    _ImageSource(source: source, uri: uri, headers: widget.headers, bytes: bytes),
-                  ],
-                  initialIndex: 0,
-                ),
+                builder: (_) => _ImageViewer(images: [image], initialIndex: 0),
               ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
           // 显式尺寸：WidgetSpan 的高度约束不可靠，这里不再依赖父级 maxHeight。
-          child: SizedBox(width: width, height: height, child: preview),
+          child: SizedBox(
+            width: width,
+            height: height,
+            // 取图/失败/重试都交给同一个壳：点占位就 evict + 换 key 重来。
+            child: _RetryableImage(
+              source: image,
+              width: width,
+              height: height,
+              cacheWidth: _cacheWidth(context),
+              onAttempt: _remeasure,
+            ),
+          ),
         ),
       ),
     );
@@ -697,6 +658,225 @@ class _ImageSource {
 
   /// 声明了 data URI 却解不出来：直接给占位，别让 `Image.network` 抛 unsupported scheme。
   bool get broken => source.startsWith('data:') && bytes == null;
+}
+
+/// 一张图（网络或内存）的取图壳：失败先自动重试一次，之后停在「点击重试」。
+/// 单图缩略、网格格子、全屏查看三处共用，重试行为因此完全一致。
+///
+/// 重试要两件事一起做，缺一不可：
+///   1. `evict()` 掉这份 provider（连 `ResizeImage` 那层包装一起）——失败的请求可能还挂在
+///      `ImageCache` 的 pending/live 表里，不踢掉的话下一次解析拿到的还是同一份失败；
+///   2. 给 `Image` 换一个 key（`ValueKey('$url#$attempt')`）——同一个 key 的 `_ImageState`
+///      会把上一次的 `_lastException` 一直留着，换 key 才会重新解析 provider。
+class _RetryableImage extends StatefulWidget {
+  const _RetryableImage({
+    required this.source,
+    this.width,
+    this.height,
+    this.cacheWidth,
+    this.fit = BoxFit.cover,
+    this.compact = false,
+    this.onDark = false,
+    this.onAttempt,
+  });
+
+  final _ImageSource source;
+
+  /// 展示尺寸：缩略图与网格格子给死；全屏查看不给，由父级撑开。
+  final double? width;
+  final double? height;
+
+  /// 解码宽度：与 `Image.network(cacheWidth:)` 解到同一份缓存。
+  final int? cacheWidth;
+
+  final BoxFit fit;
+
+  /// 网格格子只有几十像素宽：文案缩成两行小字，整块随格子等比缩小。
+  final bool compact;
+
+  /// 全屏查看是黑底：占位、转圈与文案都不跟主题的中性色走。
+  final bool onDark;
+
+  /// 每次开始新一次尝试（含自动重试）时回调：单图缩略要重新测量解码尺寸。
+  final VoidCallback? onAttempt;
+
+  @override
+  State<_RetryableImage> createState() => _RetryableImageState();
+}
+
+class _RetryableImageState extends State<_RetryableImage> {
+  /// 首次失败后隔 2s 自动再试一次：慢网下第一发常常正好卡在超时上，隔一下再发多半就通；
+  /// 再失败就停住，等人点。只自动试一次，不会无限重连。
+  static const Duration _autoRetryDelay = Duration(seconds: 2);
+
+  /// 第几次尝试：既进 `Image` 的 key，也记着自动重试用掉没有。
+  int _attempt = 0;
+
+  /// 自动重试只挂一次；`errorBuilder` 每次重建都会被调用，得挡住重复挂表。
+  bool _autoRetryUsed = false;
+  Timer? _timer;
+
+  ImageProvider get _baseProvider => widget.source.bytes != null
+      ? MemoryImage(widget.source.bytes!)
+      : NetworkImage(widget.source.uri.toString(), headers: widget.source.headers);
+
+  /// `Image` 的 key：换 key 等于换一个 `_ImageState`，它才会重新解析 provider。
+  /// 内存图的源可能是一整段 base64，key 里只放字节对象的身份，别把几 MB 塞进去。
+  ValueKey<String> get _imageKey {
+    final source = widget.source;
+    final tag = source.bytes != null
+        ? 'bytes:${identityHashCode(source.bytes)}'
+        : source.uri.toString();
+    return ValueKey<String>('$tag#$_attempt');
+  }
+
+  @override
+  void didUpdateWidget(covariant _RetryableImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.source.source != widget.source.source) {
+      _timer?.cancel();
+      _timer = null;
+      _autoRetryUsed = false;
+      _attempt = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  /// 失败之后挂上自动重试。从 `errorBuilder` 里调用，所以这里不能 setState。
+  void _afterFailure() {
+    // 内存图解码失败是定局（字节就是那样），隔 2s 再来一次不会变好，直接留给手动重试。
+    if (widget.source.bytes != null || _autoRetryUsed) return;
+    _autoRetryUsed = true;
+    _timer = Timer(_autoRetryDelay, _retry);
+  }
+
+  /// 手动/自动重试：先 evict 掉这份失败的缓存与 pending 请求，再换 key 重建 `Image`。
+  Future<void> _retry() async {
+    _timer?.cancel();
+    _timer = null;
+    if (!mounted) return;
+    final base = _baseProvider;
+    await base.evict();
+    final cacheWidth = widget.cacheWidth;
+    if (cacheWidth != null) {
+      // 展示时用的就是 `ResizeImage` 包过的 key，这份也要踢。
+      await ResizeImage(base, width: cacheWidth).evict();
+    }
+    if (!mounted) return;
+    // 缓存清干净了才能让外面重新解析：先 evict 再回调，别让它又挂到那份失败的 completer 上。
+    widget.onAttempt?.call();
+    setState(() => _attempt++);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // data:/base64: 声明成图片却解不出来：没有网络请求可重试，只报解码失败。
+    if (widget.source.broken) {
+      return _notice(context, label: '无法解码', icon: Icons.broken_image_outlined);
+    }
+
+    final bytes = widget.source.bytes;
+    if (bytes != null) {
+      return Image.memory(
+        bytes,
+        key: _imageKey,
+        width: widget.width,
+        height: widget.height,
+        cacheWidth: widget.cacheWidth,
+        fit: widget.fit,
+        frameBuilder: _frame,
+        errorBuilder: (context, _, _) => _failure(context),
+      );
+    }
+    return Image.network(
+      widget.source.uri.toString(),
+      key: _imageKey,
+      headers: widget.source.headers,
+      width: widget.width,
+      height: widget.height,
+      cacheWidth: widget.cacheWidth,
+      fit: widget.fit,
+      frameBuilder: _frame,
+      errorBuilder: (context, _, _) => _failure(context),
+    );
+  }
+
+  /// 还没解出第一帧就自己画转圈：`loadingBuilder` 的 progress 在收到第一段字节之前是 null，
+  /// 光靠它，慢网下这一段是空白，重试时也看不出「正在重试」。
+  Widget _frame(BuildContext context, Widget child, int? frame, bool wasSynchronouslyLoaded) {
+    if (frame != null || wasSynchronouslyLoaded) return child;
+    return Container(
+      width: widget.width,
+      height: widget.height,
+      alignment: Alignment.center,
+      color: _background(context),
+      child: SizedBox.square(
+        dimension: widget.compact ? 16 : 20,
+        child: CircularProgressIndicator(
+          strokeWidth: 2,
+          color: widget.onDark ? Colors.white70 : null,
+        ),
+      ),
+    );
+  }
+
+  Widget _failure(BuildContext context) {
+    _afterFailure();
+    return _notice(
+      context,
+      label: widget.compact ? '图片加载失败\n点击重试' : '图片加载失败 · 点击重试',
+      icon: Icons.refresh,
+      onTap: _retry,
+    );
+  }
+
+  Color _background(BuildContext context) =>
+      widget.onDark ? Colors.black : Theme.of(context).colorScheme.surfaceContainerHighest;
+
+  /// 占位：图标 + 一行字。给了 `onTap` 才是可点的重试态（没给就是「无法解码」）。
+  Widget _notice(
+    BuildContext context, {
+    required String label,
+    required IconData icon,
+    VoidCallback? onTap,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = onTap == null
+        ? (widget.onDark ? Colors.white70 : scheme.onSurfaceVariant)
+        : (widget.onDark ? Colors.white : scheme.primary);
+    final content = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: widget.compact ? 18 : 22, color: color),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: widget.compact ? 10 : 12, height: 1.25, color: color),
+        ),
+      ],
+    );
+    final box = Container(
+      width: widget.width,
+      height: widget.height,
+      // 全屏查看没有固定尺寸：给一块够点的热区，别只剩两行字。
+      constraints: widget.width == null || widget.height == null
+          ? const BoxConstraints(minWidth: 132, minHeight: 96)
+          : null,
+      color: _background(context),
+      alignment: Alignment.center,
+      padding: const EdgeInsets.all(6),
+      // 格子可能只有几十像素宽：整块等比缩小，不换行、不溢出。
+      child: FittedBox(fit: BoxFit.scaleDown, child: content),
+    );
+    if (onTap == null) return box;
+    return GestureDetector(behavior: HitTestBehavior.opaque, onTap: onTap, child: box);
+  }
 }
 
 /// 一条消息的媒体区：图片先成组（单张缩略 / 多张网格），视频/音频/文件按原顺序排成胶囊。
@@ -843,50 +1023,18 @@ class _ImageGridState extends State<_ImageGrid> {
           top: const Radius.circular(12),
           bottom: Radius.circular(lastRow ? 12 : 4),
         ),
-        child: SizedBox.square(dimension: side, child: _preview(context, _sources[index], side)),
+        // 格子里的图同样走重试壳：按格子宽度解码，失败后点一下就重来。
+        child: SizedBox.square(
+          dimension: side,
+          child: _RetryableImage(
+            source: _sources[index],
+            width: side,
+            height: side,
+            cacheWidth: (side * MediaQuery.devicePixelRatioOf(context)).round(),
+            compact: true,
+          ),
+        ),
       ),
-    );
-  }
-
-  /// 网格格子的预览：正方形裁切，按格子宽度解码，不为一格缩略图拉全尺寸位图。
-  Widget _preview(BuildContext context, _ImageSource image, double side) {
-    final scheme = Theme.of(context).colorScheme;
-    final cacheWidth = (side * MediaQuery.devicePixelRatioOf(context)).round();
-    Widget placeholder() => Container(
-      color: scheme.surfaceContainerHighest,
-      alignment: Alignment.center,
-      child: Icon(Icons.broken_image_outlined, size: 22, color: scheme.onSurfaceVariant),
-    );
-    if (image.broken) return placeholder();
-    if (image.bytes case final bytes?) {
-      return Image.memory(
-        bytes,
-        width: side,
-        height: side,
-        cacheWidth: cacheWidth,
-        fit: BoxFit.cover,
-        errorBuilder: (_, _, _) => placeholder(),
-      );
-    }
-    return Image.network(
-      image.uri.toString(),
-      width: side,
-      height: side,
-      cacheWidth: cacheWidth,
-      headers: image.headers,
-      fit: BoxFit.cover,
-      loadingBuilder: (context, child, progress) => progress == null
-          ? child
-          : Container(
-              color: scheme.surfaceContainerHighest,
-              alignment: Alignment.center,
-              child: const SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            ),
-      errorBuilder: (_, _, _) => placeholder(),
     );
   }
 }
@@ -963,22 +1111,9 @@ class _ImageViewerState extends State<_ImageViewer> {
     );
   }
 
-  Widget _page(_ImageSource image) {
-    Widget placeholder() => const Padding(
-      padding: EdgeInsets.all(24),
-      child: Text('图片不可用', style: TextStyle(color: Colors.white70)),
-    );
-    if (image.broken) return placeholder();
-    if (image.bytes case final bytes?) {
-      return Image.memory(bytes, fit: BoxFit.contain, errorBuilder: (_, _, _) => placeholder());
-    }
-    return Image.network(
-      image.uri.toString(),
-      fit: BoxFit.contain,
-      headers: image.headers,
-      errorBuilder: (_, _, _) => placeholder(),
-    );
-  }
+  /// 全屏页与缩略图/格子走同一个重试壳：失败也能点一下重来，不靠退回消息列表。
+  Widget _page(_ImageSource image) =>
+      _RetryableImage(source: image, fit: BoxFit.contain, onDark: true);
 }
 
 /// 视频 / 音频 / 文件 / 只有 ref 的附件：一行胶囊（图标 + 名称）。

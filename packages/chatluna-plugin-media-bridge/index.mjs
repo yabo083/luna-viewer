@@ -3,11 +3,14 @@
 // GET /api/workspace?path=<相对路径> 暴露给客户端（移动端渲染消息里的图片）。
 // 只读；路径必须落在工作区内。
 //
-// 同时是本实例的平台消息真源：在事件层按会话记录入站 + 出站消息，App 只消费
-// /api/platform/* 三件套（会话列表、消息分页、实时流），不再自己拿会话日志和旁路
-// 流量拼消息。指令回复这类「只到平台、不进 agent 日志」的消息同样在这里落一份。
+// 同时是本实例的平台消息真源：App 只消费 /api/platform/* 三件套（会话列表、消息分页、
+// 实时流）。消息有两个来源，按同一套 id/时间去重后合并成一条流：
+//   1. ChatLuna 会话日志（`data/chatluna.db` 的 `chatluna_session_entry`）——进过 agent 的
+//      普通消息，重启后仍在，是普通消息的真源；
+//   2. 事件层捕获——指令回复、群聊里没 @bot 的消息等「不进日志」的消息，落盘保存增量。
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
-import { extname, join, normalize, resolve, sep } from 'node:path'
+import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openStream } from '@chatluna/server'
 
@@ -31,12 +34,32 @@ const MIME = {
 }
 
 // 每个会话独立环形缓冲：300 条足够 App 翻最近几屏；会话表 200 个，淘汰最久未活跃的。
-// 全部只在内存里，实例重启即清空（App 重连后从新消息重新积累）。
 const MESSAGE_CAPACITY = 300
 const CONVERSATION_CAPACITY = 200
 const MESSAGE_MAX_CONTENT = 500
 // 新连接先回放每个会话最近 5 条，够 App 把当前屏幕接上；更早的走分页接口。
 const STREAM_REPLAY = 5
+
+// ── 会话日志投影 ────────────────────────────────────────────────────────
+// 只读打开 ChatLuna 的 sqlite（Node 24 内置 node:sqlite）。会话按 lastActiveAt 取前 200 个、
+// 每个读最近 300 条 message 条目；之后每 1.5s 按每会话游标补增量。
+const LOG_POLL_MS = 1500
+const LOG_SESSION_LIMIT = 200
+const LOG_ENTRY_WINDOW = 300
+// 首次全量按批跑（setImmediate），单批 4 个会话，避免启动时长时间占住事件循环。
+const LOG_FULL_LOAD_CHUNK = 4
+// 增量查询一次最多读多少条：正常只有个位数，上限只用于异常场景兜底。
+const LOG_INCREMENT_LIMIT = 1000
+// DB 打不开（文件缺失/被锁）时的重试间隔。
+const LOG_DB_RETRY_MS = 30_000
+
+// 捕获增量落盘：只存「日志里没有的那部分」与每会话游标；日志本身不落盘（重启从 DB 重读）。
+const CAPTURE_FLUSH_MS = 1000
+const CAPTURE_MAX_BYTES = 5 * 1024 * 1024
+// 同一句话的两个视角：正文压空白后相同 + |Δt| ≤ 3s 视为同一条。时间戳完全对得上
+// （平台消息 id 相同）时放宽到 10s——多段回复的日志条目时间是整轮结束时刻。
+const DEDUPE_WINDOW = 3000
+const DEDUPE_EXACT_WINDOW = 10_000
 
 // 出站：`before-send` 到适配器真正 `send` 之间只隔一次渲染/一次 HTTP，2s 足够覆盖排队与重试；
 // 超过这个窗口的快照不再属于本次 send，宁可略过也不写错正文。
@@ -392,9 +415,48 @@ function publicMessage(message) {
   }
 }
 
+// ── 日志条目 → 消息 ────────────────────────────────────────────────────
+// 去重键里的「压缩空白正文」：空白位置在不同渲染路径里不一致，直接抹掉。
+function compactText(value) {
+  return textOf(value).replace(/\s+/g, '')
+}
+
+// 捕获侧正文是渲染后的文本，日志侧还留着 markdown 标记（`**`、`` ` ``、`~`）：
+// 去重比对时一并抹掉，两边才可比。
+function twinText(value) {
+  return compactText(value).replace(/[*_`~]/g, '')
+}
+
+// 日志里的正文是给平台渲染的标记串：`<message>` 是分条边界，`<status/>`/`<silence/>`
+// 是元信息，`<markdown>` 是排版。剥完标签再压空白，与捕获侧（元素已渲染）的正文可比。
+function plainLogText(value) {
+  return stripRawTags(textOf(value)).replace(/\s+/g, ' ').trim()
+}
+
+// 一轮回复可能写成多条平台消息：`<message>a</message><message>b</message>`。没有边界标记
+// 时整段算一条（`<silence/>` 剥完为空，自然被丢掉）。
+function replySegments(value) {
+  const raw = textOf(value)
+  if (!raw.trim()) return []
+  const segments = []
+  for (const match of raw.matchAll(/<message(?:\s[^>]*)?>([\s\S]*?)<\/message>/gi)) segments.push(match[1])
+  return segments.length ? segments : [raw]
+}
+
+const REPLY_TOOLS = new Set(['reply', 'send'])
+
+function parseJsonText(value) {
+  try {
+    return JSON.parse(textOf(value))
+  } catch {
+    return null
+  }
+}
+
 export function apply(ctx) {
+  const logger = ctx.logger('media-bridge')
   const root = resolve(process.env.CHATLUNA_WORKSPACE ?? join(process.cwd(), 'data/chatluna/agents-work'))
-  ctx.logger('media-bridge').info('serving workspace files from %s', root)
+  logger.info('serving workspace files from %s', root)
 
   // 会话表：插入顺序即最近活跃顺序；每条消息按 time 去重、升序保存在 messages 里。
   const conversations = new Map()
@@ -404,6 +466,31 @@ export function apply(ctx) {
     for (const stream of subscribers) stream.close()
     subscribers.clear()
   })
+
+  // 归一键 → 会话键。App 侧把 `route:` 前缀与 `:user:` / `:lane:` 后缀归一后比较，插件这边
+  // 用同一套规则把日志会话与捕获会话合到同一个桶：先见到的键（通常是捕获的
+  // `session.conversation.key`）为准。
+  const keyAliases = new Map()
+  const normalizeKey = (value) => {
+    const text = textOf(value)
+    const stripped = text.startsWith('route:') ? text.slice(6) : text
+    const cut = stripped.search(/:(?:user|lane):/)
+    return cut > 0 ? stripped.slice(0, cut) : stripped
+  }
+  const canonicalKey = (value) => {
+    const normalized = normalizeKey(value)
+    return (normalized && keyAliases.get(normalized)) || textOf(value)
+  }
+  const rememberKey = (value) => {
+    const normalized = normalizeKey(value)
+    if (normalized && !keyAliases.has(normalized)) keyAliases.set(normalized, textOf(value))
+  }
+
+  // 上次落盘的会话展示信息（群名/昵称/头像）。日志投影按 key 建会话时先套这一层，
+  // 重启后不会退化成「群聊 · 尾号」。
+  const savedMeta = new Map()
+  // 捕获增量有变化；真正的写盘函数在后面定义（防抖 1s）。
+  let markCaptureDirty = () => {}
 
   const notify = (key, message) => {
     // 推送失败（背压/已断开）不影响存储：客户端重连时靠回放补齐。
@@ -626,9 +713,21 @@ export function apply(ctx) {
     event: session.event?.message
   })
 
-  // 落一条消息；同一个会话、同一个 time 视为同一条（多 bot 实例/适配器重复上报）。
-  // 返回真正入库的消息（重复则 null），调用方据此决定是否推实时帧。
-  const record = (key, entry) => {
+  // 按时间升序插入：正常是追加；时间戳回退（适配器补发/重试、日志与捕获差几百毫秒）
+  // 时插到正确位置，接口永远返回升序。
+  const insertSorted = (messages, message) => {
+    if (!messages.length || message.time >= messages[messages.length - 1].time) {
+      messages.push(message)
+      return
+    }
+    let index = messages.length - 1
+    while (index >= 0 && messages[index].time > message.time) index -= 1
+    messages.splice(index + 1, 0, message)
+  }
+
+  // 落一条消息。两个来源（会话日志 `log` / 事件捕获 `captured`）各自上报，同一句话只留一条。
+  // 返回需要推实时帧的消息；重复/被合并/已推过则 null。
+  const record = (key, entry, source = 'captured') => {
     const time = Number(entry.time) || Date.now()
     const channelId = textOf(entry.channelId)
     const guildId = entry.guildId ? textOf(entry.guildId) : null
@@ -638,17 +737,18 @@ export function apply(ctx) {
       // 末尾即最新活跃；删了重插把这次活动挪到 LRU 尾部。
       conversations.delete(key)
     } else {
+      const saved = savedMeta.get(key)
       conversation = {
         key,
-        platform: '',
-        selfId: '',
-        channelId: '',
-        guildId: null,
+        platform: saved?.platform ?? '',
+        selfId: saved?.selfId ?? '',
+        channelId: saved?.channelId ?? '',
+        guildId: saved?.guildId ?? null,
         kind: 'private',
-        name: '',
-        nameKind: 'private',
+        name: saved?.name ?? '',
+        nameKind: saved?.nameKind ?? 'private',
         title: '',
-        avatar: null,
+        avatar: saved?.avatar ?? null,
         messages: []
       }
     }
@@ -669,10 +769,6 @@ export function apply(ctx) {
     conversation.title = conversationTitle(conversation.kind, conversation.channelId, key, conversation.name)
     conversations.set(key, conversation)
 
-    const messages = conversation.messages
-    const last = messages[messages.length - 1]
-    if (last && last.time === time) return null
-
     const message = {
       id: textOf(entry.id),
       time,
@@ -681,19 +777,44 @@ export function apply(ctx) {
       userName: textOf(entry.userName),
       avatar: entry.avatar ? textOf(entry.avatar) : null,
       content: textOf(entry.content),
-      media: Array.isArray(entry.media) ? entry.media : []
+      media: Array.isArray(entry.media) ? entry.media : [],
+      // 内部字段：`captured` 的部分才落盘，`log` 的部分每次从 DB 重读。
+      _src: source
+    }
+
+    // 同一句话的另一个视角已经在了：不新增条目，把信息并进已有那条。
+    // 已被 App 收到过的那条保留自己的 id（换 id 会让客户端当成两条），时间改成日志里的
+    // ——日志是时间的真源，重新起进程后同一个会话的最后一条才会和重启前完全一致。
+    const twin = findTwin(conversation.messages, message)
+    if (twin) {
+      if (source === 'log') {
+        // 日志优先：正文与时间以日志为准，媒体/昵称/头像从捕获副本补。
+        const index = conversation.messages.indexOf(twin)
+        if (index >= 0) conversation.messages.splice(index, 1)
+        twin.content = message.content
+        twin.dir = message.dir
+        twin.time = message.time
+        if (!twin.media.length && message.media.length) twin.media = message.media
+        if (!twin.userId && message.userId) twin.userId = message.userId
+        if (!twin.userName && message.userName) twin.userName = message.userName
+        twin.avatar = twin.avatar ?? message.avatar
+        // 并完这条就是日志条目了，捕获副本不再需要落盘。
+        if (twin._src !== 'log') markCaptureDirty()
+        twin._src = 'log'
+        insertSorted(conversation.messages, twin)
+      } else {
+        if (!twin.media.length && message.media.length) twin.media = message.media
+        if (!twin.userName && message.userName) twin.userName = message.userName
+        if (!twin.avatar && message.avatar) twin.avatar = message.avatar
+      }
+      return null
     }
 
     // 正常是追加；时间戳回退（适配器补发/重试）时插到正确位置，保持升序。
-    if (last && time < last.time) {
-      let index = messages.length - 1
-      while (index >= 0 && messages[index].time > time) index--
-      if (index >= 0 && messages[index].time === time) return null
-      messages.splice(index + 1, 0, message)
-    } else {
-      messages.push(message)
+    insertSorted(conversation.messages, message)
+    if (conversation.messages.length > MESSAGE_CAPACITY) {
+      conversation.messages.splice(0, conversation.messages.length - MESSAGE_CAPACITY)
     }
-    if (messages.length > MESSAGE_CAPACITY) messages.splice(0, messages.length - MESSAGE_CAPACITY)
 
     // 会话表按「最后一条消息时间」淘汰，最久没消息的先走。
     if (conversations.size > CONVERSATION_CAPACITY) {
@@ -708,10 +829,52 @@ export function apply(ctx) {
           oldestKey = candidateKey
         }
       }
-      if (oldestKey !== null) conversations.delete(oldestKey)
+      if (oldestKey !== null) {
+        conversations.delete(oldestKey)
+        // 被淘汰会话的捕获增量仍然落盘：App 翻旧会话时还能补齐。
+        markCaptureDirty()
+      }
     }
 
+    // 捕获增量要落盘（日志部分不落盘）。
+    if (source === 'captured') markCaptureDirty()
     return message
+  }
+
+  // 同一条消息的另一个来源/另一次上报。判定顺序：
+  // 1. 平台消息 id 相同（捕获的 `messageId` 与日志 envelope 的 `externalId` 是同一个）；
+  // 2. 同来源：正文压空白相同且 500ms 内（多 bot 实例/适配器重复上报）；
+  // 3. 跨来源：正文压空白相同（或多出的部分只是媒体占位）且 3s 内；时间戳对不上但
+  //    正文完全相同时放宽到 10s（多段回复的日志条目时间是整轮结束时刻）。
+  function findTwin(messages, message) {
+    const content = twinText(message.content)
+    let best = null
+    let bestDelta = Infinity
+    for (const candidate of messages) {
+      if (candidate.dir !== message.dir) continue
+      const delta = Math.abs(candidate.time - message.time)
+      if (message.id && candidate.id === message.id && delta <= DEDUPE_EXACT_WINDOW) return candidate
+      const candidateContent = twinText(candidate.content)
+      if (candidate._src === message._src) {
+        // 只有捕获侧会被多个 bot 实例/适配器重复上报；日志条目 id 唯一，正文相同也是
+        // 两条不同的消息（连发两张图就是这样），不能合并。
+        if (message._src === 'captured' && delta <= OUTBOUND_DEDUPE_MS && content && candidateContent === content) {
+          return candidate
+        }
+        continue
+      }
+      if (!content) continue
+      const exact = candidateContent === content
+      const contained = !exact && content.length >= 4 && candidateContent.length >= 4 &&
+        (candidateContent.startsWith(content) || content.startsWith(candidateContent))
+      if (!exact && !contained) continue
+      if (delta > (exact ? DEDUPE_EXACT_WINDOW : DEDUPE_WINDOW)) continue
+      if (delta < bestDelta) {
+        bestDelta = delta
+        best = candidate
+      }
+    }
+    return best
   }
 
   // 频道 → 会话键。出站 `send` 的 session 是 `bot.session()` 新造的，`isDirect` 这类挂在
@@ -733,6 +896,7 @@ export function apply(ctx) {
   ctx.on('message', async (session) => {
     const key = conversationKeyOf(session)
     if (!key) return
+    rememberKey(key)
     const entry = messageEntry(session, 'in')
     await resolveIdentity(session, entry)
     entry.media = await collectMedia(mediaSnapshot(session))
@@ -810,8 +974,584 @@ export function apply(ctx) {
     const inboundKey = inboundKeys.get(entry.platform + '\u0000' + entry.channelId)
     const key = inboundKey || slot.conversationKey || conversationKeyOf(session) || entry.channelId
     if (!key) return
+    rememberKey(key)
     const message = record(key, entry)
     if (message) notify(key, message)
+  })
+
+  // ── 捕获增量持久化 ────────────────────────────────────────────────────
+  // 只存「日志里没有的那部分」（指令回复、未触发 agent 的群消息）与每会话游标；日志部分
+  // 每次启动从 DB 重读，所以文件很小。原子写（tmp + rename）、1s 防抖、进程退出前刷一次。
+  const captureFile = resolve(
+    process.env.CHATLUNA_PLATFORM_CAPTURE ?? join(process.cwd(), 'data/chatluna/platform-capture.json')
+  )
+  const persistedCursors = new Map()
+  let captureTimer = null
+
+  const captureMeta = (conversation) => ({
+    platform: conversation.platform,
+    selfId: conversation.selfId,
+    channelId: conversation.channelId,
+    guildId: conversation.guildId,
+    name: conversation.name,
+    nameKind: conversation.nameKind,
+    avatar: conversation.avatar
+  })
+
+  const captureSnapshot = () => {
+    const items = []
+    const seen = new Set()
+    for (const conversation of conversations.values()) {
+      seen.add(conversation.key)
+      items.push({
+        key: conversation.key,
+        ...captureMeta(conversation),
+        messages: conversation.messages
+          .filter((message) => message._src === 'captured')
+          .map((message) => ({
+            id: message.id,
+            time: message.time,
+            dir: message.dir,
+            userId: message.userId,
+            userName: message.userName,
+            avatar: message.avatar,
+            content: message.content,
+            media: message.media
+          }))
+      })
+    }
+    // 已被 LRU 淘汰、但还没再出现消息的会话只留展示信息。
+    for (const [key, meta] of savedMeta) {
+      if (seen.has(key)) continue
+      items.push({ key, ...meta, messages: [] })
+    }
+    return { version: 2, savedAt: Date.now(), cursors: Object.fromEntries(logCursors), conversations: items }
+  }
+
+  // 体积上限 5MB：超了先丢最旧的捕获消息（日志那份还在 DB 里，丢了也能重读）。
+  const captureJson = (snapshot) => {
+    let json = JSON.stringify(snapshot)
+    if (Buffer.byteLength(json) <= CAPTURE_MAX_BYTES) return json
+    const entries = []
+    for (const conversation of snapshot.conversations) {
+      for (const message of conversation.messages) entries.push({ conversation, message })
+    }
+    entries.sort((a, b) => a.message.time - b.message.time)
+    let index = 0
+    while (Buffer.byteLength(json) > CAPTURE_MAX_BYTES && index < entries.length) {
+      for (let step = 0; step < 20 && index < entries.length; step += 1, index += 1) {
+        const { conversation, message } = entries[index]
+        conversation.messages = conversation.messages.filter((candidate) => candidate !== message)
+      }
+      json = JSON.stringify(snapshot)
+    }
+    while (Buffer.byteLength(json) > CAPTURE_MAX_BYTES && snapshot.conversations.length > 1) {
+      snapshot.conversations.pop()
+      json = JSON.stringify(snapshot)
+    }
+    return json
+  }
+
+  const flushCapture = () => {
+    if (captureTimer !== null) {
+      clearTimeout(captureTimer)
+      captureTimer = null
+    }
+    const json = captureJson(captureSnapshot())
+    try {
+      mkdirSync(dirname(captureFile), { recursive: true })
+      const temp = captureFile + '.tmp'
+      writeFileSync(temp, json)
+      renameSync(temp, captureFile)
+    } catch (error) {
+      logger.warn('platform capture flush failed (%s): %s', captureFile, error?.message ?? error)
+    }
+  }
+
+  // 先恢复上次的增量，再后台跑日志全量：服务启动不被 DB 读取挡住。
+  const restoreCapture = () => {
+    let raw
+    try {
+      raw = readFileSync(captureFile, 'utf8')
+    } catch {
+      return
+    }
+    const data = parseJsonText(raw)
+    if (!data || typeof data !== 'object') return
+    for (const [sessionId, value] of Object.entries(data.cursors ?? {})) {
+      const n = Number(value)
+      if (Number.isSafeInteger(n) && n > 0) persistedCursors.set(textOf(sessionId), n)
+    }
+    const restored = []
+    for (const conversation of Array.isArray(data.conversations) ? data.conversations : []) {
+      const key = textOf(conversation?.key)
+      if (!key) continue
+      rememberKey(key)
+      savedMeta.set(key, {
+        platform: textOf(conversation.platform),
+        selfId: textOf(conversation.selfId),
+        channelId: textOf(conversation.channelId),
+        guildId: conversation.guildId ? textOf(conversation.guildId) : null,
+        name: textOf(conversation.name),
+        nameKind: textOf(conversation.nameKind) || 'private',
+        avatar: conversation.avatar ? textOf(conversation.avatar) : null
+      })
+      for (const message of Array.isArray(conversation.messages) ? conversation.messages : []) {
+        if (!message || !Number.isFinite(Number(message.time))) continue
+        restored.push({ key, message })
+      }
+    }
+    restored.sort((a, b) => Number(a.message.time) - Number(b.message.time))
+    for (const { key, message } of restored) {
+      record(key, {
+        id: textOf(message.id),
+        time: Number(message.time),
+        dir: message.dir,
+        userId: textOf(message.userId),
+        userName: textOf(message.userName),
+        avatar: message.avatar ? textOf(message.avatar) : null,
+        content: textOf(message.content),
+        media: Array.isArray(message.media) ? message.media : []
+      }, 'captured')
+    }
+    if (restored.length) logger.info('platform capture restored: %d messages from %s', restored.length, captureFile)
+  }
+
+  restoreCapture()
+
+  markCaptureDirty = () => {
+    if (captureTimer !== null) return
+    captureTimer = setTimeout(flushCapture, CAPTURE_FLUSH_MS)
+    captureTimer.unref?.()
+  }
+  // 退出前把没落盘的增量刷掉：daemon 正常停止走 dispose，强杀走 exit。
+  const flushOnExit = () => flushCapture()
+  process.once('exit', flushOnExit)
+
+  // ── 会话日志投影 ──────────────────────────────────────────────────────
+  // 普通消息的真源是 ChatLuna 的会话日志：`chatluna_sessions` 给会话（键 = conversationKey，
+  // 与捕获侧 `session.conversation.key` 同源），`chatluna_session_entry.kind = 'message'`
+  // 给消息（user → in，assistant → out）。web / subagent 会话不是平台对话，不投影。
+  const logDbPath = resolve(process.env.CHATLUNA_DB ?? join(process.cwd(), 'data/chatluna.db'))
+  const logCursors = new Map()
+  const loadedSessions = new Set()
+  const peerCache = new Map()
+  let peerCacheAt = 0
+  let logDb = null
+  let logStatements = null
+  let logSessions = []
+  let logSessionIndex = new Map()
+  let dbRetryAt = 0
+  let dbWarnAt = 0
+  let tickBusy = false
+  let fullLoadRunning = false
+  let fullLoadDone = false
+  let pollTimer = null
+
+  const peerParts = (value) => {
+    const text = textOf(value)
+    const parts = text.split(':')
+    if (parts.length < 4) return null
+    return { platform: parts[0], selfId: parts[1], kind: parts[2], id: parts.slice(3).join(':') }
+  }
+
+  const peerKey = (platform, selfId, kind, id) => [platform, selfId, kind, id].join('\u0000')
+
+  const peerDisplay = (platform, selfId, kind, id) => {
+    if (!platform || !id) return null
+    return peerCache.get(peerKey(platform, selfId, kind, id)) ?? null
+  }
+
+  const refreshPeers = () => {
+    const next = new Map()
+    for (const row of logStatements.peers.all()) {
+      next.set(peerKey(textOf(row.platform), textOf(row.selfId), textOf(row.kind), textOf(row.id)), {
+        name: textOf(row.name),
+        avatar: textOf(row.avatar)
+      })
+    }
+    peerCache.clear()
+    for (const [key, value] of next) peerCache.set(key, value)
+    peerCacheAt = Date.now()
+  }
+
+  const metaOf = (row) => {
+    const identity = parseJsonText(row.identity) ?? {}
+    const peer = peerParts(row.peer) ?? peerParts(row.convPeer)
+    const platform = textOf(identity.platform) || peer?.platform || textOf(row.origin)
+    const selfId = textOf(identity.selfId) || peer?.selfId || ''
+    const channelId = textOf(identity.channelId) || peer?.id || ''
+    const guildId = textOf(identity.guildId) || (peer?.kind === 'guild' ? peer.id : '') || null
+    const kind = conversationKind(guildId, channelId)
+    const conversationPeer = peer && peer.kind === (kind === 'group' ? 'guild' : 'user')
+      ? { name: textOf(row.peerName), avatar: textOf(row.peerAvatar) }
+      : peerDisplay(platform, selfId, kind === 'group' ? 'guild' : 'user', kind === 'group' ? guildId : channelId)
+    const bot = peerDisplay(platform, selfId, 'bot', selfId)
+    return {
+      platform,
+      selfId,
+      channelId,
+      guildId,
+      kind,
+      name: cleanName(conversationPeer?.name),
+      avatar: textOf(conversationPeer?.avatar) || null,
+      botName: cleanName(bot?.name),
+      botAvatar: textOf(bot?.avatar) || null
+    }
+  }
+
+  const refreshSessions = () => {
+    if (Date.now() - peerCacheAt > 30_000) refreshPeers()
+    const next = []
+    const index = new Map()
+    for (const row of logStatements.sessions.all()) {
+      const id = textOf(row.id)
+      const rawKey = textOf(row.conversationKey)
+      if (!id || !rawKey) continue
+      rememberKey(rawKey)
+      const session = {
+        id,
+        key: canonicalKey(rawKey),
+        meta: metaOf(row),
+        lastActiveAt: Number(row.lastActiveAt) || 0
+      }
+      next.push(session)
+      index.set(id, session)
+    }
+    logSessions = next
+    logSessionIndex = index
+  }
+
+  const MEDIA_TEXT = { image: '[图片]', video: '[视频]', audio: '[语音]', file: '[文件]' }
+
+  const mediaItemOf = (descriptor) => {
+    const source = textOf(descriptor?.source).trim()
+    if (!source) return null
+    const kind = descriptor?.kind || 'file'
+    const item = { kind }
+    const url = workspaceRelativeOf(source) || (isWorkspacePath(source) ? source : '') || normalizeMediaUrl(source)
+    if (url) item.url = url
+    else item.ref = unescapeAttr(source)
+    if (descriptor?.mime) item.mime = textOf(descriptor.mime)
+    const name = cleanName(descriptor?.name)
+    if (name) item.name = name
+    const size = Number(descriptor?.size)
+    if (Number.isFinite(size) && size > 0) item.size = size
+    return item
+  }
+
+  // ChatLuna 的 `file` 块：`{mediaType, data:{type:'reference', reference:'storage://…'}}`。
+  // 参考值不是可访问地址，`mediaItemOf` 会把它留成 `ref`，客户端按占位处理。
+  const fileDescriptor = (block) => {
+    const mime = textOf(block?.mediaType ?? block?.mimeType ?? block?.mime)
+    const data = block?.data
+    const source = textOf(
+      (typeof data === 'string' ? data : '') ||
+      data?.url || data?.reference || data?.data || data?.src ||
+      block?.url || block?.reference || block?.src
+    )
+    return { kind: mediaKind('file', mime) || 'file', mime, source }
+  }
+
+  const withMeta = (session, item) => ({
+    ...item,
+    platform: session.meta.platform,
+    selfId: session.meta.selfId,
+    channelId: session.meta.channelId,
+    guildId: session.meta.guildId,
+    conversationName: session.meta.name,
+    conversationAvatar: session.meta.avatar
+  })
+
+  // 入站：真正来自平台的只有 `envelope` 块（`kind: 'message'`），一个 envelope 就是一条
+  // 平台消息，`externalId` 就是平台消息 id。同一轮里被折叠进来的记忆/状态块是纯 `text`，
+  // 不是用户发言，跳过。
+  const envelopeMessages = (blocks, row, session) => {
+    const out = []
+    const entryTime = Number(row.time) || Number(row.n) || Date.now()
+    for (const block of Array.isArray(blocks) ? blocks : []) {
+      if (block?.type !== 'envelope') continue
+      if (block.kind && block.kind !== 'message') continue
+      const media = []
+      let text = ''
+      for (const child of Array.isArray(block.content) ? block.content : []) {
+        if (child?.type === 'text') text += textOf(child.text)
+        else if (child?.type === 'file') {
+          const item = mediaItemOf(fileDescriptor(child))
+          if (item) {
+            media.push(item)
+            text += MEDIA_TEXT[item.kind] ?? '[文件]'
+          }
+        }
+      }
+      const content = clipContent(plainLogText(text))
+      if (!content && !media.length) continue
+      const senderId = textOf(block.sender?.id)
+      const sender = senderId ? peerDisplay(session.meta.platform, session.meta.selfId, 'user', senderId) : null
+      out.push(withMeta(session, {
+        id: textOf(block.externalId) || textOf(block.id) || `${session.id}:${row.n}`,
+        dir: 'in',
+        time: Number(block.time) || entryTime,
+        userId: senderId,
+        userName: cleanName(block.sender?.name) || cleanName(sender?.name) || shortId(senderId),
+        avatar: textOf(sender?.avatar) || null,
+        content,
+        media
+      }))
+    }
+    return out
+  }
+
+  // 出站：正文可能在 `text` 块里（多段用 `<message>` 分条），也可能在 `reply` 工具的
+  // `input.content` 里。一段平台消息 = 一条消息，媒体从该段里的 `<img src=…>` 取。
+  const assistantMessages = (message, row, session) => {
+    const blocks = Array.isArray(message.content) ? message.content : []
+    let source = ''
+    for (const block of blocks) if (block?.type === 'text') source += textOf(block.text)
+    if (!source.trim()) {
+      for (const block of blocks) {
+        if (block?.type !== 'tool-call' || !REPLY_TOOLS.has(textOf(block.toolName))) continue
+        source += textOf(block.input?.content ?? block.input?.text)
+      }
+    }
+    const out = []
+    const entryTime = Number(row.time) || Date.now()
+    for (const segment of replySegments(source)) {
+      const content = clipContent(plainLogText(segment))
+      const media = rawMediaTags(segment).map(mediaItemOf).filter(Boolean)
+      if (!content && !media.length) continue
+      out.push(withMeta(session, {
+        id: `${textOf(message.id) || `${session.id}:${row.n}`}:${out.length}`,
+        dir: 'out',
+        time: entryTime + out.length,
+        userId: session.meta.selfId,
+        userName: session.meta.botName || session.meta.selfId,
+        avatar: session.meta.botAvatar,
+        content,
+        media
+      }))
+    }
+    return out
+  }
+
+  const projectRow = (session, row, publish) => {
+    const payload = parseJsonText(row.payloadJson)
+    const message = payload?.message ?? payload
+    if (!message || typeof message !== 'object') return 0
+    const items = message.role === 'user'
+      ? envelopeMessages(message.content, row, session)
+      : message.role === 'assistant'
+        ? assistantMessages(message, row, session)
+        : []
+    let count = 0
+    for (const item of items) {
+      const recorded = record(session.key, item, 'log')
+      count += 1
+      if (recorded && publish) notify(session.key, recorded)
+    }
+    return count
+  }
+
+  const advanceCursor = (session, row) => {
+    const n = Number(row.n) || 0
+    const previous = logCursors.get(session.id) ?? 0
+    if (n > previous) logCursors.set(session.id, n)
+    return n > previous
+  }
+
+  // 首次全量：一个会话最近 300 条 message 条目（多会话的同一会话键会先后并入同一列表）。
+  // 不推实时帧——App 连上时的回放与分页已经覆盖这批历史。
+  const loadWindow = (session) => {
+    if (!logStatements) return 0
+    let rows
+    try {
+      rows = logStatements.window.all(session.id)
+    } catch (error) {
+      dbFailure('window', error)
+      return 0
+    }
+    let count = 0
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      const row = rows[index]
+      if (advanceCursor(session, row)) markCaptureDirty()
+      count += projectRow(session, row, false)
+    }
+    loadedSessions.add(session.id)
+    return count
+  }
+
+  const loadNew = (session) => {
+    if (!logStatements) return 0
+    const cursor = logCursors.get(session.id) ?? 0
+    let rows
+    try {
+      rows = logStatements.newer.all(session.id, cursor)
+    } catch (error) {
+      dbFailure('increment', error)
+      return 0
+    }
+    let count = 0
+    for (const row of rows) {
+      if (advanceCursor(session, row)) markCaptureDirty()
+      count += projectRow(session, row, true)
+    }
+    return count
+  }
+
+  function dbFailure(stage, error) {
+    logger.warn('chatluna log projection %s failed: %s', stage, error?.message ?? error)
+    // 查询失败（例如 DB 被独占/文件被替换）：关掉连接，稍后重开并重跑全量。
+    try {
+      logDb?.close()
+    } catch {}
+    logDb = null
+    logStatements = null
+    fullLoadDone = false
+    loadedSessions.clear()
+    dbRetryAt = Date.now() + LOG_DB_RETRY_MS
+  }
+
+  const openLogDb = async () => {
+    if (logDb) return true
+    if (Date.now() < dbRetryAt) return false
+    try {
+      const { DatabaseSync } = await import('node:sqlite')
+      logDb = new DatabaseSync(logDbPath, { readOnly: true })
+      try {
+        logDb.exec('pragma busy_timeout = 1000')
+      } catch {}
+      logStatements = {
+        sessions: logDb.prepare(`
+          select s.id as id, s.conversationKey as conversationKey, s.origin as origin,
+                 s.peer as peer, s.lastActiveAt as lastActiveAt,
+                 c.identity as identity, c.peer as convPeer,
+                 p.name as peerName, p.avatar as peerAvatar
+            from chatluna_sessions s
+            left join chatluna_conversations c on c.key = s.conversationKey
+            left join chatluna_peers p on p.key = s.peer
+           where s.conversationKey is not null
+             and s.origin not in ('web', 'subagent')
+             and s.messageCount > 0
+           order by s.lastActiveAt desc
+           limit ${LOG_SESSION_LIMIT}
+        `),
+        window: logDb.prepare(`
+          select n, time, payloadJson from chatluna_session_entry
+           where sessionId = ? and kind = 'message'
+           order by n desc limit ${LOG_ENTRY_WINDOW}
+        `),
+        newer: logDb.prepare(`
+          select n, time, payloadJson from chatluna_session_entry
+           where sessionId = ? and kind = 'message' and n > ?
+           order by n asc limit ${LOG_INCREMENT_LIMIT}
+        `),
+        peers: logDb.prepare('select platform, selfId, kind, id, name, avatar from chatluna_peers')
+      }
+      logger.info('chatluna log projection: reading %s', logDbPath)
+      return true
+    } catch (error) {
+      logDb = null
+      logStatements = null
+      dbRetryAt = Date.now() + LOG_DB_RETRY_MS
+      if (Date.now() > dbWarnAt) {
+        dbWarnAt = Date.now() + 60_000
+        logger.warn('chatluna log projection unavailable (%s): %s', logDbPath, error?.message ?? error)
+      }
+      return false
+    }
+  }
+
+  // 首次全量按批跑：每批 4 个会话，中间让出事件循环，启动时不会长时间卡住 HTTP。
+  const startFullLoad = () => {
+    if (fullLoadRunning || fullLoadDone) return
+    fullLoadRunning = true
+    const startedAt = Date.now()
+    let messages = 0
+    let restoredCursors = 0
+    const pending = logSessions.slice()
+    const step = () => {
+      const batch = pending.splice(0, LOG_FULL_LOAD_CHUNK)
+      for (const session of batch) {
+        if (loadedSessions.has(session.id)) continue
+        messages += loadWindow(session)
+      }
+      if (pending.length) {
+        // DB 在批量加载中掉线：停下，等 pollLog 重连后重跑。
+        if (!logStatements) {
+          fullLoadRunning = false
+          return
+        }
+        setImmediate(step)
+        return
+      }
+      if (!logStatements) {
+        fullLoadRunning = false
+        return
+      }
+      for (const session of logSessions) {
+        if (loadedSessions.has(session.id) && (persistedCursors.get(session.id) ?? 0) < (logCursors.get(session.id) ?? 0)) {
+          restoredCursors += 1
+        }
+      }
+      fullLoadDone = true
+      fullLoadRunning = false
+      logger.info(
+        'log projection loaded: %d sessions, %d messages, %d conversations in %dms (%d sessions advanced while down)',
+        loadedSessions.size, messages, conversations.size, Date.now() - startedAt, restoredCursors
+      )
+    }
+    step()
+  }
+
+  const pollLog = async () => {
+    if (tickBusy) return
+    tickBusy = true
+    try {
+      if (!(await openLogDb())) return
+      try {
+        refreshSessions()
+      } catch (error) {
+        dbFailure('sessions', error)
+        return
+      }
+      // 全量还没跑完（首次启动，或 DB 断开后重连）：先补历史，增量下一轮再说。
+      if (!fullLoadDone) {
+        startFullLoad()
+        return
+      }
+      for (const session of logSessions) {
+        if (!loadedSessions.has(session.id)) {
+          loadWindow(session)
+          continue
+        }
+        loadNew(session)
+      }
+    } finally {
+      tickBusy = false
+    }
+  }
+
+  void (async () => {
+    await openLogDb()
+    try {
+      refreshSessions()
+    } catch (error) {
+      dbFailure('sessions', error)
+    }
+    startFullLoad()
+    pollTimer = setInterval(pollLog, LOG_POLL_MS)
+    pollTimer.unref?.()
+  })()
+
+  ctx.on('dispose', () => {
+    clearInterval(pollTimer)
+    process.removeListener('exit', flushOnExit)
+    flushCapture()
+    try {
+      logDb?.close()
+    } catch {}
+    logDb = null
+    logStatements = null
   })
 
   const serve = async (relative, res) => {
