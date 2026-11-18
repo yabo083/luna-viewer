@@ -906,14 +906,21 @@ class _MediaBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 有 url 的图片才进图片区；只有 ref 的图片没有可画的像素，落到下面当占位胶囊。
+    // `storage://<id>` 引用在日志侧只给 ref；它能通过 `/files/<id>` 取到像素，所以按图片渲染。
+    String? imageUrlOf(PlatformMedia item) {
+      if (!item.isImage) return null;
+      if (item.url != null && item.url!.isNotEmpty) return item.url;
+      final ref = item.ref;
+      if (ref == null || ref.isEmpty) return null;
+      return '/files/${Uri.encodeComponent(ref)}';
+    }
+
     final imageUrls = [
-      for (final item in media)
-        if (item.isImage && item.url != null) item.url!,
+      for (final item in media) ?imageUrlOf(item),
     ];
     final rest = [
       for (final item in media)
-        if (!(item.isImage && item.url != null)) item,
+        if (imageUrlOf(item) == null) item,
     ];
     return Column(
       mainAxisSize: MainAxisSize.min,
