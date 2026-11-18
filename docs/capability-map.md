@@ -37,6 +37,7 @@
 | 待审批 | `GET /api/interaction/pending?routeId=` / `POST /api/interaction/answer {routeId,answer}` | 回合会挂起等待 |
 | 附件（storage） | `GET /files/:name` | 无鉴权、无 `/api` 前缀 |
 | 消息旁路记录（伴侣插件） | `GET /api/traffic?limit=&platform=&channelId=` | 入站消息环形缓冲，含未进入会话的指令 |
+| 旁路实时流（伴侣插件） | `GET /api/traffic/stream`（SSE） | `event: traffic`；先回放最近 20 条（旧→新）再实时推，15 s 一次 `: ping`；条目新增 `conversationKey`（= 会话 id） |
 | 工作区文件（伴侣插件） | `GET /api/workspace?path=<相对路径>` | 需 Bearer；路径限定在 `data/chatluna/agents-work`；消息里的相对 `<img src>` 走这里 |
 
 ## 平台与 bot

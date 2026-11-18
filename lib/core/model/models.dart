@@ -161,6 +161,21 @@ class ChatMessage {
     );
   }
 
+  /// 合成消息：不存在于会话日志、由页面侧旁路数据生成的一条（目前是 `/api/traffic` 的
+  /// 指令）。[form] 标明来源，一律按框架卡片渲染；`id` 由调用方保证唯一，去重靠它。
+  factory ChatMessage.synthetic({
+    required String id,
+    required String form,
+    required String text,
+    String role = 'user',
+  }) => ChatMessage(
+    id: id,
+    role: role,
+    blocks: [ChatBlock('text', {'text': text})],
+    form: form,
+    isFramework: true,
+  );
+
   /// 角色引擎把正文包在 `<message>…</message>` 里；图片是 `<img src="…">`；`<status/>` 是状态栏，不展示。
   /// 输出是 markdown：`<img>` 已转成 `![](url)`，其余标签剥掉（`<br>` 保留）。
   late final String bodyMarkdown = _bodyMarkdown();

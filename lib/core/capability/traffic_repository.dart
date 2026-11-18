@@ -17,6 +17,7 @@ class TrafficEntry {
     required this.channelId,
     required this.guildId,
     required this.content,
+    this.serverKey,
   });
 
   final String id;
@@ -27,6 +28,11 @@ class TrafficEntry {
   final String channelId;
   final String? guildId;
   final String content;
+
+  /// 服务端的会话键（JSON `conversationKey`，即 `session.conversation?.key`）。
+  /// 新插件才有：它就是会话 id（`route:r-…`，私聊还带 `:user:<id>`），
+  /// 群/私聊都能直接对上，标题里没有 id 的会话也靠它命中。旧实例为 null。
+  final String? serverKey;
 
   static TrafficEntry? fromJson(Object? json) {
     if (json is! Map) return null;
@@ -43,6 +49,7 @@ class TrafficEntry {
       channelId: _text(json['channelId']),
       guildId: json['guildId'] == null ? null : _text(json['guildId']),
       content: _text(json['content']),
+      serverKey: json['conversationKey'] == null ? null : _text(json['conversationKey']),
     );
   }
 
@@ -64,6 +71,10 @@ class TrafficEntry {
   /// 会话分组键：同一个平台、同一个频道才算同一个会话。
   /// `channelId` 在不同平台之间会撞车（数值 id 居多），所以平台必须进键里。
   String get conversationKey => '$platform\u0000$channelId';
+
+  /// 去重键：服务端的消息 id；缺 id（旧实例/旧缓冲）时退回「时间 + 正文」。
+  /// SSE 重连会重放最近 20 条、轮询会重复拉到同一批，都靠它挡。
+  String get dedupeKey => id.isNotEmpty ? id : '${time.millisecondsSinceEpoch}\u0000$content';
 
   /// 复制用的整条文本：身份全带上，便于拿去排查路由/频道。
   String get copyText {

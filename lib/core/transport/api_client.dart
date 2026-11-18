@@ -115,7 +115,15 @@ class ApiClient {
     ),
   );
 
-  Stream<SseEvent> sse(String path, {Map<String, String>? query, String? lastEventId}) async* {
+  /// [includeComments] 为真时把服务端心跳（`: ping` 注释行）也作为
+  /// `event: comment` 的帧发出来：需要感知「连接还活着」的调用方（如旁路流量流）
+  /// 靠它判断链路健康，默认丢弃，`/live`、`/events` 不受影响。
+  Stream<SseEvent> sse(
+    String path, {
+    Map<String, String>? query,
+    String? lastEventId,
+    bool includeComments = false,
+  }) async* {
     final request = http.Request('GET', _uri(path, query))
       ..headers.addAll({
         ..._headers,
@@ -151,7 +159,11 @@ class ApiClient {
         data.clear();
         continue;
       }
-      if (line.startsWith(':')) continue;
+      if (line.startsWith(':')) {
+        // 注释行就是心跳（`: ping`）：默认丢掉，需要探活的调用方收下这一帧。
+        if (includeComments) yield const SseEvent('comment', null, null);
+        continue;
+      }
       final colon = line.indexOf(':');
       final field = colon == -1 ? line : line.substring(0, colon);
       var value = colon == -1 ? '' : line.substring(colon + 1);

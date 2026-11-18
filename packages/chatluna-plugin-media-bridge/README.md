@@ -24,10 +24,17 @@ Authorization: Bearer <实例 token 或登录 session>
 GET /api/traffic?limit=50&platform=qq&channelId=C3A7...
 Authorization: Bearer <实例 token 或登录 session>
 
-{"items":[{"id","time","platform","selfId","userId","channelId","guildId","content"}]}
+{"items":[{"id","time","platform","selfId","userId","channelId","guildId","content","conversationKey","routeId"}]}
 ```
 
 - 新 → 旧；`limit` 默认 50（1–200），`platform` / `channelId` 空串表示不过滤。
+- `conversationKey` 是 ChatLuna 的 `session.conversation.key`（群聊形如 `r-1a2b3c4d5e6f`，
+  个人/泳道配置会带 `:user:` / `:lane:` 后缀），`routeId` 是同一路由的 id；会话标题里那种
+  `A1338876…` 与 `channelId`/`guildId` 的 `C…` 不是同一命名空间，**客户端匹配会话要用
+  `conversationKey`（或 `routeId`），不要用标题 id 对 `channelId`**。
+- 降级：`session.conversation` 由 chat 插件惰性挂在 Session 原型上且依赖 `routing` 服务，
+  取不到时 `conversationKey` 退回 `channelId`（两者都没有才是 `null`）；运行环境没有
+  `@chatluna/satori` 时条目里不出现 `routeId` 键。此时客户端只能退回标题 id 匹配。
 - `time` 是毫秒时间戳；`content` 由 `session.elements` 翻译成可读文本（文本原样、`at` → `@尾4位`、
   `img`/`image` → `[图片]`、`face`/`emoji` → `[表情]`、`quote` → `[引用]`、`file`/`audio`/`video` →
   `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。

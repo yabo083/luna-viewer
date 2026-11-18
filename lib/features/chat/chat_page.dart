@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/capability/sessions_repository.dart';
+import '../../core/capability/traffic_repository.dart';
+import '../../core/capability/traffic_stream.dart';
 import '../../core/model/models.dart';
 import 'chat_chrome.dart';
 import 'message_view.dart';
@@ -107,6 +109,31 @@ class _ChatPageState extends State<ChatPage> {
   bool _awayFromBottom = false;
   final ValueNotifier<int> _unseen = ValueNotifier<int>(0);
 
+  /// 旁路流量：指令层吃掉的消息（`chatluna xxx` 之类）不进会话日志，由
+  /// `/api/traffic/stream` 在页面打开期间实时补成框架卡片。
+  /// 它**不进** `_all`：既不参与日志流的 id 去重，也不被同标题合并吞掉。
+  final List<_TrafficItem> _traffic = [];
+  StreamSubscription<TrafficEntry>? _trafficSub;
+  TrafficStream? _trafficStream;
+
+  /// 标题里的候选 id（openid / 群号 / 频道号）：旧插件没有会话键时靠它命中。
+  Set<String> _trafficIds = const {};
+
+  /// 已判定过的旁路消息去重键（服务端重连会重放最近 20 条）。
+  final Set<String> _trafficSeen = {};
+
+  /// 回显窗口：同一内容在 3s 内已经进了 `_all`（指令被服务端回显到日志）就不再画卡。
+  static const _echoWindow = Duration(seconds: 3);
+
+  /// 列表里最多留这么多旁路卡片，更早的靠「消息记录」页翻。
+  static const _trafficMax = 100;
+
+  /// 去重集上限：重放/轮询会重复送 id，旧 id 可以淘汰。
+  static const _trafficSeenMax = 400;
+
+  /// 最近落进 `_all` 的正文 + 本地到达时间：旁路卡片据此判断「指令已被回显」。
+  final List<({String body, DateTime at})> _recentBodies = [];
+
   /// 会话当前模型；切换成功后立即反映到信息栏与详情。
   ModelRef? _model;
 
@@ -147,7 +174,9 @@ class _ChatPageState extends State<ChatPage> {
     }
     // 首帧先画出来再连实时流：SSE 握手与首个 snapshot 会和首屏排版抢时间。
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _startLive();
+      if (!mounted) return;
+      _startLive();
+      _startTraffic();
     });
   }
 
@@ -159,6 +188,8 @@ class _ChatPageState extends State<ChatPage> {
     _unseen.dispose();
     _liveSub?.cancel();
     _eventsSub?.cancel();
+    _trafficSub?.cancel();
+    _trafficStream?.dispose();
     _poll?.cancel();
     _snapshotTimer?.cancel();
     _eventsRetry?.cancel();
@@ -169,6 +200,8 @@ class _ChatPageState extends State<ChatPage> {
   int _since() => DateTime.now().difference(_t0).inMilliseconds;
 
   Future<void> _load() async {
+    // 已知 id：重取后多出来的才算「刚进日志」，用来撤掉被回显的旁路卡片。
+    final known = {for (final message in _all) message.id};
     try {
       final transcript = await widget.repo.transcript(widget.session.id);
       if (!mounted) return;
@@ -176,6 +209,11 @@ class _ChatPageState extends State<ChatPage> {
       setState(() {
         final keepWindow = _all.isNotEmpty;
         _all = transcript.messages;
+        // 重取不清 `_traffic`；只把这一批里已被真实消息回显的卡片撤掉。
+        _dropEchoedTraffic([
+          for (final message in _all)
+            if (!known.contains(message.id)) message,
+        ]);
         if (!keepWindow) {
           _windowStart = _all.length > _initialWindow ? _all.length - _initialWindow : 0;
           _autoFillDone = false;
@@ -373,6 +411,8 @@ class _ChatPageState extends State<ChatPage> {
       if (_windowStart > 0) {
         _windowStart = math.min(_windowStart + 1, math.max(0, _all.length - 1));
       }
+      _noteBody(message);
+      _dropEchoedTraffic([message]);
     });
     if (_nearBottom) {
       _scrollToLatest();
@@ -380,6 +420,118 @@ class _ChatPageState extends State<ChatPage> {
       _unseen.value += 1;
     }
   }
+
+  /// 旁路流：新插件的 `conversationKey` 就是会话 id，标题里没有 id 的会话也能命中，
+  /// 所以只要有 token 就订阅（只在页面打开期间，关闭即断开一条连接）。
+  /// 详情页只拿到 `ApiClient.authHeaders`，从同一个头里取回 token 自建客户端。
+  void _startTraffic() {
+    final token = _bearer;
+    if (token == null || token.isEmpty) return;
+    _trafficIds = candidateIdsOf(widget.session.title);
+    final stream = TrafficStream(widget.base, token);
+    _trafficStream = stream;
+    _trafficSub = stream.entries.listen(
+      _onTraffic,
+      // 断线退避与 404 退化都在 TrafficStream 内部：这里只收消息，不把页面拖垮。
+      onError: (Object _) {},
+    );
+  }
+
+  String? get _bearer {
+    final raw = widget.headers['authorization'] ?? widget.headers['Authorization'];
+    if (raw == null) return null;
+    const prefix = 'bearer ';
+    final value = raw.trim();
+    return value.toLowerCase().startsWith(prefix)
+        ? value.substring(prefix.length).trim()
+        : value;
+  }
+
+  /// 服务端不做会话过滤：会话键优先，旧插件退回标题 id（见 [matchesTraffic]）。
+  void _onTraffic(TrafficEntry entry) {
+    if (!mounted) return;
+    if (!matchesTraffic(_trafficIds, entry, widget.session.id)) return;
+    final key = entry.dedupeKey;
+    // 服务端重连会重放最近 20 条：同一个 id 只画一次。
+    if (!_trafficSeen.add(key)) return;
+    if (_trafficSeen.length > _trafficSeenMax) _trafficSeen.remove(_trafficSeen.first);
+    // 指令回显：正文 3s 内已经作为真实消息进了日志，就不再画第二遍。
+    if (_echoed(entry.display)) return;
+    // 开局回放的 20 条里，页面打开之前的普通消息多半已在历史里，同样不画。
+    if (_replayed(entry)) return;
+    setState(() {
+      _traffic.add(_TrafficItem(entry, DateTime.now()));
+      if (_traffic.length > _trafficMax) {
+        _traffic.removeRange(0, _traffic.length - _trafficMax);
+      }
+    });
+    if (_nearBottom) {
+      _scrollToLatest();
+    } else {
+      _unseen.value += 1;
+    }
+  }
+
+  /// 旁路卡片：`role: user`（就是用户发的那条）+ `form: traffic`（走框架卡片渲染）。
+  /// 标题行是 `[指令] 正文`，`Notice.parse` 会把 `[指令]` 当结构标签吃掉，正文照常预览。
+  ChatMessage _trafficMessage(TrafficEntry entry) => ChatMessage.synthetic(
+    id: 'traffic-${entry.dedupeKey}',
+    form: 'traffic',
+    text: '[指令] ${entry.display}',
+  );
+
+  /// 回显去重（反方向）：真实消息在旁路卡片之后 3s 内落进日志，卡片让位给真实消息。
+  /// 会改 `_traffic`，只在 `setState` 里调用。
+  void _dropEchoedTraffic(List<ChatMessage> arrived) {
+    if (_traffic.isEmpty || arrived.isEmpty) return;
+    final now = DateTime.now();
+    final bodies = [
+      for (final message in arrived) _squeeze(message.bodyMarkdown),
+    ]..removeWhere((body) => body.isEmpty);
+    if (bodies.isEmpty) return;
+    for (var i = _traffic.length - 1; i >= 0; i--) {
+      final item = _traffic[i];
+      if (now.difference(item.at) > _echoWindow) continue;
+      final text = _squeeze(item.entry.display);
+      if (text.isEmpty) continue;
+      if (bodies.any((body) => body.contains(text))) _traffic.removeAt(i);
+    }
+  }
+
+  /// 3s 内同内容已经进了 `_all`（`/events` 或重取）：这张卡是重复的。
+  bool _echoed(String display) {
+    final text = _squeeze(display);
+    if (text.isEmpty) return false;
+    final now = DateTime.now();
+    _recentBodies.removeWhere((item) => now.difference(item.at) > _echoWindow);
+    return _recentBodies.any((item) => item.body.contains(text));
+  }
+
+  /// 页面打开之前就有的消息：正文已在历史里就不补卡（连接开局的重放会带上它们）。
+  bool _replayed(TrafficEntry entry) {
+    if (!entry.time.isBefore(_t0)) return false;
+    final text = _squeeze(entry.display);
+    if (text.isEmpty) return false;
+    return _all.any((message) => _squeeze(message.bodyMarkdown).contains(text));
+  }
+
+  /// 记录刚进日志的正文，给 [_echoed] 判回显；窗口外的旧条目顺手淘汰。
+  void _noteBody(ChatMessage message) {
+    final body = _squeeze(message.bodyMarkdown);
+    if (body.isEmpty) return;
+    final now = DateTime.now();
+    _recentBodies
+      ..removeWhere((item) => now.difference(item.at) > _echoWindow)
+      ..add((body: body, at: now));
+    if (_recentBodies.length > 40) {
+      _recentBodies.removeRange(0, _recentBodies.length - 40);
+    }
+  }
+
+  static final RegExp _spaces = RegExp(r'\s+');
+
+  /// 比较用：压掉空白差异，避免换行/多空格让同一条对不上。
+  static String _squeeze(String raw) => raw.replaceAll(_spaces, ' ').trim();
 
   /// 渲染列表：相邻且同标题的框架消息合并成一条虚拟消息（`id = 'a|b|c'`），
   /// 其余消息原样一行一条。合并只发生在渲染层，`_all` 本身不动；
@@ -399,6 +551,13 @@ class _ChatPageState extends State<ChatPage> {
         );
       }
       i = end;
+    }
+    // 旁路卡片接在真实消息之后：倒序列表里它们落在最底部（最新）。
+    // 它们是页面侧合成消息、不进 `_all`，所以不参与上面的同标题合并，也不进 `/events` 的 id 去重。
+    final traffic = [..._traffic]..sort((a, b) => a.entry.time.compareTo(b.entry.time));
+    for (final item in traffic) {
+      // `srcEnd` 取 `_all.length + 1`：窗口换算里永远算可见（历史为空时也能命中）。
+      rows.add(_RenderRow(_trafficMessage(item.entry), srcEnd: _all.length + 1));
     }
     return rows;
   }
@@ -573,6 +732,7 @@ class _ChatPageState extends State<ChatPage> {
       if (_netMs != null) 'net ${_netMs}ms',
       if (_paintMs != null) 'paint ${_paintMs}ms',
       if (_liveMs != null) 'live ${_liveMs}ms',
+      if (_trafficStream != null) 'traffic ${_traffic.length}',
     ];
   }
 
@@ -679,7 +839,7 @@ class _ChatPageState extends State<ChatPage> {
                       ],
                     ),
                   )
-                : _all.isEmpty && _live == LiveState.idle
+                : _all.isEmpty && _traffic.isEmpty && _live == LiveState.idle
                 ? Center(
                     child: Text(
                       '这个会话还没有消息',
@@ -725,6 +885,14 @@ class _ChatPageState extends State<ChatPage> {
       ),
     );
   }
+}
+
+/// 一条已入列表的旁路消息 + 本地到达时间：回显去重要用「3s 内」，服务端时间是消息时间。
+class _TrafficItem {
+  const _TrafficItem(this.entry, this.at);
+
+  final TrafficEntry entry;
+  final DateTime at;
 }
 
 /// 渲染行：一行对应列表里的一个 `MessageView`。框架块可能是多条相邻同标题消息合并成的

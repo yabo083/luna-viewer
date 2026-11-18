@@ -78,11 +78,24 @@ function describeElements(elements) {
   return text
 }
 
+// 标题里的 id（`A1338876…`）是 ChatLuna 会话 id，traffic 里的 `channelId`/`guildId` 是适配器
+// 的 `C…`，两者不同命名空间，靠标题 id 匹配群会话必然失败。`conversationKey` / `routeId`
+// 才是同一套标识，客户端用它们精确匹配。
+function conversationKeyOf(session) {
+  // `.conversation` 由 chat 插件惰性挂在 Session 原型上（依赖 routing 服务）；取不到或抛错时
+  // 退回 channelId，客户端就要退回标题 id 匹配。
+  try {
+    const key = session.conversation?.key
+    if (key) return textOf(key)
+  } catch {}
+  return textOf(session.channelId) || null
+}
+
 function trafficEntry(session) {
   // 元素拿不到时（老适配器）退回 content；两条路都压成一行再截断。
   const raw = describeElements(session.elements) || textOf(session.content)
   const content = raw.replace(/\s+/g, ' ').trim()
-  return {
+  const entry = {
     id: textOf(session.messageId ?? session.id),
     time: Number(session.timestamp) || Date.now(),
     platform: textOf(session.platform),
@@ -90,8 +103,13 @@ function trafficEntry(session) {
     userId: textOf(session.userId),
     channelId: textOf(session.channelId),
     guildId: session.guildId ? textOf(session.guildId) : null,
-    content: content.length > TRAFFIC_MAX_CONTENT ? content.slice(0, TRAFFIC_MAX_CONTENT) : content
+    content: content.length > TRAFFIC_MAX_CONTENT ? content.slice(0, TRAFFIC_MAX_CONTENT) : content,
+    conversationKey: conversationKeyOf(session)
   }
+  // `routeId` 由 @chatluna/satori 惰性提供；没有这个字段的运行环境不写键，保持条目形状兼容。
+  const routeId = session.routeId
+  if (routeId) entry.routeId = textOf(routeId)
+  return entry
 }
 
 export function apply(ctx) {
