@@ -50,9 +50,12 @@ Authorization: Bearer <实例 token 或登录 session>
 - 名称会做编码修复：UTF-8 字节被按 latin1 解出的乱码先 `latin1 → utf8` 还原；
   仍带控制字符/Latin 扩展字符的 `<...>` 片段（如 `<$ǿĀD\u000e>`）直接剥掉。
   `title`、`userName`、群名、昵称都走这一步，`avatar` 不受影响。
-- `avatar`：群聊取群头像（`guild.avatar`），私聊取对方头像；拿不到为 `null`。
+- `avatar`：群聊取群头像（`guild.avatar`，事件没带时调 `bot.getGuild` 取 `icon`）；
+  私聊取对方头像；拿不到为 `null`。**不回退 bot 自己的头像**。
+  查询结果（含「没有头像」）都进缓存，同一个群不会再重复请求。
+  QQ 群（`group_openid`）的群信息里没有头像字段，所以这些群的 `avatar` 一直是 `null`。
 - `count` 是当前缓冲里该会话的条数（上限 300，不是历史总数）。
-- `last` 是最新一条消息的摘要，字段与消息条目一致（`text` 即 `content`）。
+- `last` 是最新一条消息的摘要，字段与消息条目一致（`text` 即 `content`，不含 `media`）。
 
 ## 消息分页（`GET /api/platform/messages`）
 
@@ -60,7 +63,7 @@ Authorization: Bearer <实例 token 或登录 session>
 GET /api/platform/messages?key=r-1a2b3c4d5e6f&limit=50&before=1795...
 Authorization: Bearer <实例 token 或登录 session>
 
-{"items":[{"id","time","dir","userId","userName","avatar","content"}],"hasMore":true}
+{"items":[{"id","time","dir","userId","userName","avatar","content","media":[]}],"hasMore":true}
 ```
 
 - **时间升序**（旧 → 新），直接追加到列表尾部即可。
@@ -73,7 +76,8 @@ Authorization: Bearer <实例 token 或登录 session>
   （`user.name` / `user.nick`），都没有才用 `userId` 尾 4 位；出站消息是 bot 名
   （`session.bot.user.name`，拿不到用 `selfId`）。`avatar` 同理，可为 `null`。
 - 名称/头像按 `平台 + guildId` / `平台 + userId` 缓存：事件自带名字时直接写入缓存，
-  缺失时才调 `bot.getGuild` / `bot.getUser`（1.2s 超时），之后复用。
+  缺失时才调 `bot.getGuild` / `bot.getUser`（1.2s 超时），之后复用；群头像即使事件带了
+  群名也一定会查一次（`fetched` 标记跟结果一起缓存）。
 - `content` 由 `session.elements` 翻译成可读文本（文本原样、`at` → `@尾4位`、
   `img`/`image` → `[图片]`、`face`/`emoji` → `[表情]`、`quote` → `[引用]`、
   `file`/`audio`/`video` → `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
@@ -82,6 +86,36 @@ Authorization: Bearer <实例 token 或登录 session>
   其余附件类型 → `[附件]`；`at` → `@名字（或 id 尾 4 位）`、`face`/`emoji` → `[表情]`、
   `img`/`image` → `[图片]`、`quote` → `[引用]`，无法识别的 `<...>` 标签直接剥掉。
   归一后再压空白、截断。
+
+### 媒体（`media`）
+
+`content` 只是给人看的占位；能渲染的东西在 `media` 里（没有就是 `[]`，最多 8 条）：
+
+```json
+"media": [
+  {"kind":"image","url":"https://gchat.qpic.cn/gchatpic_new/0/0-1234/0?term=2","mime":"image/jpeg"},
+  {"kind":"image","url":"https://multimedia.nt.qq.com.cn/download?appid=1&fileid=x"},
+  {"kind":"file","url":"medialuna/a.zip","name":"a.zip","mime":"application/zip","size":2048},
+  {"kind":"file","ref":"FILE_ID_MISSING"}
+]
+```
+
+- `kind`：`image` | `video` | `audio` | `file`。由元素类型与 MIME 共同决定：
+  `img`/`image`/`mface`/`sticker` 与 `image/*` 是 `image`，`video/*` 是 `video`，
+  `audio`/`voice`/`record` 与 `audio/*`（QQ 的 `voice`）是 `audio`，其余是 `file`。
+- `url`：客户端可直接加载的地址。`http(s)://` 原样；QQ 附件常见的 `//host/path`
+  补成 `https://`；`base64://`、`data:` 原样；工作区相对路径（`medialuna/x.png`）原样，
+  客户端按既有约定走 `/api/workspace`。`url` 与 `ref` 至少给一个。
+- `ref`：换不到可访问地址时原样给的原始值（`file:///...`、裸文件 id）。先试
+  `bot.internal.getFile` → `bot.getFile` → `bot.internal.getFileUrl`（每个 1.2s 超时，
+  结果含失败缓存 60s）；`file://` 落在工作区内时直接换成工作区相对路径，不用问平台。
+- `name` / `mime` / `size`：有才给；`size` 是字节数。
+- 来源依次是 `session.elements`、`session.event.message`（`elements`、QQ 原始
+  `attachments` 数组的 `content_type`/`url`/`filename`/`size`、`content` 标记串）、
+  最后是 `session.content` 标记串；同一个 URL/`ref` 只留一条。
+- 单条消息换地址总预算 3s：超出的引用直接给 `ref`，不拖慢入站事件。
+- 出站消息的 `media` 来自 `before-send` 的快照（`send` 的 session 没有 elements）。
+- `last` 摘要只有 `text`，不含 `media`。
 
 ### 出站（`dir: "out"`）
 
@@ -118,7 +152,7 @@ curl -N -H "Authorization: Bearer <实例 token 或登录 session>" \
 - 帧格式：`event: platform`，`data` 是单条 JSON：
 
 ```json
-{"key":"r-1a2b3c4d5e6f","message":{"id":"...","time":1795...,"dir":"in","userId":"...","content":"..."}}
+{"key":"r-1a2b3c4d5e6f","message":{"id":"...","time":1795...,"dir":"in","userId":"...","content":"看图 [图片]","media":[{"kind":"image","url":"https://gchat.qpic.cn/..."}]}}
 ```
 
 - 客户端按 `message.id` 去重（回放 + 重连会重复拿到同一批）。

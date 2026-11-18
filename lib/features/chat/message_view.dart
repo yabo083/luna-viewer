@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -247,7 +246,7 @@ class _HumanAvatar extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final url = imageUrl;
-    final initial = _initialOf(name);
+    final initial = _initialOfName(name);
     final fallback = Container(
       width: size,
       height: size,
@@ -277,12 +276,73 @@ class _HumanAvatar extends StatelessWidget {
       ),
     );
   }
+}
 
-  /// 名字首字：去掉首尾空白，按 rune 取，避免把一个代理对切成两半。
-  static String _initialOf(String? name) {
-    final trimmed = name?.trim() ?? '';
-    if (trimmed.isEmpty) return '';
-    return String.fromCharCode(trimmed.runes.first).toUpperCase();
+/// 名字首字：去掉首尾空白，按 rune 取，避免把一个代理对切成两半。
+String _initialOfName(String? name) {
+  final trimmed = name?.trim() ?? '';
+  if (trimmed.isEmpty) return '';
+  return String.fromCharCode(trimmed.runes.first).toUpperCase();
+}
+
+/// 会话头像：只代表**对方/群**，会话列表的每一行都用它。
+/// 回退链：`conversation.avatar` → 会话名首字 → 群组/人形图标。
+/// **绝不回退 bot 头像**：bot 是助手自己，拿它代表对方/群会让人认错会话。
+class ConversationAvatar extends StatelessWidget {
+  const ConversationAvatar({
+    super.key,
+    required this.title,
+    this.imageUrl,
+    this.isGroup = false,
+    this.size = 36,
+  });
+
+  /// 会话展示名：首字占位用它。
+  final String title;
+
+  /// 插件给的会话头像（群头像 / 对方头像）；null 或空串走占位。
+  final String? imageUrl;
+
+  /// 群聊用群组色与群组图标，私聊用中性色与人形图标。
+  final bool isGroup;
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final background = isGroup ? scheme.tertiaryContainer : scheme.secondaryContainer;
+    final onBackground = isGroup ? scheme.onTertiaryContainer : scheme.onSecondaryContainer;
+    final initial = _initialOfName(title);
+    final fallback = Container(
+      width: size,
+      height: size,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(shape: BoxShape.circle, color: background),
+      child: initial.isEmpty
+          ? Icon(
+              isGroup ? Icons.groups_outlined : Icons.person_outline,
+              size: size * 0.55,
+              color: onBackground,
+            )
+          : Text(
+              initial,
+              style: TextStyle(
+                fontSize: size * 0.42,
+                height: 1,
+                fontWeight: FontWeight.w600,
+                color: onBackground,
+              ),
+            ),
+    );
+    final url = imageUrl?.trim() ?? '';
+    if (url.isEmpty) return fallback;
+    return SizedBox.square(
+      dimension: size,
+      child: ClipOval(
+        child: Image.network(url, fit: BoxFit.cover, errorBuilder: (_, _, _) => fallback),
+      ),
+    );
   }
 }
 
@@ -366,6 +426,12 @@ bool _needsAuth(Uri base, Uri uri) =>
     uri.host == base.host &&
     uri.port == base.port &&
     (uri.path.startsWith('/files/') || uri.path == '/api/workspace');
+
+/// 媒体图片的取头：先把源归一成真实地址（`base64://` → `data:`），再决定要不要带 Bearer。
+Map<String, String> _authHeadersFor(Uri base, String raw, Map<String, String> headers) {
+  final uri = _resolveAsset(base, _ChatImage._normalizeSource(raw));
+  return _needsAuth(base, uri) ? headers : const <String, String>{};
+}
 
 /// 正文占位文案：插件在「没有文字、只有媒体」时写的就是这些。
 final RegExp _mediaPlaceholder = RegExp(
@@ -602,6 +668,417 @@ class _ChatImageState extends State<_ChatImage> {
           borderRadius: BorderRadius.circular(12),
           // 显式尺寸：WidgetSpan 的高度约束不可靠，这里不再依赖父级 maxHeight。
           child: SizedBox(width: width, height: height, child: preview),
+        ),
+      ),
+    );
+  }
+}
+
+/// 媒体图片的取源结果：`base64://` / `data:` 解成内存字节，其余按 URL 解析。
+/// base64 只在源列表变化时解一次（每次 build 重建 Uint8List 会让 ImageCache 全部落空）。
+class _ImageSource {
+  const _ImageSource({required this.source, required this.uri, required this.headers, this.bytes});
+
+  factory _ImageSource.of(String raw, {required Uri base, required Map<String, String> headers}) {
+    final source = _ChatImage._normalizeSource(raw);
+    return _ImageSource(
+      source: source,
+      uri: _resolveAsset(base, source),
+      // 外部图床不该收到实例 token：只有解回本实例 `/files` 与工作区时才带头。
+      headers: _authHeadersFor(base, source, headers),
+      bytes: _ChatImage._inlineBytes(source),
+    );
+  }
+
+  final String source;
+  final Uri uri;
+  final Map<String, String> headers;
+  final Uint8List? bytes;
+
+  /// 声明了 data URI 却解不出来：直接给占位，别让 `Image.network` 抛 unsupported scheme。
+  bool get broken => source.startsWith('data:') && bytes == null;
+}
+
+/// 一条消息的媒体区：图片先成组（单张缩略 / 多张网格），视频/音频/文件按原顺序排成胶囊。
+/// 颜色跟随气泡前景，右侧主色底与左侧中性底都能读。
+class _MediaBlock extends StatelessWidget {
+  const _MediaBlock({
+    super.key,
+    required this.media,
+    required this.base,
+    required this.headers,
+    required this.foreground,
+    required this.muted,
+  });
+
+  final List<PlatformMedia> media;
+  final Uri base;
+  final Map<String, String> headers;
+  final Color foreground;
+  final Color muted;
+
+  static const double _gap = 6;
+
+  @override
+  Widget build(BuildContext context) {
+    // 有 url 的图片才进图片区；只有 ref 的图片没有可画的像素，落到下面当占位胶囊。
+    final imageUrls = [
+      for (final item in media)
+        if (item.isImage && item.url != null) item.url!,
+    ];
+    final rest = [
+      for (final item in media)
+        if (!(item.isImage && item.url != null)) item,
+    ];
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (imageUrls.length == 1)
+          _ChatImage(
+            url: imageUrls.first,
+            resolve: (url) => _resolveAsset(base, url),
+            headers: _authHeadersFor(base, imageUrls.first, headers),
+          )
+        else if (imageUrls.length > 1)
+          _ImageGrid(urls: imageUrls, base: base, headers: headers),
+        for (var i = 0; i < rest.length; i++) ...[
+          if (i > 0) const SizedBox(height: _gap),
+          _MediaPill(item: rest[i], base: base, foreground: foreground, muted: muted),
+        ],
+      ],
+    );
+  }
+}
+
+/// 多张图片：**2 列网格**，格子间距 6，格子按可用宽度均分、最大 168（平板上一格不至于半屏）。
+/// 每格上边圆角 12；非末行下边收 4，上下两格拼起来像一整块，末行下边再回到 12。
+/// 点任意一格进全屏，PageView 从这一张开始左右滑动，多图点击因此对得上号。
+class _ImageGrid extends StatefulWidget {
+  const _ImageGrid({required this.urls, required this.base, required this.headers});
+
+  final List<String> urls;
+  final Uri base;
+  final Map<String, String> headers;
+
+  @override
+  State<_ImageGrid> createState() => _ImageGridState();
+}
+
+class _ImageGridState extends State<_ImageGrid> {
+  static const double _gap = 6;
+  static const double _maxCell = 168;
+  static const int _columns = 2;
+  static const double _fallbackWidth = _maxCell * _columns + _gap;
+
+  late List<_ImageSource> _sources = _decode();
+
+  @override
+  void didUpdateWidget(covariant _ImageGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_sameUrls(oldWidget.urls, widget.urls)) _sources = _decode();
+  }
+
+  List<_ImageSource> _decode() => [
+    for (final url in widget.urls)
+      _ImageSource.of(url, base: widget.base, headers: widget.headers),
+  ];
+
+  static bool _sameUrls(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final available = constraints.maxWidth.isFinite && constraints.maxWidth > 0
+              ? constraints.maxWidth
+              : _fallbackWidth;
+          final side = math.min((available - _gap) / _columns, _maxCell);
+          final rows = <Widget>[];
+          for (var start = 0; start < _sources.length; start += _columns) {
+            final end = math.min(start + _columns, _sources.length);
+            rows.add(
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (var i = start; i < end; i++) ...[
+                    if (i > start) const SizedBox(width: _gap),
+                    _cell(context, i, side, lastRow: end == _sources.length),
+                  ],
+                ],
+              ),
+            );
+          }
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (var i = 0; i < rows.length; i++) ...[
+                if (i > 0) const SizedBox(height: _gap),
+                rows[i],
+              ],
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _cell(BuildContext context, int index, double side, {required bool lastRow}) {
+    return GestureDetector(
+      onTap: () => showDialog<void>(
+        context: context,
+        builder: (_) => _ImageViewer(images: _sources, initialIndex: index),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.vertical(
+          top: const Radius.circular(12),
+          bottom: Radius.circular(lastRow ? 12 : 4),
+        ),
+        child: SizedBox.square(dimension: side, child: _preview(context, _sources[index], side)),
+      ),
+    );
+  }
+
+  /// 网格格子的预览：正方形裁切，按格子宽度解码，不为一格缩略图拉全尺寸位图。
+  Widget _preview(BuildContext context, _ImageSource image, double side) {
+    final scheme = Theme.of(context).colorScheme;
+    final cacheWidth = (side * MediaQuery.devicePixelRatioOf(context)).round();
+    Widget placeholder() => Container(
+      color: scheme.surfaceContainerHighest,
+      alignment: Alignment.center,
+      child: Icon(Icons.broken_image_outlined, size: 22, color: scheme.onSurfaceVariant),
+    );
+    if (image.broken) return placeholder();
+    if (image.bytes case final bytes?) {
+      return Image.memory(
+        bytes,
+        width: side,
+        height: side,
+        cacheWidth: cacheWidth,
+        fit: BoxFit.cover,
+        errorBuilder: (_, _, _) => placeholder(),
+      );
+    }
+    return Image.network(
+      image.uri.toString(),
+      width: side,
+      height: side,
+      cacheWidth: cacheWidth,
+      headers: image.headers,
+      fit: BoxFit.cover,
+      loadingBuilder: (context, child, progress) => progress == null
+          ? child
+          : Container(
+              color: scheme.surfaceContainerHighest,
+              alignment: Alignment.center,
+              child: const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+      errorBuilder: (_, _, _) => placeholder(),
+    );
+  }
+}
+
+/// 全屏查看：多图左右滑动、双指缩放；单张图也走这里（只有一个 page 的 pager），
+/// 因此缩略图与网格共用一个查看器，行为一致。
+class _ImageViewer extends StatefulWidget {
+  const _ImageViewer({required this.images, required this.initialIndex});
+
+  final List<_ImageSource> images;
+  final int initialIndex;
+
+  @override
+  State<_ImageViewer> createState() => _ImageViewerState();
+}
+
+class _ImageViewerState extends State<_ImageViewer> {
+  late final PageController _controller = PageController(initialPage: widget.initialIndex);
+  late int _index = widget.initialIndex;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final images = widget.images;
+    return Dialog.fullscreen(
+      backgroundColor: Colors.black,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: PageView.builder(
+              controller: _controller,
+              itemCount: images.length,
+              onPageChanged: (index) => setState(() => _index = index),
+              itemBuilder: (context, index) =>
+                  InteractiveViewer(child: Center(child: _page(images[index]))),
+            ),
+          ),
+          Positioned(
+            top: 8,
+            right: 8,
+            child: IconButton.filledTonal(
+              onPressed: () => Navigator.pop(context),
+              icon: const Icon(Icons.close),
+            ),
+          ),
+          if (images.length > 1)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 24,
+              child: Center(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                    child: Text(
+                      '${_index + 1} / ${images.length}',
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _page(_ImageSource image) {
+    Widget placeholder() => const Padding(
+      padding: EdgeInsets.all(24),
+      child: Text('图片不可用', style: TextStyle(color: Colors.white70)),
+    );
+    if (image.broken) return placeholder();
+    if (image.bytes case final bytes?) {
+      return Image.memory(bytes, fit: BoxFit.contain, errorBuilder: (_, _, _) => placeholder());
+    }
+    return Image.network(
+      image.uri.toString(),
+      fit: BoxFit.contain,
+      headers: image.headers,
+      errorBuilder: (_, _, _) => placeholder(),
+    );
+  }
+}
+
+/// 视频 / 音频 / 文件 / 只有 ref 的附件：一行胶囊（图标 + 名称）。
+/// 点：能交给系统的地址（外部 `http(s)`、实例静态附件 `/files/`）就地打开，
+/// 其余（工作区文件要 Bearer、data/base64 载荷、只有 ref）复制链接；长按总是复制。
+/// 只有 ref 时胶囊用描边而不是填充，视觉上区分「打不开，只能复制」。
+class _MediaPill extends StatelessWidget {
+  const _MediaPill({
+    required this.item,
+    required this.base,
+    required this.foreground,
+    required this.muted,
+  });
+
+  final PlatformMedia item;
+  final Uri base;
+  final Color foreground;
+  final Color muted;
+
+  static const double _radius = 18;
+
+  IconData get _icon => switch (item.kind) {
+    'video' => Icons.play_circle_outline,
+    'audio' => Icons.graphic_eq,
+    'image' => Icons.image_outlined,
+    _ => Icons.insert_drive_file_outlined,
+  };
+
+  /// 能直接交给系统浏览器/播放器的地址：外部 `http(s)` 与实例静态附件 `/files/`。
+  /// 工作区文件要带 Bearer，系统拿不到 token，只能复制。
+  Uri? get _openable {
+    final url = item.url;
+    if (url == null || url.startsWith('data:') || url.startsWith('base64:')) return null;
+    final uri = _resolveAsset(base, url);
+    if (uri.scheme != 'http' && uri.scheme != 'https') return null;
+    return uri.path == '/api/workspace' ? null : uri;
+  }
+
+  /// 复制内容：优先真实地址（相对路径先解成实例地址）；data/base64 载荷太长没有复制意义，
+  /// 退回引用或文件名。
+  String get _copyText {
+    final url = item.url;
+    if (url != null && !url.startsWith('data:') && !url.startsWith('base64:')) {
+      return _resolveAsset(base, url).toString();
+    }
+    return item.ref ?? item.label;
+  }
+
+  Future<void> _activate(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final uri = _openable;
+    if (uri != null) {
+      try {
+        if (await launchUrl(uri, mode: LaunchMode.externalApplication)) return;
+      } on Exception {
+        // 没有可用的外部处理程序：退回复制，别让点击变成没反馈。
+      }
+    }
+    await _copy(messenger);
+  }
+
+  Future<void> _copy(ScaffoldMessengerState messenger) async {
+    await Clipboard.setData(ClipboardData(text: _copyText));
+    messenger.showSnackBar(const SnackBar(content: Text('已复制链接')));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final refOnly = item.url == null;
+    return Material(
+      type: MaterialType.transparency,
+      child: InkWell(
+        onTap: () => _activate(context),
+        onLongPress: () => _copy(ScaffoldMessenger.of(context)),
+        borderRadius: BorderRadius.circular(_radius),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(10, 7, 10, 7),
+          decoration: BoxDecoration(
+            color: refOnly ? null : foreground.withValues(alpha: 0.14),
+            border: refOnly ? Border.all(color: foreground.withValues(alpha: 0.3)) : null,
+            borderRadius: BorderRadius.circular(_radius),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(_icon, size: 16, color: foreground),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  item.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelMedium?.copyWith(color: foreground),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Icon(refOnly ? Icons.content_copy : Icons.open_in_new, size: 13, color: muted),
+            ],
+          ),
         ),
       ),
     );

@@ -200,10 +200,18 @@ function mediaKind(type, mime) {
   return ''
 }
 
+// 序列化元素（`session.content`）里的属性是 HTML 转义的：`&amp;` 会让 QQ 附件的
+// `fileid` 断掉，也让同一条消息的元素/标记串两条来源去重失败。
+const HTML_ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&apos;': "'" }
+
+function unescapeAttr(value) {
+  return value.replace(/&(?:amp|lt|gt|quot|#39|apos);/g, (entity) => HTML_ENTITIES[entity] ?? entity)
+}
+
 // 能直接交给客户端的值：`https://`、`//host/path`（QQ 附件常见）、`base64://`、
 // `data:`。其余（`file://`、裸文件 id）交给 resolveReference 换地址。
 function normalizeMediaUrl(value) {
-  const raw = textOf(value).trim()
+  const raw = unescapeAttr(textOf(value).trim())
   if (!raw) return ''
   if (/^https?:\/\//i.test(raw)) return raw
   if (raw.startsWith('//')) return 'https:' + raw
@@ -503,6 +511,8 @@ export function apply(ctx) {
   // ── 媒体 ─────────────────────────────────────────────────────────────
   // 换地址的结果（含失败）短期缓存：同一条消息被重复上报、或同一文件被多次引用时不再打接口。
   const mediaRefCache = new Map()
+  // 单条消息换地址的总预算：拿不到就退回 `ref`，不让入站事件被慢接口拖住。
+  const MEDIA_RESOLVE_BUDGET = 3000
 
   // `file://` 落在工作区里时直接换成 `/api/workspace` 能取的相对路径，客户端本来就认这个形态。
   const workspaceRelativeOf = (value) => {
@@ -547,10 +557,11 @@ export function apply(ctx) {
     const bot = source?.bot
     const items = []
     const seen = new Set()
+    const deadline = Date.now() + MEDIA_RESOLVE_BUDGET
 
     const add = async (descriptor) => {
       if (!descriptor || items.length >= MEDIA_LIMIT) return
-      const raw = textOf(descriptor.source).trim()
+      const raw = unescapeAttr(textOf(descriptor.source).trim())
       const mime = textOf(descriptor.mime).trim()
       const name = cleanName(descriptor.name)
       const size = Number(descriptor.size) > 0 ? Number(descriptor.size) : undefined
@@ -563,11 +574,11 @@ export function apply(ctx) {
         else url = normalizeMediaUrl(raw)
         if (!url && isWorkspacePath(raw)) url = raw
         if (!url && mime && isBase64Payload(raw)) url = `data:${mime};base64,${raw}`
-        if (!url) {
+        if (!url && Date.now() < deadline) {
           url = await resolveReference(bot, raw)
-          // 换不到地址就原样留 ref：客户端据此显示占位/重试，不会误以为是 URL。
-          if (!url) ref = raw
         }
+        // 换不到地址就原样留 ref：客户端据此显示占位/重试，不会误以为是 URL。
+        if (!url) ref = raw
       }
       const identity = url || ref
       if (!identity || seen.has(identity)) return

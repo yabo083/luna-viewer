@@ -77,6 +77,9 @@ class ChatPage extends StatefulWidget {
 
   /// 非空 = 该会话同时出现在 `/api/sessions`：保留状态胶囊与会话级操作。
   final SessionSummary? session;
+
+  /// **bot 自己的头像**：`dir=out` 的气泡与信息栏用它。
+  /// 对方/群的头像不走这里——`dir=in` 用该条消息自带的 `avatar`，会话列表行用 `conversation.avatar`。
   final String? avatarUrl;
   final String? botName;
 
@@ -798,6 +801,7 @@ class _ChatPageState extends State<ChatPage> {
           base: widget.base,
           headers: widget.headers,
           noticeOpen: _noticeOpen,
+          media: message.media,
           avatarUrl: message.outbound ? widget.avatarUrl : message.avatar,
           senderName: message.outbound ? widget.botName : message.userName,
           time: message.time,

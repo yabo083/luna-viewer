@@ -124,7 +124,7 @@ class PlatformConversation {
   final String channelId;
   final String? guildId;
 
-  /// 会话头像（插件后续会带真实群名/昵称时一起给）；缺失时列表退回 bot 头像或占位。
+  /// 会话头像（群头像 / 对方头像）；缺失时列表退回会话名首字或形态图标，**不回退 bot 头像**。
   final String? avatar;
 
   /// 插件判定的会话形态（`group` / `private`），原样透传，只用于展示。
@@ -225,9 +225,7 @@ class PlatformMedia {
 
   /// 容错：`media` 缺失、为 null、不是数组、项不是对象时都当空列表。
   static List<PlatformMedia> listFrom(Object? raw) => [
-    if (raw is List)
-      for (final item in raw)
-        if (fromJson(item) case final media?) media,
+    if (raw is List) for (final item in raw) ?fromJson(item),
   ];
 
   /// 类型归一：插件声明优先，缺失或无法识别时从地址猜（`data:image/`、视频扩展名）。

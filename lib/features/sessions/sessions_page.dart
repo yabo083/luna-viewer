@@ -14,9 +14,9 @@ import '../../core/store/connection_store.dart';
 import '../../core/transport/api_client.dart';
 import '../../core/transport/state_socket.dart';
 import '../../core/update/update_checker.dart';
-import '../chat/assistant_avatar.dart';
 import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
+import '../chat/message_view.dart';
 
 /// 活跃窗口：最后一条消息在 72 小时内的会话留在主列表，更早的收进「归档」。
 /// 时间基准是设备当前时间，由列表每次重建时重新计算（收到新消息就自动回到主列表）。
@@ -881,8 +881,9 @@ class _SessionsPageState extends State<SessionsPage> {
     // 固定 key：实时帧引起的重排只移动元素，不会把手指下的 InkWell 重建掉。
     key: ValueKey(row.key),
     row: row,
-    // 插件给了会话头像就优先用它；否则退回 bot 头像（再没有就是占位图标）。
-    avatarUrl: row.conversation?.avatar ?? _bot?.avatar,
+    // 会话头像只代表对方/群：插件给 `conversation.avatar` 就用它，缺了由 `_SessionTile`
+    // 按会话形态退回首字/图标占位——**不回退 bot 头像**（那是助手自己，会把会话认错）。
+    avatarUrl: row.conversation?.avatar,
     onTap: () => _open(row),
     onLongPress: () => _actions(row),
   );
@@ -930,6 +931,10 @@ class _SessionRow {
   final SessionSummary? session;
 
   bool get running => session?.running ?? false;
+
+  /// 群聊还是私聊：插件判定（`conversation.kind`）。没有插件会话（只存在于 App 侧）时按私聊处理，
+  /// 头像退回首字而不是群组图标。
+  bool get isGroup => conversation?.kind == 'group';
 
   /// 没有最后一条消息时的副标题：已加载会话退回平台/引擎/模型，未加载就没有副标题。
   String? get fallbackSubtitle {
@@ -1056,6 +1061,8 @@ class _SessionTile extends StatelessWidget {
   static const _runningDot = Color(0xFF22C55E);
 
   final _SessionRow row;
+
+  /// 会话头像（`conversation.avatar`）：null 或加载失败时按 [row] 的形态退回首字/图标占位。
   final String? avatarUrl;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
@@ -1076,7 +1083,12 @@ class _SessionTile extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
             child: Row(
               children: [
-                AssistantAvatar(size: 36, imageUrl: avatarUrl),
+                ConversationAvatar(
+                  size: 36,
+                  imageUrl: avatarUrl,
+                  title: row.title,
+                  isGroup: row.isGroup,
+                ),
                 const SizedBox(width: 14),
                 Expanded(
                   child: Column(
