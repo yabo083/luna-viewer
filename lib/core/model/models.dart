@@ -116,6 +116,7 @@ class ChatMessage {
     required this.role,
     required this.blocks,
     this.form = '',
+    this.isFramework = false,
   });
 
   final String id;
@@ -125,10 +126,13 @@ class ChatMessage {
   /// 服务端标记的消息形态：`notice` 是引擎/插件注入的内部消息（wake、turn 装配），不是用户发言。
   final String form;
 
-  bool get isUser => role == 'user';
-  bool get isNotice => form == 'notice';
+  /// 框架消息：`form` 不是 `message`（如 `notice`），或来源是插件（`source.kind == 'plugin'`）。
+  /// 这类消息不属于对话双方，渲染成居中的弱化块。
+  final bool isFramework;
 
-  factory ChatMessage.fromJson(Map<String, Object?> json) {
+  bool get isUser => role == 'user';
+
+  factory ChatMessage.fromJson(Map<String, Object?> json, {String? fallbackId}) {
     final raw = json['content'];
     final blocks = <ChatBlock>[];
     if (raw is List) {
@@ -140,11 +144,16 @@ class ChatMessage {
     } else if (raw is String) {
       blocks.add(ChatBlock('text', {'text': raw}));
     }
+    final form = (json['form'] as String?) ?? '';
+    final source = json['source'];
+    final sourceKind = source is Map ? source['kind'] : null;
+    final rawId = json['id'];
     return ChatMessage(
-      id: (json['id'] as String?) ?? '',
+      id: rawId is String && rawId.isNotEmpty ? rawId : (fallbackId ?? ''),
       role: (json['role'] as String?) ?? 'assistant',
       blocks: blocks,
-      form: (json['form'] as String?) ?? '',
+      form: form,
+      isFramework: (form.isNotEmpty && form != 'message') || sourceKind == 'plugin',
     );
   }
 
@@ -421,7 +430,8 @@ class ForkResult {
 
 /// `/api/sessions/:id/live` 的流事件。`part` 是 ChatPart 的原始 JSON。
 class LiveEvent {
-  const LiveEvent.snapshot(this.parts)
+  /// `active` 表示快照来自进行中的 attempt；为 false 时服务端没有在跑的生成。
+  const LiveEvent.snapshot(this.parts, {this.active = false})
     : kind = LiveEventKind.snapshot,
       delta = null,
       toolName = null,
@@ -431,32 +441,39 @@ class LiveEvent {
     : kind = LiveEventKind.delta,
       parts = const [],
       toolName = null,
-      reason = null;
+      reason = null,
+      active = true;
 
   const LiveEvent.tool(this.toolName)
     : kind = LiveEventKind.tool,
       parts = const [],
       delta = null,
-      reason = null;
+      reason = null,
+      active = true;
 
   const LiveEvent.settled(this.reason)
     : kind = LiveEventKind.settled,
       parts = const [],
       delta = null,
-      toolName = null;
+      toolName = null,
+      active = false;
 
   const LiveEvent.lagged()
     : kind = LiveEventKind.lagged,
       parts = const [],
       delta = null,
       toolName = null,
-      reason = null;
+      reason = null,
+      active = false;
 
   final LiveEventKind kind;
   final List<Map<String, Object?>> parts;
   final String? delta;
   final String? toolName;
   final String? reason;
+
+  /// 该事件是否代表「有生成在进行中」：snapshot 看有没有 attempt，delta/tool 恒为真。
+  final bool active;
 
   static LiveEvent? fromSse(String event, Map<String, Object?>? data) {
     switch (event) {
@@ -471,7 +488,7 @@ class LiveEvent {
             }
           }
         }
-        return LiveEvent.snapshot(parts);
+        return LiveEvent.snapshot(parts, active: attempt is Map);
       case 'agent/assistant-stream':
         final part = data?['part'];
         if (part is! Map) return null;
@@ -499,3 +516,22 @@ class LiveEvent {
 }
 
 enum LiveEventKind { snapshot, delta, tool, settled, lagged }
+
+/// `/api/sessions/:id/events` 的一个增量帧：落库的新消息，或增量窗口失效。
+class SessionEvent {
+  const SessionEvent.message(this.message, this.id) : truncated = false;
+
+  const SessionEvent.truncated()
+    : message = null,
+      id = null,
+      truncated = true;
+
+  /// 新落库的消息；`truncated` 时为空。
+  final ChatMessage? message;
+
+  /// SSE 帧的 `id`（形如 `<sessionId>:<n>`），重连时作为 `Last-Event-ID` 续传。
+  final String? id;
+
+  /// 服务端的增量窗口已失效：本地增量不可信，调用方应重取 `/messages`。
+  final bool truncated;
+}

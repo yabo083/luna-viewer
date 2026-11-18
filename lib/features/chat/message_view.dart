@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -32,6 +33,11 @@ class MessageView extends StatelessWidget {
     final reasoning = message.reasoningText;
     if (body.isEmpty && reasoning.isEmpty && message.toolCalls.isEmpty) {
       return const SizedBox.shrink();
+    }
+
+    // 框架消息不参与左右布局：先短路，省掉整棵 markdown 构建。
+    if (message.isFramework) {
+      return _FrameworkNotice(text: body);
     }
 
     final content = Column(
@@ -69,10 +75,6 @@ class MessageView extends StatelessWidget {
           ),
       ],
     );
-
-    if (message.isNotice) {
-      return _ExpandableNotice(text: body);
-    }
 
     if (message.isUser) {
       return Align(
@@ -162,7 +164,7 @@ class _Markdown extends StatelessWidget {
   }
 }
 
-class _ChatImage extends StatelessWidget {
+class _ChatImage extends StatefulWidget {
   const _ChatImage({required this.url, required this.resolve, required this.headers});
 
   final String url;
@@ -190,17 +192,118 @@ class _ChatImage extends StatelessWidget {
   }
 
   @override
+  State<_ChatImage> createState() => _ChatImageState();
+}
+
+class _ChatImageState extends State<_ChatImage> {
+  /// 缩略图上限：长图不再占满一屏。点开后的全屏查看不受这两个值限制。
+  static const _maxWidth = 260.0;
+  static const _maxHeight = 320.0;
+
+  late String _source;
+  Uint8List? _bytes;
+
+  /// 解码得到的展示尺寸（已按比例收进上限）；null 表示还用着占位尺寸。
+  Size? _size;
+  ImageProvider? _measured;
+  ImageStream? _stream;
+  ImageStreamListener? _listener;
+  bool _inBuild = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ChatImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.url != widget.url) {
+      _detach();
+      _measured = null;
+      _size = null;
+      _prepare();
+    }
+  }
+
+  @override
+  void dispose() {
+    _detach();
+    super.dispose();
+  }
+
+  /// base64 只在 url 变化时解一次：每次 build 重建 Uint8List 会让 ImageCache 全部落空。
+  void _prepare() {
+    _source = _ChatImage._normalizeSource(widget.url);
+    _bytes = _ChatImage._inlineBytes(_source);
+  }
+
+  void _detach() {
+    final listener = _listener;
+    final stream = _stream;
+    if (listener != null && stream != null) stream.removeListener(listener);
+    _listener = null;
+    _stream = null;
+  }
+
+  int _cacheWidth(BuildContext context) =>
+      (_maxWidth * MediaQuery.devicePixelRatioOf(context)).round();
+
+  /// markdown 的 `WidgetSpan` 给子节点的高度是无界的，`BoxConstraints.maxHeight` 会被忽略；
+  /// 所以自己解码一次拿真实宽高，再给出确定的 `SizedBox` 尺寸。
+  void _measure(BuildContext context, Uri uri) {
+    final width = _cacheWidth(context);
+    final provider = _bytes != null
+        ? ResizeImage(MemoryImage(_bytes!), width: width)
+        : ResizeImage(NetworkImage(uri.toString(), headers: widget.headers), width: width);
+    if (provider == _measured) return;
+    _detach();
+    _measured = provider;
+    final stream = provider.resolve(createLocalImageConfiguration(context));
+    final listener = ImageStreamListener(
+      (info, _) {
+        final image = info.image;
+        final natural = Size(image.width.toDouble(), image.height.toDouble());
+        info.dispose();
+        if (!mounted) return;
+        final fitted = _fit(natural);
+        if (fitted == _size) return;
+        if (_inBuild) {
+          // 解码命中缓存时回调是同步的：本帧直接按真实比例排，别在 build 期间 setState。
+          _size = fitted;
+        } else {
+          setState(() => _size = fitted);
+        }
+      },
+      onError: (error, stack) {},
+    );
+    _stream = stream;
+    _listener = listener;
+    stream.addListener(listener);
+  }
+
+  /// 按比例收进 260 × 320：小图不放大，长图收到 320 高，`BoxFit.cover` 不再有裁切。
+  static Size _fit(Size natural) {
+    if (natural.width <= 0 || natural.height <= 0) {
+      return const Size(_maxWidth, _maxHeight);
+    }
+    final scale = math.min(_maxWidth / natural.width, _maxHeight / natural.height);
+    return scale < 1 ? natural * scale : natural;
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final source = _normalizeSource(url);
-    final uri = resolve(source);
-    final bytes = _inlineBytes(source);
+    final source = _source;
+    final uri = widget.resolve(source);
+    final bytes = _bytes;
     // 声明了 data URI 却解不出来：直接给占位，别让 Image.network 抛 unsupported scheme。
     final broken = source.startsWith('data:') && bytes == null;
 
-    Widget placeholder() => Container(
-      width: 200,
-      height: 120,
+    Widget placeholder({double width = 200, double height = 120}) => Container(
+      width: width,
+      height: height,
       color: theme.colorScheme.surfaceContainerHighest,
       alignment: Alignment.center,
       child: Column(
@@ -213,27 +316,45 @@ class _ChatImage extends StatelessWidget {
       ),
     );
 
+    var size = _size ?? const Size(_maxWidth, _maxHeight);
+    if (!broken) {
+      _inBuild = true;
+      try {
+        _measure(context, uri);
+      } finally {
+        _inBuild = false;
+      }
+      size = _size ?? size;
+    }
+    final cacheWidth = _cacheWidth(context);
+    final double width = broken ? 200 : size.width;
+    final double height = broken ? 120 : size.height;
+
     final Widget preview;
     if (broken) {
       preview = placeholder();
     } else if (bytes != null) {
       preview = Image.memory(
         bytes,
-        cacheWidth: 560,
+        width: width,
+        height: height,
+        cacheWidth: cacheWidth,
         fit: BoxFit.cover,
-        errorBuilder: (context, error, stack) => placeholder(),
+        errorBuilder: (context, error, stack) => placeholder(width: width, height: height),
       );
     } else {
       preview = Image.network(
         uri.toString(),
-        headers: headers,
-        cacheWidth: 560,
+        headers: widget.headers,
+        width: width,
+        height: height,
+        cacheWidth: cacheWidth,
         fit: BoxFit.cover,
         loadingBuilder: (context, child, progress) => progress == null
             ? child
             : Container(
-                width: 200,
-                height: 140,
+                width: width,
+                height: height,
                 color: theme.colorScheme.surfaceContainerHighest,
                 child: const Center(
                   child: SizedBox(
@@ -243,7 +364,7 @@ class _ChatImage extends StatelessWidget {
                   ),
                 ),
               ),
-        errorBuilder: (context, error, stack) => placeholder(),
+        errorBuilder: (context, error, stack) => placeholder(width: width, height: height),
       );
     }
 
@@ -265,7 +386,7 @@ class _ChatImage extends StatelessWidget {
                               : Image.network(
                                   uri.toString(),
                                   fit: BoxFit.contain,
-                                  headers: headers,
+                                  headers: widget.headers,
                                 ),
                         ),
                       ),
@@ -283,59 +404,101 @@ class _ChatImage extends StatelessWidget {
               ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 280, maxHeight: 360),
-            child: preview,
-          ),
+          // 显式尺寸：WidgetSpan 的高度约束不可靠，这里不再依赖父级 maxHeight。
+          child: SizedBox(width: width, height: height, child: preview),
         ),
       ),
     );
   }
 }
 
-/// 引擎注入的内部消息（如 `[memory update]`）：默认收成两行，点开看全文。
-class _ExpandableNotice extends StatefulWidget {
-  const _ExpandableNotice({required this.text});
+/// 框架/系统消息（`form != message` 或 `source.kind == plugin`）：不属于对话左右任一方，
+/// 居中收成一行胶囊标题，点开看全文。旧的 `form: notice` 也走这一条路径。
+class _FrameworkNotice extends StatefulWidget {
+  const _FrameworkNotice({required this.text});
 
   final String text;
 
   @override
-  State<_ExpandableNotice> createState() => _ExpandableNoticeState();
+  State<_FrameworkNotice> createState() => _FrameworkNoticeState();
 }
 
-class _ExpandableNoticeState extends State<_ExpandableNotice> {
+class _FrameworkNoticeState extends State<_FrameworkNotice> {
   bool _open = false;
+
+  /// 标题取首个非空行：wake / turn 装配这类长文本不该整段顶在列表里。
+  String get _title {
+    for (final line in widget.text.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.isNotEmpty) return trimmed;
+    }
+    return '系统消息';
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     final style = theme.textTheme.labelSmall?.copyWith(
-      color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.75),
-      height: 1.4,
+      color: scheme.onSurfaceVariant,
+      height: 1.35,
     );
-    return InkWell(
-      onTap: () => setState(() => _open = !_open),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 24),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.start,
+    return Align(
+      alignment: Alignment.center,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.86),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Flexible(
-              child: Text(
-                widget.text,
-                textAlign: TextAlign.center,
-                maxLines: _open ? null : 2,
-                overflow: _open ? TextOverflow.clip : TextOverflow.ellipsis,
-                style: style,
+            InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: () => setState(() => _open = !_open),
+              child: Container(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                padding: const EdgeInsets.fromLTRB(10, 5, 8, 5),
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.subdirectory_arrow_right,
+                      size: 14,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 4),
+                    Flexible(
+                      child: Text(
+                        _title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: style,
+                      ),
+                    ),
+                    const SizedBox(width: 2),
+                    Icon(
+                      _open ? Icons.expand_less : Icons.expand_more,
+                      size: 14,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
               ),
             ),
-            const SizedBox(width: 4),
-            Icon(
-              _open ? Icons.expand_less : Icons.expand_more,
-              size: 14,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
+            if (_open)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                child: SelectableText(
+                  widget.text,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                    height: 1.5,
+                  ),
+                ),
+              ),
           ],
         ),
       ),

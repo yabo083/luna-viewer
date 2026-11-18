@@ -105,4 +105,39 @@ class SessionsRepository {
       if (event != null) yield event;
     }
   }
+
+  /// 会话日志流：`message` 是新落库的消息（含别人发的），`cut`/mark 是日志结构变化，忽略；
+  /// `truncated` 表示增量窗口失效，调用方需重取全量。
+  /// [since] 是上次最后收到的 `id`，重连时作为 `Last-Event-ID` 续传。
+  Stream<SessionEvent> events(String id, {String? since}) async* {
+    await for (final sse in api.sse(
+      '/api/sessions/${Uri.encodeComponent(id)}/events',
+      lastEventId: since,
+    )) {
+      final event = _sessionEvent(id, sse);
+      if (event != null) yield event;
+    }
+  }
+
+  static SessionEvent? _sessionEvent(String sessionId, SseEvent sse) {
+    switch (sse.event) {
+      case 'message':
+        final entry = sse.data?['data'];
+        if (entry is! Map) return null;
+        final n = sse.data?['n'];
+        // 帧 id 由服务端给；没有就用 sessionId:n 复现同一种形式。
+        final lastId = sse.id ?? (n is num ? '$sessionId:${n.toInt()}' : null);
+        final message = ChatMessage.fromJson(
+          entry.cast<String, Object?>(),
+          fallbackId: lastId,
+        );
+        if (message.id.isEmpty) return null;
+        return SessionEvent.message(message, lastId);
+      case 'truncated':
+        return const SessionEvent.truncated();
+      default:
+        // `cut` / mark 等：日志被裁剪或打点，不是消息。
+        return null;
+    }
+  }
 }

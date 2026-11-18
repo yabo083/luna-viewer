@@ -9,6 +9,10 @@ import '../../core/model/models.dart';
 import 'chat_chrome.dart';
 import 'message_view.dart';
 
+/// 实时流的唯一状态来源：UI 只读它，不再散落一堆 bool。
+/// idle → 空闲/生成已结束；running → 有生成在跑；failed → SSE 断了，退回轮询。
+enum LiveState { idle, running, failed }
+
 /// 会话详情：只读历史 + 实时流 + 会话级操作（中止 / 压缩 / 分叉 / 重新载入）。
 /// v0.1.0 不在 App 里发消息——平台会话的输入仍由聊天软件承担。
 class ChatPage extends StatefulWidget {
@@ -55,11 +59,20 @@ class _ChatPageState extends State<ChatPage> {
   static const _streamFlushInterval = Duration(milliseconds: 90);
   Timer? _flushTimer;
 
-  StreamSubscription<LiveEvent>? _live;
+  StreamSubscription<LiveEvent>? _liveSub;
+  StreamSubscription<SessionEvent>? _eventsSub;
   Timer? _poll;
+  Timer? _snapshotTimer;
+  Timer? _eventsRetry;
+  bool _eventsStarted = false;
+  int _eventsBackoff = 1;
+  String? _lastEventId;
   bool _loading = true;
-  bool _liveOk = true;
-  bool _running = false;
+
+  /// 首个 snapshot 是否已到：权威帧之前，`session.running` 只是乐观值。
+  bool _snapshotSeen = false;
+
+  LiveState _live = LiveState.idle;
   String? _error;
 
   bool _awayFromBottom = false;
@@ -78,7 +91,8 @@ class _ChatPageState extends State<ChatPage> {
     super.initState();
     _t0 = DateTime.now();
     _model = widget.session.model;
-    _running = widget.session.running;
+    // 列表页的 running 只做乐观值：首个 snapshot 到达后一律以服务端为准。
+    _live = widget.session.running ? LiveState.running : LiveState.idle;
     _scroll.addListener(_onScroll);
     final initial = widget.initial;
     if (initial != null) {
@@ -103,8 +117,11 @@ class _ChatPageState extends State<ChatPage> {
     _flushTimer?.cancel();
     _streamingText.dispose();
     _unseen.dispose();
-    _live?.cancel();
+    _liveSub?.cancel();
+    _eventsSub?.cancel();
     _poll?.cancel();
+    _snapshotTimer?.cancel();
+    _eventsRetry?.cancel();
     _scroll.dispose();
     super.dispose();
   }
@@ -121,6 +138,9 @@ class _ChatPageState extends State<ChatPage> {
         _all = transcript.messages;
         if (!keepWindow) {
           _windowStart = _all.length > _initialWindow ? _all.length - _initialWindow : 0;
+        } else {
+          // 重取后历史可能变短（cut / truncated），窗口光标不能越过末尾。
+          _windowStart = math.min(_windowStart, math.max(0, _all.length - 1));
         }
         _loading = false;
         _error = null;
@@ -144,12 +164,23 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _startLive() {
-    _live = widget.repo.live(widget.session.id).listen(
+    // 8s 内既没有 snapshot 也没有任何事件：乐观的 running 收回去，空闲会话绝不播动画。
+    _snapshotTimer?.cancel();
+    _snapshotTimer = Timer(const Duration(seconds: 8), () {
+      if (!mounted || _snapshotSeen) return;
+      _setLive(LiveState.idle);
+      // 实时流指望不上时，日志流照样能补上别人发的新消息。
+      _ensureEvents();
+    });
+    _liveSub = widget.repo.live(widget.session.id).listen(
       (event) {
         if (!mounted) return;
         _liveMs ??= _since();
         switch (event.kind) {
           case LiveEventKind.snapshot:
+            // 权威帧：带 attempt 才在跑；没有 attempt 就立刻回到 idle 并清掉残留文本。
+            _snapshotSeen = true;
+            _snapshotTimer?.cancel();
             _flushTimer?.cancel();
             _flushTimer = null;
             _streaming.clear();
@@ -159,10 +190,12 @@ class _ChatPageState extends State<ChatPage> {
               }
             }
             _flushStreaming();
-            if (!_running) setState(() => _running = true);
+            _setLive(event.active ? LiveState.running : LiveState.idle);
+            _ensureEvents();
             _followIfAtBottom();
           case LiveEventKind.delta:
-            if (!_running) setState(() => _running = true);
+            _snapshotTimer?.cancel();
+            _setLive(LiveState.running);
             _streaming.write(event.delta ?? '');
             if (_awayFromBottom) _unseen.value += 1;
             // 首个 delta 直接出字（替换打字指示器），之后才按 90ms 合并。
@@ -173,16 +206,18 @@ class _ChatPageState extends State<ChatPage> {
             }
             _followIfAtBottom();
           case LiveEventKind.tool:
-            if (!_running) setState(() => _running = true);
+            _snapshotTimer?.cancel();
+            _setLive(LiveState.running);
           case LiveEventKind.settled:
             // 收尾时立刻 flush，避免最后一段 delta 卡在定时器里被丢掉。
+            _snapshotTimer?.cancel();
             _flushTimer?.cancel();
             _flushTimer = null;
             _flushStreaming();
             _streaming.clear();
             _streamingText.value = '';
             if (_awayFromBottom) _unseen.value += 1;
-            if (_running) setState(() => _running = false);
+            _setLive(LiveState.idle);
             _load();
           case LiveEventKind.lagged:
             _flushTimer?.cancel();
@@ -193,11 +228,84 @@ class _ChatPageState extends State<ChatPage> {
       },
       onError: (Object error) {
         if (!mounted) return;
-        setState(() => _liveOk = false);
-        if (_running) _startPolling();
+        _snapshotTimer?.cancel();
+        // SSE 断了不等于在跑：切到 failed，由「轮询中」胶囊 + 定时重载兜底。
+        _setLive(LiveState.failed);
+        _ensureEvents();
+        _startPolling();
+      },
+      onDone: () {
+        if (!mounted || _live == LiveState.failed) return;
+        _snapshotTimer?.cancel();
+        _setLive(LiveState.failed);
+        _ensureEvents();
+        _startPolling();
       },
       cancelOnError: true,
     );
+  }
+
+  /// 唯一的写入口：相同状态不触发重建。
+  void _setLive(LiveState next) {
+    if (_live == next) return;
+    setState(() => _live = next);
+  }
+
+  /// 日志流（别人/自己发的新消息）在拿到首个 snapshot 后才打开：
+  /// 它和 `/live` 分工不同——live 是流式增量，events 是落库结果。
+  void _ensureEvents() {
+    if (_eventsStarted || !mounted) return;
+    _eventsStarted = true;
+    _openEvents();
+  }
+
+  void _openEvents() {
+    if (!mounted) return;
+    _eventsSub?.cancel();
+    _eventsSub = widget.repo.events(widget.session.id, since: _lastEventId).listen(
+      (event) {
+        if (!mounted) return;
+        _eventsBackoff = 1;
+        if (event.truncated) {
+          // 增量窗口失效：本地增量不可信，重取全量；旧消息先留着，别闪空。
+          _lastEventId = null;
+          _load();
+          return;
+        }
+        _lastEventId = event.id ?? _lastEventId;
+        final message = event.message;
+        if (message != null) _appendMessage(message);
+      },
+      onError: (Object error) => _retryEvents(),
+      onDone: _retryEvents,
+      cancelOnError: true,
+    );
+  }
+
+  /// 断线退避 1→2→4→8→16→30s，收到任意帧后回到 1s；已加载的消息一律不清空。
+  void _retryEvents() {
+    if (!mounted) return;
+    _eventsRetry?.cancel();
+    final seconds = _eventsBackoff;
+    _eventsBackoff = seconds >= 15 ? 30 : seconds * 2;
+    _eventsRetry = Timer(Duration(seconds: seconds), _openEvents);
+  }
+
+  /// 日志顺序追加；同 id 跳过，避免和 settled 后的全量重取重复。
+  void _appendMessage(ChatMessage message) {
+    if (_all.any((m) => m.id == message.id)) return;
+    setState(() {
+      _all = [..._all, message];
+      // 窗口大小保持不变：新增的一条是最新消息，仍在可视窗口里。
+      if (_windowStart > 0) {
+        _windowStart = math.min(_windowStart + 1, math.max(0, _all.length - 1));
+      }
+    });
+    if (_nearBottom) {
+      _scrollToLatest();
+    } else {
+      _unseen.value += 1;
+    }
   }
 
   void _scheduleStreamFlush() {
@@ -265,7 +373,7 @@ class _ChatPageState extends State<ChatPage> {
       _flushTimer = null;
       _streaming.clear();
       _streamingText.value = '';
-      setState(() => _running = false);
+      _setLive(LiveState.idle);
     } on ApiFailure catch (e) {
       _toast('取消失败 ${e.code}：${e.message}');
     }
@@ -308,6 +416,9 @@ class _ChatPageState extends State<ChatPage> {
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
       builder: (_) => _ModelPickerSheet(
         repo: widget.repo,
         sessionId: widget.session.id,
@@ -332,7 +443,9 @@ class _ChatPageState extends State<ChatPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final visible = _all.length - _windowStart;
-    final streaming = _running ? 1 : 0;
+    final running = _live == LiveState.running;
+    // 三点/流式气泡只在 running 时占位：idle 会话的列表里绝不出现动画行。
+    final streaming = running ? 1 : 0;
     return Scaffold(
       appBar: AppBar(
         title: ChatTitle(
@@ -341,7 +454,7 @@ class _ChatPageState extends State<ChatPage> {
         ),
         actions: [
           IconButton(
-            onPressed: _running ? _cancel : null,
+            onPressed: running ? _cancel : null,
             icon: const Icon(Icons.stop_circle_outlined),
             tooltip: '中止当前生成',
           ),
@@ -379,8 +492,8 @@ class _ChatPageState extends State<ChatPage> {
         children: [
           ChatInfoBar(
             session: _summary,
-            running: _running,
-            liveOk: _liveOk,
+            running: running,
+            liveOk: _live != LiveState.failed,
             botName: widget.botName,
             avatarUrl: widget.avatarUrl,
             debugMetrics: _debugMetrics(),
@@ -401,7 +514,7 @@ class _ChatPageState extends State<ChatPage> {
                       ],
                     ),
                   )
-                : _all.isEmpty && !_running
+                : _all.isEmpty && !running
                 ? Center(
                     child: Text(
                       '这个会话还没有消息',
@@ -535,8 +648,15 @@ class _ModelPickerSheet extends StatefulWidget {
 
 class _ModelPickerSheetState extends State<_ModelPickerSheet> {
   late Future<Map<String, List<ModelOption>>> _future = widget.repo.models();
+  final _search = TextEditingController();
   String? _pending;
   String? _error;
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
 
   void _retry() {
     setState(() {
@@ -578,21 +698,59 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final query = _search.text.trim().toLowerCase();
     return SafeArea(
       top: false,
+      // 键盘弹出时把弹层抬到键盘之上；高度上限 70% 屏高。
+      minimum: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
       child: ConstrainedBox(
-        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.72),
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.7),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
               child: Text('选择模型', style: theme.textTheme.titleMedium),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: TextField(
+                controller: _search,
+                textInputAction: TextInputAction.search,
+                style: theme.textTheme.bodyMedium,
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  isDense: true,
+                  hintText: '搜索模型',
+                  hintStyle: theme.textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  prefixIcon: Icon(Icons.search, size: 18, color: scheme.onSurfaceVariant),
+                  prefixIconConstraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                  suffixIcon: _search.text.isEmpty
+                      ? null
+                      : IconButton(
+                          tooltip: '清空',
+                          onPressed: () {
+                            _search.clear();
+                            setState(() {});
+                          },
+                          icon: const Icon(Icons.close, size: 16),
+                        ),
+                  filled: true,
+                  fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
             ),
             if (_error != null)
               Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
                 child: Text(
                   _error!,
                   style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
@@ -635,13 +793,12 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                     );
                   }
                   final grouped = snapshot.data ?? const <String, List<ModelOption>>{};
-                  final entries =
-                      grouped.entries.where((entry) => entry.value.isNotEmpty).toList();
-                  if (entries.isEmpty) {
+                  final rows = _rowsFor(grouped, query);
+                  if (rows.isEmpty) {
                     return Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
                       child: Text(
-                        '实例没有可用模型',
+                        query.isEmpty ? '实例没有可用模型' : '没有匹配的模型',
                         textAlign: TextAlign.center,
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: scheme.onSurfaceVariant,
@@ -649,25 +806,14 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                       ),
                     );
                   }
-                  return ListView(
+                  return ListView.builder(
                     shrinkWrap: true,
                     padding: const EdgeInsets.only(bottom: 8),
-                    children: [
-                      for (final entry in entries) ...[
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
-                          child: Text(
-                            entry.key,
-                            style: theme.textTheme.labelSmall?.copyWith(
-                              letterSpacing: 1,
-                              fontWeight: FontWeight.w600,
-                              color: scheme.onSurfaceVariant,
-                            ),
-                          ),
-                        ),
-                        for (final option in entry.value) _tile(entry.key, option),
-                      ],
-                    ],
+                    itemCount: rows.length,
+                    itemBuilder: (context, index) => switch (rows[index]) {
+                      _ProviderRow row => _providerHeader(row),
+                      _OptionRow row => _tile(row.provider, row.option),
+                    },
                   );
                 },
               ),
@@ -678,29 +824,142 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     );
   }
 
+  /// 弹层是「分组头 + 模型行」的扁平序列，交给 `ListView.builder` 按需构建。
+  /// 搜索只过滤模型行；分组头跟着存活的分组走，计数是过滤后的数量。
+  List<_PickRow> _rowsFor(Map<String, List<ModelOption>> grouped, String query) {
+    final rows = <_PickRow>[];
+    for (final entry in grouped.entries) {
+      final models = query.isEmpty
+          ? entry.value
+          : entry.value
+                .where(
+                  (option) =>
+                      option.id.toLowerCase().contains(query) ||
+                      option.label.toLowerCase().contains(query),
+                )
+                .toList();
+      if (models.isEmpty) continue;
+      rows.add(_ProviderRow(entry.key, models.length));
+      for (final option in models) {
+        rows.add(_OptionRow(entry.key, option));
+      }
+    }
+    return rows;
+  }
+
+  /// 分组头：小号 written 标题 + 计数胶囊（与列表页 `_SectionHeader` 同风格）；
+  /// 当前生效的 provider 在行尾多一枚「当前」胶囊。
+  Widget _providerHeader(_ProviderRow row) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final active = widget.current?.provider == row.provider;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Row(
+        children: [
+          Text(
+            row.provider,
+            style: theme.textTheme.labelSmall?.copyWith(
+              letterSpacing: 1.2,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(width: 6),
+          _pill(
+            '${row.count}',
+            fill: scheme.surfaceContainerHighest,
+            foreground: scheme.onSurfaceVariant,
+          ),
+          if (active) ...[
+            const Spacer(),
+            _pill(
+              '当前',
+              fill: scheme.primary.withValues(alpha: 0.12),
+              foreground: scheme.primary,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _pill(String label, {required Color fill, required Color foreground}) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(color: fill, borderRadius: BorderRadius.circular(20)),
+      child: Text(
+        label,
+        style: theme.textTheme.labelSmall?.copyWith(
+          height: 1.4,
+          fontWeight: FontWeight.w600,
+          color: foreground,
+        ),
+      ),
+    );
+  }
+
+  /// 模型行约 48dp：左侧勾选当前模型，标题是短名，副标题只在有独立 name 时出现。
   Widget _tile(String provider, ModelOption option) {
     final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     final current = widget.current;
     final selected =
         current != null && current.provider == provider && current.model == option.id;
     final saving = _pending == _keyOf(provider, option.id);
+    final name = option.name?.trim();
+    final title = name == null || name.isEmpty
+        ? shortModelLabel(ModelRef(provider, option.id))
+        : name;
+    final subtitle = option.id == title || option.label == option.id ? null : option.id;
     return ListTile(
       dense: true,
+      visualDensity: const VisualDensity(horizontal: -2, vertical: -2),
+      minVerticalPadding: 2,
+      contentPadding: const EdgeInsets.only(left: 4, right: 16),
+      minLeadingWidth: 22,
       enabled: _pending == null,
-      title: Text(option.label, maxLines: 1, overflow: TextOverflow.ellipsis),
-      subtitle: option.label == option.id
+      leading: SizedBox(
+        width: 22,
+        child: selected ? Icon(Icons.check, size: 18, color: scheme.primary) : null,
+      ),
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: subtitle == null
           ? null
-          : Text(option.id, maxLines: 1, overflow: TextOverflow.ellipsis),
+          : Text(
+              subtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
       trailing: saving
           ? const SizedBox(
               width: 18,
               height: 18,
               child: CircularProgressIndicator(strokeWidth: 2),
             )
-          : selected
-          ? Icon(Icons.check, size: 20, color: theme.colorScheme.primary)
           : null,
       onTap: _pending == null ? () => _select(provider, option) : null,
     );
   }
+}
+
+/// 模型弹层的一行：provider 分组头或一个模型。
+sealed class _PickRow {
+  const _PickRow();
+}
+
+class _ProviderRow extends _PickRow {
+  const _ProviderRow(this.provider, this.count);
+
+  final String provider;
+  final int count;
+}
+
+class _OptionRow extends _PickRow {
+  const _OptionRow(this.provider, this.option);
+
+  final String provider;
+  final ModelOption option;
 }

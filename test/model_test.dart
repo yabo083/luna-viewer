@@ -154,6 +154,25 @@ void main() {
       expect(message.bodyMarkdown, contains('/files/abc123'));
     });
 
+    test('框架消息按 form / source 判定', () {
+      ChatMessage make(Map<String, Object?> extra) => ChatMessage.fromJson({
+        'role': 'user',
+        'content': [
+          {'type': 'text', 'text': 'x'},
+        ],
+        ...extra,
+      });
+      expect(make({'form': 'notice'}).isFramework, isTrue);
+      expect(
+        make({
+          'source': {'kind': 'plugin', 'plugin': 'chatluna:character'},
+        }).isFramework,
+        isTrue,
+      );
+      expect(make({'form': 'message'}).isFramework, isFalse);
+      expect(make({}).isFramework, isFalse);
+    });
+
     test('表情与 @ 有可读占位', () {
       final message = ChatMessage.fromJson({
         'role': 'user',
@@ -198,6 +217,16 @@ void main() {
       });
       expect(event?.kind, LiveEventKind.settled);
       expect(event?.reason, 'completed');
+    });
+
+    test('snapshot 的 active 反映 attempt 是否存在', () {
+      final idle = LiveEvent.fromSse('snapshot', {'attempt': null});
+      expect(idle?.kind, LiveEventKind.snapshot);
+      expect(idle?.active, isFalse);
+      final busy = LiveEvent.fromSse('snapshot', {
+        'attempt': {'parts': []},
+      });
+      expect(busy?.active, isTrue);
     });
 
     test('snapshot 收集已累积的文本 part', () {
