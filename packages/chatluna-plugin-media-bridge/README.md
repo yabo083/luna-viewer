@@ -33,8 +33,9 @@ Authorization: Bearer <实例 token 或登录 session>
 {"items":[{
   "key":"r-1a2b3c4d5e6f","platform":"qq","selfId":"...",
   "channelId":"...","guildId":"..."|null,"kind":"group"|"private",
-  "title":"群聊 · 53FB78","count":12,
-  "last":{"id":"...","time":1795...,"dir":"in","text":"..."}
+  "title":"明日方舟交流群","avatar":"https://..."|null,"count":12,
+  "last":{"id":"...","time":1795...,"dir":"in","userId":"...",
+          "userName":"群昵称小明","avatar":"https://..."|null,"text":"..."}
 }]}
 ```
 
@@ -43,9 +44,12 @@ Authorization: Bearer <实例 token 或登录 session>
   会话 id 同一套标识，不要用标题里的 `A1338876…`（那是 ChatLuna 会话 id，不是平台 `C…` 频道 id）。
 - `kind`：`guildId` 非空且 `guildId === channelId` → `group`，否则 `private`
   （QQ 群消息的 `guildId` 与 `channelId` 相同，私聊没有 `guildId`）。
-- `title`：`群聊/私聊 · ` + 频道 id 尾 6 位；频道 id 缺失时退回会话键尾 6 位。
+- `title`：群聊优先 `session.event.guild.name`（缺失再试 `channel.name` 与
+  `bot.getGuild`），私聊优先对方昵称（`user.name` / `member.name`）；
+  都拿不到才退回 `群聊/私聊 · ` + 频道 id 尾 6 位（频道 id 缺失用会话键尾 6 位）。
+- `avatar`：群聊取群头像（`guild.avatar`），私聊取对方头像；拿不到为 `null`。
 - `count` 是当前缓冲里该会话的条数（上限 300，不是历史总数）。
-- `last.text` 就是最后一条消息的 `content`（已翻译成可读文本并压成一行）。
+- `last` 是最新一条消息的摘要，字段与消息条目一致（`text` 即 `content`）。
 
 ## 消息分页（`GET /api/platform/messages`）
 
@@ -53,7 +57,7 @@ Authorization: Bearer <实例 token 或登录 session>
 GET /api/platform/messages?key=r-1a2b3c4d5e6f&limit=50&before=1795...
 Authorization: Bearer <实例 token 或登录 session>
 
-{"items":[{"id","time","dir","userId","content"}],"hasMore":true}
+{"items":[{"id","time","dir","userId","userName","avatar","content"}],"hasMore":true}
 ```
 
 - **时间升序**（旧 → 新），直接追加到列表尾部即可。
@@ -62,9 +66,19 @@ Authorization: Bearer <实例 token 或登录 session>
 - `hasMore` 表示还有更早的消息；`before` 翻到头后为 `false`。
 - `key` 缺失 → 400；会话不存在或已被淘汰 → 200 + 空 `items`（客户端按空态处理即可）。
 - `dir`：`in` 是收到的消息（`ctx.on('message')`），`out` 是 bot 自己发出的回复。
+- `userName`：群昵称优先（`member.name` / `member.nick`），其次全局昵称
+  （`user.name` / `user.nick`），都没有才用 `userId` 尾 4 位；出站消息是 bot 名
+  （`session.bot.user.name`，拿不到用 `selfId`）。`avatar` 同理，可为 `null`。
+- 名称/头像按 `平台 + guildId` / `平台 + userId` 缓存：事件自带名字时直接写入缓存，
+  缺失时才调 `bot.getGuild` / `bot.getUser`（1.2s 超时），之后复用。
 - `content` 由 `session.elements` 翻译成可读文本（文本原样、`at` → `@尾4位`、
   `img`/`image` → `[图片]`、`face`/`emoji` → `[表情]`、`quote` → `[引用]`、
   `file`/`audio`/`video` → `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
+- 原始平台 content 里残留的标记也会归一：QQ 卡片/附件标记
+  `<attachmentType="image/jpeg",...>` 按 MIME 映射为 `[图片]` / `[视频]` / `[语音]` / `[文件]`，
+  其余附件类型 → `[附件]`；`at` → `@名字（或 id 尾 4 位）`、`face`/`emoji` → `[表情]`、
+  `img`/`image` → `[图片]`、`quote` → `[引用]`，无法识别的 `<...>` 标签直接剥掉。
+  归一后再压空白、截断。
 
 ### 出站（`dir: "out"`）
 

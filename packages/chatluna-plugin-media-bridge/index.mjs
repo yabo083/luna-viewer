@@ -54,6 +54,8 @@ const ELEMENT_LABELS = {
   quote: '[引用]',
   file: '[文件]',
   audio: '[语音]',
+  voice: '[语音]',
+  record: '[语音]',
   video: '[视频]'
 }
 
@@ -67,6 +69,51 @@ function textOf(value) {
   return typeof value === 'string' ? value : value == null ? '' : String(value)
 }
 
+// `rest` 是标签名之后的原始属性串；QQ 的附件标记用逗号分隔属性，且允许无引号，
+// 所以不能按标准 HTML 解析，只按 `key=value` 抓值。
+function attrOf(rest, name) {
+  const matched = rest.match(new RegExp(
+    `(?:^|[\\s,])${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s,>]+))`,
+    'i'
+  ))
+  return matched ? matched[1] ?? matched[2] ?? matched[3] ?? '' : ''
+}
+
+// `<attachmentType="image/jpeg",...>` / `<attachment type="file">` 这类标记只带 MIME，
+// 按类型翻成可读占位符。
+function attachmentLabel(rest) {
+  const type = (
+    attrOf(rest, 'type') ||
+    attrOf(rest, 'contentType') ||
+    attrOf(rest, 'content_type') ||
+    attrOf(rest, 'mimeType') ||
+    attrOf(rest, 'mime_type') ||
+    rest
+  ).toLowerCase()
+  if (type.includes('image')) return '[图片]'
+  if (type.includes('video')) return '[视频]'
+  if (type.includes('audio') || type.includes('voice') || type.includes('record')) return '[语音]'
+  if (type.includes('file')) return '[文件]'
+  return '[附件]'
+}
+
+// 原始 platform content 里残留的 Satori/QQ 标记：认识的映射，不认识的剥掉。
+// 只匹配 `<字母` 或 `</字母` 形式，普通文本里的 `<` 不会误伤。
+function stripRawTags(text) {
+  if (!text.includes('<')) return text
+  return text.replace(/<(\/?)([a-zA-Z][\w:-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g, (_, closing, rawTag, rest) => {
+    if (closing) return ''
+    const tag = rawTag.toLowerCase()
+    if (tag === 'at') {
+      const name = attrOf(rest, 'name')
+      const id = attrOf(rest, 'id')
+      return '@' + (name || id.slice(-4))
+    }
+    if (tag.startsWith('attachment')) return attachmentLabel(rest)
+    return ELEMENT_LABELS[tag] ?? ''
+  })
+}
+
 function describeElements(elements) {
   if (!Array.isArray(elements)) return ''
   let text = ''
@@ -78,6 +125,15 @@ function describeElements(elements) {
       const name = textOf(element.attrs?.name)
       const id = textOf(element.attrs?.id)
       text += '@' + (name || id.slice(-4)) + ' '
+    } else if (type === 'attachment') {
+      text += attachmentLabel(
+        [
+          textOf(element.attrs?.type),
+          textOf(element.attrs?.contentType ?? element.attrs?.content_type),
+          textOf(element.attrs?.mimeType ?? element.attrs?.mime_type),
+          textOf(element.attrs?.filename)
+        ].join(' ')
+      )
     } else {
       const label = ELEMENT_LABELS[type]
       if (label) text += label
@@ -90,9 +146,9 @@ function clipContent(text) {
   return text.length > MESSAGE_MAX_CONTENT ? text.slice(0, MESSAGE_MAX_CONTENT) : text
 }
 
-// 元素拿不到时（老适配器）退回 content；两条路都压成一行。
+// 元素拿不到时（老适配器）退回 content；两条路都先归一残留标记，再压成一行。
 function normalizeContent(elements, fallback) {
-  return (describeElements(elements) || textOf(fallback)).replace(/\s+/g, ' ').trim()
+  return stripRawTags(describeElements(elements) || textOf(fallback)).replace(/\s+/g, ' ').trim()
 }
 
 // 标题里的 id（`A1338876…`）是 ChatLuna 会话 id，平台侧的 `channelId`/`guildId` 是适配器
@@ -113,11 +169,21 @@ function conversationKind(guildId, channelId) {
   return guildId && guildId === channelId ? 'group' : 'private'
 }
 
-// 服务端拿不到群名，尾 6 位是唯一能区分会话的信息。
-function conversationTitle(kind, channelId, key) {
+// 服务端拿不到群名/昵称时，尾 6 位是唯一能区分会话的信息。
+function tailOf(value, length) {
+  const text = textOf(value)
+  return text.length <= length ? text : text.slice(-length)
+}
+
+function conversationTitle(kind, channelId, key, name) {
+  if (name) return name
   const source = channelId || key
-  const tail = source.length <= 6 ? source : source.slice(-6)
-  return (kind === 'group' ? '群聊 · ' : '私聊 · ') + tail
+  return (kind === 'group' ? '群聊 · ' : '私聊 · ') + tailOf(source, 6)
+}
+
+// `<at>` 等场景的短 id；没有 id 时返回空串。
+function shortId(value) {
+  return tailOf(value, 4)
 }
 
 function messageEntry(session, dir = 'in') {
@@ -128,8 +194,13 @@ function messageEntry(session, dir = 'in') {
     platform: textOf(session.platform),
     selfId: textOf(session.selfId),
     userId: textOf(session.userId),
+    userName: '',
+    avatar: null,
     channelId: textOf(session.channelId),
     guildId: session.guildId ? textOf(session.guildId) : null,
+    // 由 resolveIdentity 填充；record 只认非空值，避免出站消息覆盖已有群名/昵称。
+    conversationName: '',
+    conversationAvatar: null,
     content: clipContent(normalizeContent(session.elements, session.content))
   }
 }
@@ -140,6 +211,8 @@ function publicMessage(message) {
     time: message.time,
     dir: message.dir,
     userId: message.userId,
+    userName: message.userName,
+    avatar: message.avatar,
     content: message.content
   }
 }
@@ -162,6 +235,97 @@ export function apply(ctx) {
     for (const stream of subscribers) stream.send({ event: 'platform', data: { key, message } })
   }
 
+  // 名称/头像缓存：`g:<platform>\0<guildId>` / `u:<platform>\0<userId>` → {name, avatar}。
+  // 事件里带名字就直接记下来（零开销）；缺失时才问 bot，一次查询的结果后续消息复用。
+  const profileCache = new Map()
+  const profilePending = new Map()
+  const PROFILE_TIMEOUT = 1200
+
+  const withTimeout = (factory, ms) => new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms)
+    Promise.resolve().then(factory).then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      () => { clearTimeout(timer); resolve(null) }
+    )
+  })
+
+  const resolveProfile = async (scope, platform, id, seed, fetcher) => {
+    if (!id) return null
+    const cacheKey = scope + ':' + platform + '\u0000' + id
+    const cached = profileCache.get(cacheKey)
+    const seedName = textOf(seed?.name)
+    const seedAvatar = textOf(seed?.avatar) || null
+    if (seedName || seedAvatar) {
+      const value = {
+        name: seedName || cached?.name || '',
+        avatar: seedAvatar || cached?.avatar || null
+      }
+      profileCache.set(cacheKey, value)
+      return value
+    }
+    if (cached) return cached
+    const pending = profilePending.get(cacheKey)
+    if (pending) return pending
+    const promise = (async () => {
+      try {
+        const profile = await withTimeout(fetcher, PROFILE_TIMEOUT)
+        if (!profile) return null
+        const value = {
+          name: textOf(profile.name) || textOf(profile.nick) || '',
+          avatar: textOf(profile.avatar) || null
+        }
+        if (value.name || value.avatar) profileCache.set(cacheKey, value)
+        return value
+      } catch {
+        return null
+      } finally {
+        profilePending.delete(cacheKey)
+      }
+    })()
+    profilePending.set(cacheKey, promise)
+    return promise
+  }
+
+  // 入站消息的显示名/头像：群昵称（member.name/nick）优先，其次全局昵称；
+  // 群会话标题取群名，私聊标题取对方昵称。事件里没有才走 bot.getGuild / bot.getUser。
+  const resolveIdentity = async (session, entry) => {
+    const event = session.event ?? {}
+    const member = event.member
+    const user = event.user ?? member?.user
+    const guild = event.guild
+    const channel = event.channel
+    const platform = entry.platform
+    const kind = conversationKind(entry.guildId, entry.channelId)
+
+    const sender = await resolveProfile(
+      'u',
+      platform,
+      entry.userId,
+      {
+        name: textOf(member?.name) || textOf(member?.nick) || textOf(user?.name) || textOf(user?.nick),
+        avatar: textOf(member?.avatar) || textOf(user?.avatar) || null
+      },
+      () => session.bot?.getUser?.(entry.userId, entry.guildId || undefined)
+    )
+    entry.userName = sender?.name || shortId(entry.userId)
+    entry.avatar = sender?.avatar ?? null
+
+    if (kind === 'group') {
+      const profile = await resolveProfile(
+        'g',
+        platform,
+        entry.guildId,
+        { name: textOf(guild?.name), avatar: textOf(guild?.avatar) },
+        () => session.bot?.getGuild?.(entry.guildId)
+      )
+      entry.conversationName = profile?.name || textOf(channel?.name) || ''
+      entry.conversationAvatar = profile?.avatar ?? null
+    } else {
+      entry.conversationName = sender?.name || textOf(channel?.name) || ''
+      entry.conversationAvatar = sender?.avatar ?? null
+    }
+  }
+
   // 落一条消息；同一个会话、同一个 time 视为同一条（多 bot 实例/适配器重复上报）。
   // 返回真正入库的消息（重复则 null），调用方据此决定是否推实时帧。
   const record = (key, entry) => {
@@ -181,7 +345,10 @@ export function apply(ctx) {
         channelId: '',
         guildId: null,
         kind: 'private',
+        name: '',
+        nameKind: 'private',
         title: '',
+        avatar: null,
         messages: []
       }
     }
@@ -192,7 +359,14 @@ export function apply(ctx) {
     conversation.channelId = channelId || conversation.channelId
     if (guildId) conversation.guildId = guildId
     conversation.kind = conversationKind(conversation.guildId, conversation.channelId)
-    conversation.title = conversationTitle(conversation.kind, conversation.channelId, key)
+    // 群名/对方昵称只在入站解析出来时写入，且不能跨 kind 复用（私聊昵称不会变成群名）。
+    if (conversation.nameKind !== conversation.kind) {
+      conversation.name = ''
+      conversation.nameKind = conversation.kind
+    }
+    if (entry.conversationName) conversation.name = textOf(entry.conversationName)
+    if (entry.conversationAvatar) conversation.avatar = textOf(entry.conversationAvatar)
+    conversation.title = conversationTitle(conversation.kind, conversation.channelId, key, conversation.name)
     conversations.set(key, conversation)
 
     const messages = conversation.messages
@@ -204,6 +378,8 @@ export function apply(ctx) {
       time,
       dir: entry.dir === 'out' ? 'out' : 'in',
       userId: textOf(entry.userId),
+      userName: textOf(entry.userName),
+      avatar: entry.avatar ? textOf(entry.avatar) : null,
       content: textOf(entry.content)
     }
 
@@ -253,10 +429,11 @@ export function apply(ctx) {
   }
 
   // 指令在 `message` 事件之后才被匹配执行，所以这里也能看到没进会话的那部分。
-  ctx.on('message', (session) => {
+  ctx.on('message', async (session) => {
     const key = conversationKeyOf(session)
     if (!key) return
     const entry = messageEntry(session, 'in')
+    await resolveIdentity(session, entry)
     const message = record(key, entry)
     rememberInboundKey(entry, key)
     if (message) notify(key, message)
@@ -312,6 +489,15 @@ export function apply(ctx) {
     entry.content = clipContent(slot.content)
     // 出站消息的作者是 bot 自己：`send` 的 session 是新造的，没有 user。
     if (!entry.userId) entry.userId = entry.selfId
+    const botUser = session.bot?.user
+    entry.userName = textOf(botUser?.name) || entry.selfId
+    entry.avatar = textOf(botUser?.avatar) || null
+    // 主动推送时可能没有入站消息打过底，这里顺手用 send 事件自带的 guild 补群名。
+    const eventGuild = session.event?.guild
+    if (conversationKind(entry.guildId, entry.channelId) === 'group' && eventGuild?.name) {
+      entry.conversationName = textOf(eventGuild.name)
+      entry.conversationAvatar = textOf(eventGuild.avatar) || null
+    }
     // 平台回了消息 id 就用它；否则退回本地键——客户端靠 id 去重，空 id 会让同一条消息反复出现。
     const messageId = textOf(session.messageId)
     entry.id = messageId || `out-${entry.selfId}:${now}:${++outboundSeq}`
@@ -385,9 +571,18 @@ export function apply(ctx) {
         guildId: conversation.guildId,
         kind: conversation.kind,
         title: conversation.title,
+        avatar: conversation.avatar,
         count: conversation.messages.length,
         last: last
-          ? { id: last.id, time: last.time, dir: last.dir, text: last.content }
+          ? {
+              id: last.id,
+              time: last.time,
+              dir: last.dir,
+              userId: last.userId,
+              userName: last.userName,
+              avatar: last.avatar,
+              text: last.content
+            }
           : null
       })
     }
