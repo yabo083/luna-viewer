@@ -228,6 +228,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 已经拿到 `tool-result` 的调用 id：settle 时仍没有结果的，就是被转到后台去了。
   final Set<String> _resultToolCalls = <String>{};
 
+  /// 已经播报过「转入后台」的工具（`round:name`）：一次调用只提示一次。
+  final Set<String> _notifiedBackground = <String>{};
+
   /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
   /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
   Timer? _probeDelay;
@@ -1046,15 +1049,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _snapshotTimer?.cancel();
                 // 还开着、却已经 settle 的工具 = 引擎把它转到了后台：
                 // 在中间块说明一句，用户才知道这一轮为什么"没声了"。
-                final backgrounded = [
+                final backgrounded = <String>{
                   for (final entry in _openToolCalls.entries)
                     if (!_resultToolCalls.contains(entry.key) &&
                         entry.value != replyPhase)
                       entry.value,
-                ];
+                }..removeWhere(
+                  (name) => !_notifiedBackground.add('$_skeletonRound:$name'),
+                );
                 if (backgrounded.isNotEmpty) {
                   _pushFrameworkNotice(
-                    '[${backgrounded.toSet().join('、')} 转入后台执行，完成后会回来告诉你]',
+                    '[${backgrounded.join('、')} 转入后台执行，完成后会回来告诉你]',
                   );
                 }
                 _clock.attemptSettled();
@@ -1254,15 +1259,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _openToolCalls.clear();
         _openToolNames.clear();
         _resultToolCalls.clear();
+        _notifiedBackground.clear();
       }
       // 本轮已经出过真实气泡：不再补骨架（等 running=false 收表即可）。
       if (_skeleton == _SkeletonPhase.none && !_outboundInRound) _startSkeleton();
       return;
     }
     // 先拿引擎的权威计时（轨迹视图同源）校正总时长与各工具耗时，再盖脚注。
-    // 一次 turn 可能继续开下一轮（异步工具）：等 3 秒没有新一轮再按 turn 汇总。
+    // 脚注先按本地钟落定（一轮一套读数，用户看到的就是他等的时间）。
+    if (_stampTurnEnd(view)) setState(() {});
+    // 引擎的 `timing` 只用来校正阶段耗时：稍后拉日志替换 phase 明细。
     _adoptTimer?.cancel();
-    _adoptTimer = Timer(const Duration(seconds: 3), () {
+    _adoptTimer = Timer(const Duration(seconds: 2), () {
       _adoptTimer = null;
       unawaited(_adoptTiming());
     });
@@ -1336,9 +1344,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     } catch (_) {
       // 拿不到权威数据就保留实时读数，脚注照盖。
     }
-    if (!mounted) return;
-    final view = _clock.view.value;
-    if (view != null && _stampTurnEnd(view)) setState(() {});
   }
 
   void _endSkeleton(TurnClockView view) {
