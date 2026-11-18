@@ -8,7 +8,16 @@
 flutter analyze     # 必须 No issues found
 ```
 
-## 2. 服务端契约（在实例主机上，或任意能访问 5028 的机器）
+## 2. 构建（Windows）
+
+```powershell
+flutter build apk --debug
+```
+
+被打断的构建会在 `build/<plugin>/kotlin/...` 留下无法关闭的增量缓存（报 `Could not close incremental caches … class-fq-name-to-source.tab`）。
+处理：`gradlew --stop` → 删 `build/`、`android/.gradle/` → 重跑（`android/gradle.properties` 已设 `kotlin.incremental=false`）。
+
+## 3. 服务端契约（在实例主机上，或任意能访问 5028 的机器）
 
 ```bash
 T=<实例 token>
@@ -18,7 +27,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5028/api/sessions     
 curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: chatluna_session=x" http://127.0.0.1:5028/api/sessions  # 401（cookie 不授权 /api）
 ```
 
-## 3. 会话闭环（App 内）
+## 4. 会话闭环（App 内）
 
 | 步骤 | 通过判据 |
 |---|---|
@@ -29,7 +38,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: chatluna_session=x" http://
 | 断线 | 切飞行模式→恢复：出现「实时流不可用，改用轮询」并最终补全内容 |
 | 只读 | 打开 `origin: satori` 的会话，输入框禁用并给出提示 |
 
-## 4. 设备侧
+## 5. 设备侧
 
 ```bash
 adb devices -l                                  # 设备在线

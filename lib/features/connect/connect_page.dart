@@ -1,4 +1,4 @@
-import 'package:material_ui/material_ui.dart';
+import 'package:flutter/material.dart';
 
 import '../../core/model/models.dart';
 import '../../core/store/connection_store.dart';
@@ -58,6 +58,8 @@ class _ConnectPageState extends State<ConnectPage> {
       );
     } on ApiFailure catch (e) {
       setState(() => _error = _describe(e));
+    } catch (e) {
+      setState(() => _error = '连接失败：$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

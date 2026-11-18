@@ -1,14 +1,18 @@
 import 'dart:async';
 
-import 'package:material_ui/material_ui.dart';
+import 'package:flutter/material.dart';
 
 import '../../core/capability/sessions_repository.dart';
 import '../../core/model/models.dart';
+import 'message_view.dart';
 
+/// 会话详情：只读历史 + 实时流 + 会话级操作（中止 / 压缩 / 分叉 / 重新载入）。
+/// v0.1.0 不在 App 里发消息——平台会话的输入仍由聊天软件承担。
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key, required this.repo, required this.session});
+  const ChatPage({super.key, required this.repo, required this.base, required this.session});
 
   final SessionsRepository repo;
+  final Uri base;
   final SessionSummary session;
 
   @override
@@ -16,7 +20,6 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
-  final _input = TextEditingController();
   final _scroll = ScrollController();
   final List<ChatMessage> _messages = [];
   final StringBuffer _streaming = StringBuffer();
@@ -39,7 +42,6 @@ class _ChatPageState extends State<ChatPage> {
   void dispose() {
     _live?.cancel();
     _poll?.cancel();
-    _input.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -61,6 +63,12 @@ class _ChatPageState extends State<ChatPage> {
       setState(() {
         _loading = false;
         _error = '${e.code}：${e.message}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '加载失败：$e';
       });
     }
   }
@@ -111,17 +119,12 @@ class _ChatPageState extends State<ChatPage> {
   void _startPolling() {
     _poll?.cancel();
     var ticks = 0;
-    _poll = Timer.periodic(const Duration(milliseconds: 1200), (timer) async {
-      if (!mounted || ticks++ > 60) {
+    _poll = Timer.periodic(const Duration(milliseconds: 1500), (timer) async {
+      if (!mounted || ticks++ > 40) {
         timer.cancel();
         return;
       }
       await _load();
-      final last = _messages.isEmpty ? null : _messages.last;
-      if (last != null && !last.isUser) {
-        timer.cancel();
-        setState(() => _running = false);
-      }
     });
   }
 
@@ -136,61 +139,46 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
-  Future<void> _send() async {
-    final text = _input.text.trim();
-    if (text.isEmpty || _running) return;
-    setState(() {
-      _messages.add(ChatMessage(id: 'local-${DateTime.now().microsecondsSinceEpoch}', role: 'user', blocks: [
-        ChatBlock('text', {'text': text}),
-      ]));
-      _running = true;
-      _streaming.clear();
-      _input.clear();
-    });
-    _scrollToEnd();
-    try {
-      await widget.repo.send(widget.session.id, text);
-      if (!_liveOk) _startPolling();
-    } on ApiFailure catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _running = false;
-        _error = '发送失败 ${e.code}：${e.message}';
-      });
-    }
+  void _toast(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   Future<void> _cancel() async {
     try {
       await widget.repo.cancel(widget.session.id);
-    } on ApiFailure catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('取消失败 ${e.code}')));
+      setState(() {
+        _running = false;
+        _streaming.clear();
+      });
+    } on ApiFailure catch (e) {
+      _toast('取消失败 ${e.code}：${e.message}');
     }
-    if (!mounted) return;
-    setState(() {
-      _running = false;
-      _streaming.clear();
-    });
   }
 
   Future<void> _compact() async {
-    final messenger = ScaffoldMessenger.of(context);
     try {
       final result = await widget.repo.compact(widget.session.id);
-      if (!mounted) return;
-      messenger.showSnackBar(SnackBar(content: Text('已压缩：${result ?? '完成'}')));
+      _toast('已压缩：${result ?? '完成'}');
       await _load();
     } on ApiFailure catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('压缩失败 ${e.code}：${e.message}')));
+      _toast('压缩失败 ${e.code}：${e.message}');
+    }
+  }
+
+  Future<void> _fork() async {
+    try {
+      final child = await widget.repo.fork(widget.session.id);
+      _toast('已分叉：${child.sessionId}（${child.length} 条）');
+    } on ApiFailure catch (e) {
+      _toast('分叉失败 ${e.code}：${e.message}');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final writable = widget.session.writable;
-    final canWrite = writable && !_running;
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -203,10 +191,12 @@ class _ChatPageState extends State<ChatPage> {
           PopupMenuButton<String>(
             onSelected: (value) {
               if (value == 'compact') _compact();
+              if (value == 'fork') _fork();
               if (value == 'reload') _load();
             },
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'compact', child: Text('压缩上下文')),
+              PopupMenuItem(value: 'fork', child: Text('分叉到新会话')),
               PopupMenuItem(value: 'reload', child: Text('重新载入')),
             ],
           ),
@@ -214,23 +204,7 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: Column(
         children: [
-          if (!writable)
-            Container(
-              width: double.infinity,
-              color: theme.colorScheme.surfaceContainerHighest,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text(
-                '这个会话来自 ${widget.session.origin}，只能查看，不能从 App 发消息。',
-                style: theme.textTheme.bodySmall,
-              ),
-            ),
-          if (!_liveOk)
-            Container(
-              width: double.infinity,
-              color: theme.colorScheme.errorContainer,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text('实时流不可用，改用轮询。', style: theme.textTheme.bodySmall),
-            ),
+          _Header(session: widget.session, running: _running, liveOk: _liveOk),
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
@@ -238,47 +212,21 @@ class _ChatPageState extends State<ChatPage> {
                 ? Center(child: Text(_error!, style: TextStyle(color: theme.colorScheme.error)))
                 : ListView.builder(
                     controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
                     itemCount: _messages.length + (_streaming.isEmpty ? 0 : 1),
                     itemBuilder: (context, index) {
                       if (index == _messages.length) {
-                        return _Bubble(text: _streaming.toString(), isUser: false, streaming: true);
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: SelectableText(
+                            _streaming.toString(),
+                            style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
+                          ),
+                        );
                       }
-                      final message = _messages[index];
-                      final text = message.displayText;
-                      if (text.isEmpty) return const SizedBox.shrink();
-                      return _Bubble(text: text, isUser: message.isUser);
+                      return MessageView(message: _messages[index], base: widget.base);
                     },
                   ),
-          ),
-          SafeArea(
-            top: false,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _input,
-                      enabled: writable,
-                      minLines: 1,
-                      maxLines: 5,
-                      textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => canWrite ? _send() : null,
-                      decoration: InputDecoration(
-                        hintText: writable ? (_running ? '生成中…' : '说点什么') : '只读会话',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton.filled(
-                    onPressed: canWrite ? _send : null,
-                    icon: const Icon(Icons.arrow_upward),
-                  ),
-                ],
-              ),
-            ),
           ),
         ],
       ),
@@ -286,31 +234,28 @@ class _ChatPageState extends State<ChatPage> {
   }
 }
 
-class _Bubble extends StatelessWidget {
-  const _Bubble({required this.text, required this.isUser, this.streaming = false});
+class _Header extends StatelessWidget {
+  const _Header({required this.session, required this.running, required this.liveOk});
 
-  final String text;
-  final bool isUser;
-  final bool streaming;
+  final SessionSummary session;
+  final bool running;
+  final bool liveOk;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.82),
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: isUser ? theme.colorScheme.primaryContainer : theme.colorScheme.surfaceContainerHigh,
-          borderRadius: BorderRadius.circular(14),
-        ),
-        child: SelectableText(
-          text,
-          style: theme.textTheme.bodyMedium?.copyWith(height: 1.45),
-        ),
-      ),
+    final parts = [
+      session.origin,
+      if (session.engine.isNotEmpty) session.engine,
+      if (session.model != null) session.model!.toString(),
+      if (running) '生成中',
+      if (!liveOk) '实时流不可用·轮询中',
+    ];
+    return Container(
+      width: double.infinity,
+      color: theme.colorScheme.surfaceContainerHighest,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Text(parts.join(' · '), style: theme.textTheme.bodySmall),
     );
   }
 }

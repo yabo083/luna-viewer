@@ -1,6 +1,8 @@
 /// 领域模型：与服务端 JSON 解耦。后端字段变化只改本文件的 fromJson。
 library;
 
+import 'dart:convert';
+
 class ApiFailure implements Exception {
   ApiFailure(this.code, this.message, {this.status, this.details});
 
@@ -91,13 +93,18 @@ class ChatMessage {
     required this.id,
     required this.role,
     required this.blocks,
+    this.form = '',
   });
 
   final String id;
   final String role;
   final List<ChatBlock> blocks;
 
+  /// 服务端标记的消息形态：`notice` 是引擎/插件注入的内部消息（wake、turn 装配），不是用户发言。
+  final String form;
+
   bool get isUser => role == 'user';
+  bool get isNotice => form == 'notice';
 
   factory ChatMessage.fromJson(Map<String, Object?> json) {
     final raw = json['content'];
@@ -115,21 +122,115 @@ class ChatMessage {
       id: (json['id'] as String?) ?? '',
       role: (json['role'] as String?) ?? 'assistant',
       blocks: blocks,
+      form: (json['form'] as String?) ?? '',
     );
   }
 
-  /// 角色引擎会把正文包在 `<message>…</message>` 里，后面跟 `<status …/>` 之类的标记。
-  /// 展示层只取正文，保留其余块原样跳过。
-  String get displayText {
+  /// 角色引擎把正文包在 `<message>…</message>` 里；图片是 `<img src="…">`；`<status/>` 是状态栏，不展示。
+  /// 输出是 markdown：`<img>` 已转成 `![](url)`，其余标签剥掉（`<br>` 保留）。
+  String get bodyMarkdown {
+    var raw = _collectText();
+    // 多数回合的答复是通过 `reply` 工具发出的，assistant 自身没有 text 块。
+    if (raw.trim().isEmpty) raw = _replyContent();
+    if (raw.trim().isEmpty) return '';
+    final parts = RegExp(r'<message>([\s\S]*?)</message>').allMatches(raw).map((m) => m.group(1) ?? '').toList();
+    var body = parts.isEmpty ? raw : parts.join('\n');
+    body = body.replaceAllMapped(
+      RegExp(r'''<img[^>]*src\s*=\s*["']([^"']+)["'][^>]*>''', caseSensitive: false),
+      (m) => '\n![](${m.group(1)})\n',
+    );
+    body = body.replaceAll(RegExp(r'<status[\s\S]*?(/>|</status>)'), '');
+    body = body.replaceAll(RegExp(r'</(turn|status|message|mood|bond|state)>'), '');
+    body = body.replaceAll(RegExp(r'<(?!br\s*/?>)(/?[a-zA-Z][^>]*)>'), '');
+    return body.trim();
+  }
+
+  /// 模型的思考过程（reasoning 块），UI 折叠展示。
+  String get reasoningText {
     final buffer = StringBuffer();
     for (final block in blocks) {
-      if (block.type != 'text') continue;
-      buffer.write(block.text ?? '');
+      if (block.type != 'reasoning') continue;
+      final text = block.data['text'];
+      if (text is String && text.trim().isNotEmpty) {
+        if (buffer.isNotEmpty) buffer.write('\n\n');
+        buffer.write(text);
+      }
     }
-    final raw = buffer.toString();
-    final match = RegExp(r'<message>([\s\S]*?)</message>').firstMatch(raw);
-    final body = match?.group(1) ?? raw;
-    return body.replaceAll(RegExp(r'<status[^>]*/>|<status[\s\S]*?</status>'), '').trim();
+    return buffer.toString().trim();
+  }
+
+  /// 一次消息里真正做了事的工具调用（`reply`/`finish` 是发言工具，不算），
+  /// 并按 `toolCallId` 关联同一条消息里的 `tool-result`。
+  List<ToolCallInfo> get toolCalls {
+    final outputs = <String, String>{};
+    for (final block in blocks) {
+      if (block.type != 'tool-result') continue;
+      final id = block.data['toolCallId'];
+      if (id is String) outputs[id] = _toolOutputText(block.data['output']);
+    }
+    return [
+      for (final block in blocks)
+        if (block.type == 'tool-call')
+          if (block.data['toolName'] case final String name when name != 'reply' && name != 'finish')
+            ToolCallInfo(
+              name,
+              block.data['input'],
+              output: outputs[(block.data['toolCallId'] as String?) ?? ''] ?? '',
+            ),
+    ];
+  }
+
+  static String _toolOutputText(Object? output) {
+    if (output == null) return '';
+    if (output is String) return output;
+    if (output is Map) {
+      final value = output['value'];
+      if (value is List) {
+        final parts = [
+          for (final item in value)
+            if (item is Map && item['type'] == 'text' && item['text'] is String) item['text'] as String,
+        ];
+        if (parts.isNotEmpty) return parts.join('\n');
+      }
+    }
+    return ToolCallInfo._pretty(output);
+  }
+
+  int get toolCallCount => toolCalls.length;
+
+  String _replyContent() {
+    for (final block in blocks.reversed) {
+      if (block.type != 'tool-call') continue;
+      if (block.data['toolName'] != 'reply') continue;
+      final input = block.data['input'];
+      if (input is Map) {
+        final content = input['content'];
+        if (content is String && content.trim().isNotEmpty) return content;
+      }
+    }
+    return '';
+  }
+
+  String _collectText() {
+    final buffer = StringBuffer();
+    void walk(List<ChatBlock> list) {
+      for (final block in list) {
+        if (block.type == 'text') {
+          buffer.write(block.text ?? '');
+        } else if (block.type == 'envelope') {
+          final nested = block.data['content'];
+          if (nested is List) {
+            walk([
+              for (final item in nested)
+                if (item is Map) ChatBlock((item['type'] as String?) ?? 'unknown', item.cast<String, Object?>()),
+            ]);
+          }
+        }
+      }
+    }
+
+    walk(blocks);
+    return buffer.toString();
   }
 }
 
@@ -149,39 +250,42 @@ class Health {
   final String version;
 }
 
-class EngineOption {
-  const EngineOption(this.id, this.label, this.presets);
+class ToolCallInfo {
+  const ToolCallInfo(this.name, this.input, {this.output = ''});
 
-  final String id;
-  final String label;
-  final List<PresetOption> presets;
+  final String name;
+  final Object? input;
 
-  factory EngineOption.fromJson(Map<String, Object?> json) => EngineOption(
-    (json['id'] as String?) ?? '',
-    (json['label'] as String?) ?? (json['id'] as String?) ?? '',
-    [
-      for (final p in (json['presets'] as List?) ?? const [])
-        if (p is Map)
-          PresetOption((p['id'] as String?) ?? '', (p['name'] as String?) ?? (p['id'] as String?) ?? ''),
-    ],
-  );
+  /// 对应的 `tool-result.output`，展开时显示；空串表示没有结果块。
+  final String output;
+
+  String get prettyInput => _pretty(input);
+
+  static String _pretty(Object? value) {
+    if (value == null) return '';
+    try {
+      return const JsonEncoder.withIndent('  ').convert(value);
+    } catch (_) {
+      return value.toString();
+    }
+  }
 }
 
-class PresetOption {
-  const PresetOption(this.id, this.name);
+class CompactResult {
+  const CompactResult(this.before, this.after);
 
-  final String id;
-  final String name;
+  final int before;
+  final int after;
+
+  @override
+  String toString() => '$before → $after';
 }
 
-class ModelOption {
-  const ModelOption(this.provider, this.model, this.name);
+class ForkResult {
+  const ForkResult(this.sessionId, this.length);
 
-  final String provider;
-  final String model;
-  final String name;
-
-  ModelRef get ref => ModelRef(provider, model);
+  final String sessionId;
+  final int length;
 }
 
 /// `/api/sessions/:id/live` 的流事件。`part` 是 ChatPart 的原始 JSON。

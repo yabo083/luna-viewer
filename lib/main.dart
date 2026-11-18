@@ -1,4 +1,4 @@
-import 'package:material_ui/material_ui.dart';
+import 'package:flutter/material.dart';
 
 import 'core/store/connection_store.dart';
 import 'features/connect/connect_page.dart';

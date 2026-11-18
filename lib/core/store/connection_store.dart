@@ -57,14 +57,38 @@ class ConnectionStore {
 }
 
 /// 把用户输入的 `192.168.0.107:5028` / `bot.example.com` / `http://…` 归一成 Uri。
+/// 规则：显式 scheme 优先；否则局域网/裸主机名走 http:5028，公网域名走 https:443。
+/// 全角标点、带 `%` 的主机名等非法输入一律拒绝——它们会在 socket 层抛 FormatException。
 Uri? normalizeBase(String input) {
   final text = input.trim();
   if (text.isEmpty) return null;
-  final withScheme = text.contains('://') ? text : 'http://$text';
-  final uri = Uri.tryParse(withScheme);
+  // 先挡非法字符：中文输入法/误触产生的全角标点会让 Uri 把主机名解析成意想不到的东西。
+  if (!RegExp(r'^[A-Za-z0-9.:/_\-\[\]]+$').hasMatch(text)) return null;
+  final hasScheme = text.contains('://');
+  final uri = Uri.tryParse(hasScheme ? text : 'http://$text');
   if (uri == null || uri.host.isEmpty) return null;
-  final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 5028);
-  return Uri(scheme: uri.scheme, host: uri.host, port: port);
+  final host = uri.host;
+  final validHost =
+      RegExp(r'^[A-Za-z0-9.-]+$').hasMatch(host) ||
+      (host.startsWith('[') && host.endsWith(']'));
+  if (!validHost) return null;
+  final scheme = hasScheme ? uri.scheme : (_isLanHost(host) ? 'http' : 'https');
+  final port = uri.hasPort ? uri.port : (scheme == 'https' ? 443 : 5028);
+  return Uri(scheme: scheme, host: host, port: port);
+}
+
+bool _isLanHost(String host) {
+  if (host == 'localhost' || host.endsWith('.local')) return true;
+  final parts = host.split('.');
+  if (parts.length == 4 && parts.every((part) => int.tryParse(part) != null)) {
+    final a = int.parse(parts[0]);
+    final b = int.parse(parts[1]);
+    return a == 10 ||
+        a == 127 ||
+        (a == 192 && b == 168) ||
+        (a == 172 && b >= 16 && b <= 31);
+  }
+  return !host.contains('.');
 }
 
 ApiFailure asFailure(Object error) => error is ApiFailure

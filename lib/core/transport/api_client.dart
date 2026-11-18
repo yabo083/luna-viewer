@@ -56,9 +56,7 @@ class ApiClient {
   static Future<Health> health(Uri base, {Duration timeout = const Duration(seconds: 4)}) async {
     final client = http.Client();
     try {
-      final res = await client
-          .get(base.resolve('api/health'))
-          .timeout(timeout);
+      final res = await client.get(base.resolve('api/health')).timeout(timeout);
       if (res.statusCode != 200) {
         throw ApiFailure('NETWORK', 'health ${res.statusCode}', status: res.statusCode);
       }
@@ -69,6 +67,16 @@ class ApiClient {
         (json['name'] as String?) ?? '',
         (json['version'] as String?) ?? '',
       );
+    } on ApiFailure {
+      rethrow;
+    } on TimeoutException {
+      throw ApiFailure('TIMEOUT', '连接超时');
+    } on SocketException catch (e) {
+      throw ApiFailure('NETWORK', e.message);
+    } on FormatException catch (e) {
+      throw ApiFailure('NETWORK', '地址无效：${e.message}');
+    } on http.ClientException catch (e) {
+      throw ApiFailure('NETWORK', e.message);
     } finally {
       client.close();
     }
@@ -173,6 +181,8 @@ class ApiClient {
       throw ApiFailure('NETWORK', e.message);
     } on FormatException catch (e) {
       throw ApiFailure('INTERNAL', '返回体不是合法 JSON: ${e.message}');
+    } catch (e) {
+      throw ApiFailure('INTERNAL', e.toString());
     }
   }
 
