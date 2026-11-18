@@ -451,6 +451,15 @@ class LiveEvent {
       reason = null,
       active = true;
 
+  /// 思考阶段（`part.type == 'reasoning'`）：只用来区分「思考中」与「回复中」，正文不进 buffer。
+  const LiveEvent.reasoning()
+    : kind = LiveEventKind.reasoning,
+      parts = const [],
+      delta = null,
+      toolName = null,
+      reason = null,
+      active = true;
+
   const LiveEvent.settled(this.reason)
     : kind = LiveEventKind.settled,
       parts = const [],
@@ -472,7 +481,7 @@ class LiveEvent {
   final String? toolName;
   final String? reason;
 
-  /// 该事件是否代表「有生成在进行中」：snapshot 看有没有 attempt，delta/tool 恒为真。
+  /// 该事件是否代表「有生成在进行中」：snapshot 看有没有 attempt，delta/tool/reasoning 恒为真。
   final bool active;
 
   static LiveEvent? fromSse(String event, Map<String, Object?>? data) {
@@ -498,6 +507,7 @@ class LiveEvent {
           if (delta is String && delta.isNotEmpty) return LiveEvent.delta(delta, 0);
           return null;
         }
+        if (type == 'reasoning') return const LiveEvent.reasoning();
         if (type == 'tool-input') {
           final name = part['toolName'];
           return LiveEvent.tool(name is String ? name : 'tool');
@@ -515,7 +525,7 @@ class LiveEvent {
   }
 }
 
-enum LiveEventKind { snapshot, delta, tool, settled, lagged }
+enum LiveEventKind { snapshot, delta, tool, reasoning, settled, lagged }
 
 /// `/api/sessions/:id/events` 的一个增量帧：落库的新消息，或增量窗口失效。
 class SessionEvent {

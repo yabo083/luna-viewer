@@ -126,6 +126,7 @@ class ChatInfoBar extends StatelessWidget {
     required this.session,
     required this.running,
     required this.liveOk,
+    this.statusLabel,
     this.botName,
     this.avatarUrl,
     this.debugMetrics = const [],
@@ -136,6 +137,9 @@ class ChatInfoBar extends StatelessWidget {
   final SessionSummary session;
   final bool running;
   final bool liveOk;
+
+  /// 「思考中 / 回复中」；为空时不留胶囊（待机）。
+  final String? statusLabel;
   final String? botName;
   final String? avatarUrl;
   final List<String> debugMetrics;
@@ -174,7 +178,7 @@ class ChatInfoBar extends StatelessWidget {
               icon: Icons.memory_outlined,
               onTap: onModelTap,
             ),
-          if (running) const _RunningPill(),
+          if (running && statusLabel != null) _RunningPill(label: statusLabel!),
           if (showDeveloperInfo) ...[
             if (!liveOk)
               const _InfoPill(
@@ -257,7 +261,9 @@ class _InfoPill extends StatelessWidget {
 
 /// 运行中：低饱和胶囊 + 呼吸圆点，不抢消息区的注意力。
 class _RunningPill extends StatelessWidget {
-  const _RunningPill();
+  const _RunningPill({required this.label});
+
+  final String label;
 
   @override
   Widget build(BuildContext context) {
@@ -271,7 +277,7 @@ class _RunningPill extends StatelessWidget {
           _PulseDot(color: scheme.primary),
           const SizedBox(width: 5),
           Text(
-            '运行中',
+            label,
             style: theme.textTheme.labelSmall?.copyWith(
               fontSize: 11,
               height: 1.2,

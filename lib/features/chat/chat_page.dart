@@ -10,8 +10,30 @@ import 'chat_chrome.dart';
 import 'message_view.dart';
 
 /// 实时流的唯一状态来源：UI 只读它，不再散落一堆 bool。
-/// idle → 空闲/生成已结束；running → 有生成在跑；failed → SSE 断了，退回轮询。
-enum LiveState { idle, running, failed }
+/// - `idle`：没有生成，列表首格不占位；
+/// - `thinking`：在跑但还没有正文（reasoning / 工具阶段），胶囊带三点呼吸；
+/// - `replying`：正文 delta 已到，胶囊保持静态；
+/// - `failed`：SSE 断开，退回轮询。
+enum LiveState {
+  idle,
+  thinking,
+  replying,
+  failed;
+
+  /// 有生成在跑（思考或回复）：中止按钮与信息栏读它。
+  bool get generating => this == LiveState.thinking || this == LiveState.replying;
+
+  /// 列表首格是否需要状态胶囊：待机不显示。
+  bool get hasCapsule => this != LiveState.idle;
+
+  /// 胶囊文案；`idle` 没有胶囊。
+  String? get capsuleLabel => switch (this) {
+    LiveState.thinking => '思考中',
+    LiveState.replying => '回复中',
+    LiveState.failed => '轮询中',
+    LiveState.idle => null,
+  };
+}
 
 /// 会话详情：只读历史 + 实时流 + 会话级操作（中止 / 压缩 / 分叉 / 重新载入）。
 /// v0.1.0 不在 App 里发消息——平台会话的输入仍由聊天软件承担。
@@ -52,8 +74,8 @@ class _ChatPageState extends State<ChatPage> {
   int _windowStart = 0;
   static const _initialWindow = 12;
 
-  /// 流式正文：SSE delta 只进 buffer，最多每 90ms 刷进 notifier；
-  /// 列表里的流式气泡单独监听，不随每个 delta 重建整页。
+  /// 流式正文：SSE `text` delta 只进 buffer（reasoning/tool 不进），最多每 90ms 刷进 notifier；
+  /// 列表里的流式气泡单独监听，不随每个 delta 重建整页。buffer 为空即「还没有正文」。
   final StringBuffer _streaming = StringBuffer();
   final ValueNotifier<String> _streamingText = ValueNotifier<String>('');
   static const _streamFlushInterval = Duration(milliseconds: 90);
@@ -92,7 +114,8 @@ class _ChatPageState extends State<ChatPage> {
     _t0 = DateTime.now();
     _model = widget.session.model;
     // 列表页的 running 只做乐观值：首个 snapshot 到达后一律以服务端为准。
-    _live = widget.session.running ? LiveState.running : LiveState.idle;
+    // 还没见到正文，先按「思考中」显示（快照/正文一到立刻细分）。
+    _live = widget.session.running ? LiveState.thinking : LiveState.idle;
     _scroll.addListener(_onScroll);
     final initial = widget.initial;
     if (initial != null) {
@@ -190,24 +213,33 @@ class _ChatPageState extends State<ChatPage> {
               }
             }
             _flushStreaming();
-            _setLive(event.active ? LiveState.running : LiveState.idle);
+            // 快照里有正文就是「回复中」，否则还在思考/工具阶段。
+            _setLive(
+              event.active
+                  ? (_streaming.isEmpty ? LiveState.thinking : LiveState.replying)
+                  : LiveState.idle,
+            );
             _ensureEvents();
             _followIfAtBottom();
           case LiveEventKind.delta:
             _snapshotTimer?.cancel();
-            _setLive(LiveState.running);
+            _setLive(LiveState.replying);
             _streaming.write(event.delta ?? '');
             if (_awayFromBottom) _unseen.value += 1;
-            // 首个 delta 直接出字（替换打字指示器），之后才按 90ms 合并。
+            // 首个 delta 直接出字（从「思考中」切到「回复中」），之后才按 90ms 合并。
             if (_streamingText.value.isEmpty) {
               _flushStreaming();
             } else {
               _scheduleStreamFlush();
             }
             _followIfAtBottom();
+          case LiveEventKind.reasoning:
+            // 只有思考、没有正文：停在「思考中」；正文一到就转「回复中」。
+            _snapshotTimer?.cancel();
+            if (_streaming.isEmpty) _setLive(LiveState.thinking);
           case LiveEventKind.tool:
             _snapshotTimer?.cancel();
-            _setLive(LiveState.running);
+            if (_streaming.isEmpty) _setLive(LiveState.thinking);
           case LiveEventKind.settled:
             // 收尾时立刻 flush，避免最后一段 delta 卡在定时器里被丢掉。
             _snapshotTimer?.cancel();
@@ -320,10 +352,11 @@ class _ChatPageState extends State<ChatPage> {
     if (_streamingText.value != text) _streamingText.value = text;
   }
 
+  /// SSE 断开后的兜底：每 1.2s 重取一次历史，最多 40 拍；已加载的消息一律不清空。
   void _startPolling() {
     _poll?.cancel();
     var ticks = 0;
-    _poll = Timer.periodic(const Duration(milliseconds: 1500), (timer) async {
+    _poll = Timer.periodic(const Duration(milliseconds: 1200), (timer) async {
       if (!mounted || ticks++ > 40) {
         timer.cancel();
         return;
@@ -439,13 +472,38 @@ class _ChatPageState extends State<ChatPage> {
     ];
   }
 
+  /// 列表首格：状态胶囊 + 流式正文。只有这一格监听 delta，整页不随 token 重建。
+  /// 轮询中（failed）只留胶囊：buffer 里那半句正文已不可信，等重新载入的历史为准。
+  Widget _liveSlot(ThemeData theme) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _LiveCapsule(state: _live),
+        if (_live.generating)
+          ValueListenableBuilder<String>(
+            valueListenable: _streamingText,
+            builder: (context, text, _) => text.isEmpty
+                ? const SizedBox.shrink()
+                : Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: SelectableText(
+                      text,
+                      style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
+                    ),
+                  ),
+          ),
+      ],
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final visible = _all.length - _windowStart;
-    final running = _live == LiveState.running;
-    // 三点/流式气泡只在 running 时占位：idle 会话的列表里绝不出现动画行。
-    final streaming = running ? 1 : 0;
+    final generating = _live.generating;
+    // 状态胶囊只在 thinking/replying/failed 时占位：待机会话的列表里绝不出现动画行。
+    final slot = _live.hasCapsule ? 1 : 0;
     return Scaffold(
       appBar: AppBar(
         title: ChatTitle(
@@ -454,7 +512,7 @@ class _ChatPageState extends State<ChatPage> {
         ),
         actions: [
           IconButton(
-            onPressed: running ? _cancel : null,
+            onPressed: generating ? _cancel : null,
             icon: const Icon(Icons.stop_circle_outlined),
             tooltip: '中止当前生成',
           ),
@@ -492,8 +550,9 @@ class _ChatPageState extends State<ChatPage> {
         children: [
           ChatInfoBar(
             session: _summary,
-            running: running,
+            running: generating,
             liveOk: _live != LiveState.failed,
+            statusLabel: _live.capsuleLabel,
             botName: widget.botName,
             avatarUrl: widget.avatarUrl,
             debugMetrics: _debugMetrics(),
@@ -514,7 +573,7 @@ class _ChatPageState extends State<ChatPage> {
                       ],
                     ),
                   )
-                : _all.isEmpty && !running
+                : _all.isEmpty && _live == LiveState.idle
                 ? Center(
                     child: Text(
                       '这个会话还没有消息',
@@ -533,25 +592,11 @@ class _ChatPageState extends State<ChatPage> {
                       24 + MediaQuery.paddingOf(context).bottom,
                     ),
                     cacheExtent: 200,
-                    itemCount: visible + streaming + (_windowStart > 0 ? 1 : 0),
+                    itemCount: visible + slot + (_windowStart > 0 ? 1 : 0),
                     itemBuilder: (context, index) {
                       var cursor = index;
-                      if (streaming == 1) {
-                        if (cursor == 0) {
-                          // 只有这一格监听 delta；整页不随 token 重建。
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                            child: ValueListenableBuilder<String>(
-                              valueListenable: _streamingText,
-                              builder: (context, text, _) => text.isEmpty
-                                  ? const _TypingIndicator()
-                                  : SelectableText(
-                                      text,
-                                      style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
-                                    ),
-                            ),
-                          );
-                        }
+                      if (slot == 1) {
+                        if (cursor == 0) return _liveSlot(theme);
                         cursor -= 1;
                       }
                       if (cursor < visible) {
@@ -574,15 +619,61 @@ class _ChatPageState extends State<ChatPage> {
   }
 }
 
-/// 运行时还没收到首个 delta：三个错峰呼吸的圆点，占 reverse 列表的第 0 项。
-class _TypingIndicator extends StatefulWidget {
-  const _TypingIndicator();
+/// 实时状态胶囊：待机不出现；「思考中」挂三点呼吸，「回复中」「轮询中」保持静态。
+/// 动画随胶囊一起挂载/销毁——正文流入时不再有动画和长文本抢注意力。
+class _LiveCapsule extends StatelessWidget {
+  const _LiveCapsule({required this.state});
+
+  final LiveState state;
 
   @override
-  State<_TypingIndicator> createState() => _TypingIndicatorState();
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final label = state.capsuleLabel;
+    if (label == null) return const SizedBox.shrink();
+    final thinking = state == LiveState.thinking;
+    final failed = state == LiveState.failed;
+    final accent = failed ? scheme.error : scheme.primary;
+    return Container(
+      padding: EdgeInsets.fromLTRB(10, 4, thinking ? 6 : 10, 4),
+      decoration: BoxDecoration(
+        color: failed
+            ? scheme.errorContainer.withValues(alpha: 0.3)
+            : scheme.primary.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        spacing: 6,
+        children: [
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              fontSize: 11,
+              height: 1.2,
+              letterSpacing: 0.2,
+              color: accent,
+            ),
+          ),
+          if (thinking) _ThinkingDots(color: accent),
+        ],
+      ),
+    );
+  }
 }
 
-class _TypingIndicatorState extends State<_TypingIndicator> with SingleTickerProviderStateMixin {
+/// 三个错峰呼吸的圆点：只在「思考中」里挂载。
+class _ThinkingDots extends StatefulWidget {
+  const _ThinkingDots({required this.color});
+
+  final Color color;
+
+  @override
+  State<_ThinkingDots> createState() => _ThinkingDotsState();
+}
+
+class _ThinkingDotsState extends State<_ThinkingDots> with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 1100),
@@ -596,35 +687,29 @@ class _TypingIndicatorState extends State<_TypingIndicator> with SingleTickerPro
 
   @override
   Widget build(BuildContext context) {
-    final color = Theme.of(context).colorScheme.onSurfaceVariant;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: AnimatedBuilder(
-        animation: _controller,
-        builder: (context, _) => Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (var i = 0; i < 3; i++)
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 2.5, vertical: 4),
-                child: Opacity(
-                  opacity:
-                      0.25 +
-                      0.75 *
-                          (0.5 +
-                              0.5 *
-                                  math.sin(
-                                    2 * math.pi * (_controller.value - i * 0.18),
-                                  )),
-                  child: Container(
-                    width: 6,
-                    height: 6,
-                    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-                  ),
-                ),
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) => Row(
+        mainAxisSize: MainAxisSize.min,
+        spacing: 3,
+        children: [
+          for (var i = 0; i < 3; i++)
+            Opacity(
+              opacity:
+                  0.25 +
+                  0.75 *
+                      (0.5 +
+                          0.5 *
+                              math.sin(
+                                2 * math.pi * (_controller.value - i * 0.18),
+                              )),
+              child: Container(
+                width: 4,
+                height: 4,
+                decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
               ),
-          ],
-        ),
+            ),
+        ],
       ),
     );
   }

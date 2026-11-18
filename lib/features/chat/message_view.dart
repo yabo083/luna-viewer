@@ -412,8 +412,9 @@ class _ChatImageState extends State<_ChatImage> {
   }
 }
 
-/// 框架/系统消息（`form != message` 或 `source.kind == plugin`）：不属于对话左右任一方，
-/// 居中收成一行胶囊标题，点开看全文。旧的 `form: notice` 也走这一条路径。
+/// 框架/系统消息（`form != message` 或 `source.kind == plugin`）：不属于对话左右任一方。
+/// 标题是居中胶囊（`[xxx]` 或首行 + 行数/字符数），正文在下方卡片里左对齐：
+/// 按空行分段、裸 JSON/URL 等宽、超过 12 行折叠。旧的 `form: notice` 也走这一条路径。
 class _FrameworkNotice extends StatefulWidget {
   const _FrameworkNotice({required this.text});
 
@@ -424,22 +425,22 @@ class _FrameworkNotice extends StatefulWidget {
 }
 
 class _FrameworkNoticeState extends State<_FrameworkNotice> {
-  bool _open = false;
+  static const _previewLines = 12;
 
-  /// 标题取首个非空行：wake / turn 装配这类长文本不该整段顶在列表里。
-  String get _title {
-    for (final line in widget.text.split('\n')) {
-      final trimmed = line.trim();
-      if (trimmed.isNotEmpty) return trimmed;
-    }
-    return '系统消息';
-  }
+  bool _open = false;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final style = theme.textTheme.labelSmall?.copyWith(
+    final notice = _Notice.parse(widget.text);
+    final foldable = notice.lines.length > _previewLines;
+    final shown = foldable && !_open
+        ? notice.lines.sublist(0, _previewLines)
+        : notice.lines;
+    final hidden = notice.lines.length - shown.length;
+    final paragraphs = _Notice.paragraphs(shown);
+    final titleStyle = theme.textTheme.labelSmall?.copyWith(
       color: scheme.onSurfaceVariant,
       height: 1.35,
     );
@@ -448,61 +449,215 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.86),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            InkWell(
-              borderRadius: BorderRadius.circular(20),
-              onTap: () => setState(() => _open = !_open),
-              child: Container(
-                margin: const EdgeInsets.symmetric(vertical: 4),
-                padding: const EdgeInsets.fromLTRB(10, 5, 8, 5),
-                decoration: BoxDecoration(
-                  color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.subdirectory_arrow_right,
-                      size: 14,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                    const SizedBox(width: 4),
-                    Flexible(
-                      child: Text(
-                        _title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: style,
+            // 只有标题行居中；正文卡片保持左对齐的阅读起点。
+            Center(
+              child: InkWell(
+                borderRadius: BorderRadius.circular(20),
+                onTap: foldable ? () => setState(() => _open = !_open) : null,
+                child: Container(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  padding: const EdgeInsets.fromLTRB(10, 5, 8, 5),
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.subdirectory_arrow_right,
+                        size: 14,
+                        color: scheme.onSurfaceVariant,
                       ),
-                    ),
-                    const SizedBox(width: 2),
-                    Icon(
-                      _open ? Icons.expand_less : Icons.expand_more,
-                      size: 14,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ],
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          notice.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: titleStyle,
+                        ),
+                      ),
+                      if (notice.meta.isNotEmpty) ...[
+                        const SizedBox(width: 5),
+                        Text(
+                          notice.meta,
+                          style: titleStyle?.copyWith(
+                            fontSize: 10,
+                            color: scheme.onSurfaceVariant.withValues(alpha: 0.65),
+                          ),
+                        ),
+                      ],
+                      if (foldable) ...[
+                        const SizedBox(width: 2),
+                        Icon(
+                          _open ? Icons.expand_less : Icons.expand_more,
+                          size: 14,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
             ),
-            if (_open)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-                child: SelectableText(
-                  widget.text,
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                    height: 1.5,
-                  ),
+            if (paragraphs.isNotEmpty)
+              Container(
+                margin: const EdgeInsets.only(top: 2, bottom: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (var i = 0; i < paragraphs.length; i++)
+                      Padding(
+                        // 段间距 8；最后一段把间距让给折叠按钮。
+                        padding: EdgeInsets.only(
+                          bottom: i < paragraphs.length - 1 || foldable ? 8 : 0,
+                        ),
+                        child: _paragraph(paragraphs[i], theme, scheme),
+                      ),
+                    if (foldable)
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton(
+                          onPressed: () => setState(() => _open = !_open),
+                          style: TextButton.styleFrom(
+                            padding: EdgeInsets.zero,
+                            minimumSize: const Size(0, 26),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            visualDensity: VisualDensity.compact,
+                            textStyle: theme.textTheme.labelSmall,
+                          ),
+                          child: Text(_open ? '收起' : '展开全部（还有 $hidden 行）'),
+                        ),
+                      ),
+                  ],
                 ),
               ),
           ],
         ),
       ),
     );
+  }
+
+  /// 一段正文：整段 JSON 解析后按缩进等宽排，整段裸链接也等宽，其余走小号正文。
+  Widget _paragraph(String text, ThemeData theme, ColorScheme scheme) {
+    final body = theme.textTheme.bodySmall?.copyWith(
+      color: scheme.onSurfaceVariant,
+      height: 1.5,
+    );
+    final mono = theme.textTheme.labelSmall?.copyWith(
+      fontFamily: 'monospace',
+      fontSize: 11,
+      height: 1.45,
+      color: scheme.onSurfaceVariant,
+    );
+    final json = _Notice.prettyJson(text);
+    if (json != null) return SelectableText(json, style: mono);
+    if (_Notice.isUrlList(text)) return SelectableText(text, style: mono);
+    return SelectableText(text, style: body);
+  }
+}
+
+/// 框架消息的文本解析：抽出结构标题，丢掉首行的 `---` 与尾部空行，剩余行按空行分段。
+class _Notice {
+  const _Notice(this.title, this.lines);
+
+  final String title;
+
+  /// 正文行：`[xxx]` 标题行不进正文；`---` 分隔线只做视觉标记。
+  final List<String> lines;
+
+  static final _bracketTitle = RegExp(r'^\[[^\]]+\]$');
+  static final _rule = RegExp(r'^(-{3,}|\*{3,}|_{3,})$');
+  static final _url = RegExp(r'^https?://\S+$');
+
+  static _Notice parse(String raw) {
+    final source = raw.split('\n');
+    var start = 0;
+    var ruled = false;
+    while (start < source.length) {
+      final line = source[start].trim();
+      if (line.isEmpty) {
+        start += 1;
+        continue;
+      }
+      if (!_rule.hasMatch(line)) break;
+      ruled = true;
+      start += 1;
+    }
+    if (start >= source.length) return const _Notice('系统消息', []);
+    final first = source[start].trim();
+    final rest = source.sublist(start);
+    // `[memory recall]` 这类首行、以及 `---` 分隔线之后的首行都是结构头：
+    // 抽成标题并从正文去掉；普通首行只当标题预览，展开时正文仍保留全文。
+    if (ruled || _bracketTitle.hasMatch(first)) {
+      return _Notice(first, _trimTrailing(rest.sublist(1)));
+    }
+    return _Notice(first, _trimTrailing(rest));
+  }
+
+  static List<String> _trimTrailing(List<String> lines) {
+    var end = lines.length;
+    while (end > 0 && lines[end - 1].trim().isEmpty) {
+      end -= 1;
+    }
+    return lines.sublist(0, end);
+  }
+
+  /// 标题后缀：多行给行数，单行给字符数。
+  String get meta {
+    if (lines.isEmpty) return '';
+    if (lines.length > 1) return '· ${lines.length} 行';
+    final length = lines.first.trim().length;
+    return length == 0 ? '' : '· $length 字';
+  }
+
+  /// 空行分段，段内保留换行；段间 8px 由调用方补。
+  static List<String> paragraphs(List<String> lines) {
+    final out = <String>[];
+    final buffer = StringBuffer();
+    for (final line in lines) {
+      if (line.trim().isEmpty) {
+        if (buffer.isNotEmpty) {
+          out.add(buffer.toString());
+          buffer.clear();
+        }
+        continue;
+      }
+      if (buffer.isNotEmpty) buffer.write('\n');
+      buffer.write(line.trimRight());
+    }
+    if (buffer.isNotEmpty) out.add(buffer.toString());
+    return out;
+  }
+
+  /// 整段是 JSON：解析后按两空格缩进重排；解析失败（含 `[xxx]` 这类非 JSON 方括号）返回 null。
+  static String? prettyJson(String text) {
+    final trimmed = text.trim();
+    final object = trimmed.startsWith('{') && trimmed.endsWith('}');
+    final array = trimmed.startsWith('[') && trimmed.endsWith(']');
+    if (!object && !array) return null;
+    try {
+      return const JsonEncoder.withIndent('  ').convert(jsonDecode(trimmed));
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// 整段是一行一个的裸链接。
+  static bool isUrlList(String text) {
+    final links = [
+      for (final line in text.split('\n'))
+        if (line.trim().isNotEmpty) line.trim(),
+    ];
+    return links.isNotEmpty && links.every(_url.hasMatch);
   }
 }
 

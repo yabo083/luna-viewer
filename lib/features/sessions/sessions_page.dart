@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/capability/sessions_repository.dart';
+import '../../core/capability/traffic_repository.dart';
 import '../../core/model/models.dart';
 import '../../core/store/connection_store.dart';
 import '../../core/transport/api_client.dart';
@@ -13,6 +14,7 @@ import '../../core/update/update_checker.dart';
 import '../chat/assistant_avatar.dart';
 import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
+import '../traffic/traffic_page.dart';
 
 class SessionsPage extends StatefulWidget {
   const SessionsPage({
@@ -156,6 +158,16 @@ class _SessionsPageState extends State<SessionsPage> {
     switch (picked) {
       case 'theme':
         await _pickTheme();
+      case 'traffic':
+        if (!mounted) return;
+        await Navigator.of(context).push(
+          CupertinoPageRoute<void>(
+            builder: (_) => TrafficPage(
+              repo: TrafficRepository(_api),
+              onUnauthorized: widget.onDisconnect,
+            ),
+          ),
+        );
       case 'update':
         final update = await UpdateChecker.check();
         if (!mounted) return;
@@ -206,6 +218,14 @@ class _SessionsPageState extends State<SessionsPage> {
                 }),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: () => Navigator.pop(context, 'theme'),
+              ),
+              const _SheetSectionLabel('记录'),
+              ListTile(
+                leading: const Icon(Icons.receipt_long_outlined),
+                title: const Text('消息记录'),
+                subtitle: const Text('指令等未进入会话的入站消息'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.pop(context, 'traffic'),
               ),
               const _SheetSectionLabel('更新'),
               ListTile(
