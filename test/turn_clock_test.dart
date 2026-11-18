@@ -29,7 +29,10 @@ void main() {
       expect(recent.first.elapsed, const Duration(seconds: 8));
       expect(recent[1].elapsed, const Duration(seconds: 5));
       expect(recent[2].elapsed, const Duration(seconds: 5));
-      final sum = recent.fold(Duration.zero, (total, phase) => total + phase.elapsed);
+      final sum = recent.fold(
+        Duration.zero,
+        (total, phase) => total + phase.elapsed,
+      );
       expect(sum, greaterThan(const Duration(seconds: 8)));
     });
 
@@ -109,10 +112,18 @@ void main() {
     final now = DateTime.fromMillisecondsSinceEpoch(1000000);
 
     test('信号早到多少就回填多少，超过 3s 一律不信任', () {
-      expect(turnStartLead(now.subtract(const Duration(milliseconds: 500)), now),
-          const Duration(milliseconds: 500));
-      expect(turnStartLead(now.subtract(const Duration(seconds: 30)), now), Duration.zero);
-      expect(turnStartLead(now.add(const Duration(seconds: 5)), now), Duration.zero);
+      expect(
+        turnStartLead(now.subtract(const Duration(milliseconds: 500)), now),
+        const Duration(milliseconds: 500),
+      );
+      expect(
+        turnStartLead(now.subtract(const Duration(seconds: 30)), now),
+        Duration.zero,
+      );
+      expect(
+        turnStartLead(now.add(const Duration(seconds: 5)), now),
+        Duration.zero,
+      );
       expect(turnStartLead(null, now), Duration.zero);
     });
 
@@ -224,7 +235,9 @@ void main() {
       expect(view.total, const Duration(milliseconds: 27200));
       expect(view.phase, isNull);
       expect(
-        view.recent.map((phase) => '${phase.name} ${phase.elapsed.inMilliseconds}'),
+        view.recent.map(
+          (phase) => '${phase.name} ${phase.elapsed.inMilliseconds}',
+        ),
         ['reply 3500', '思考 2600', 'tool_search 100'],
       );
     });
@@ -260,16 +273,27 @@ void main() {
         '1m04s · draw 12.3s',
       );
       expect(
-        turnLineLabel(const TurnClockView(total: Duration(milliseconds: 3200), phase: '思考',
-            phaseElapsed: Duration(milliseconds: 3200))),
+        turnLineLabel(
+          const TurnClockView(
+            total: Duration(milliseconds: 3200),
+            phase: '思考',
+            phaseElapsed: Duration(milliseconds: 3200),
+          ),
+        ),
         '3.2s · 思考 3.2s',
       );
     });
 
     test('阶段间隙只显示总时长；中止显示「已中止」', () {
-      expect(turnLineLabel(const TurnClockView(total: Duration(seconds: 12))), '12.0s');
       expect(
-        turnLineLabel(const TurnClockView(total: Duration(seconds: 12)), aborted: true),
+        turnLineLabel(const TurnClockView(total: Duration(seconds: 12))),
+        '12.0s',
+      );
+      expect(
+        turnLineLabel(
+          const TurnClockView(total: Duration(seconds: 12)),
+          aborted: true,
+        ),
         '已中止 12.0s',
       );
     });
@@ -277,22 +301,18 @@ void main() {
 
   group('phaseHistogram', () {
     test('每段占比 = 阶段耗时 / 整轮（并行时之和可以超过 1）', () {
-      final shares = phaseHistogram(
-        const [
-          TurnPhaseRecord('draw', Duration(seconds: 5)),
-          TurnPhaseRecord('reply', Duration(seconds: 3)),
-        ],
-        const Duration(seconds: 10),
-      );
+      final shares = phaseHistogram(const [
+        TurnPhaseRecord('draw', Duration(seconds: 5)),
+        TurnPhaseRecord('reply', Duration(seconds: 3)),
+      ], const Duration(seconds: 10));
       expect(shares.map((share) => share.share), [0.5, 0.3]);
       expect(shares.first.name, 'draw');
     });
 
     test('总时长为 0 时占比归零，不除零', () {
-      final shares = phaseHistogram(
-        const [TurnPhaseRecord('思考', Duration(seconds: 3))],
-        Duration.zero,
-      );
+      final shares = phaseHistogram(const [
+        TurnPhaseRecord('思考', Duration(seconds: 3)),
+      ], Duration.zero);
       expect(shares.single.share, 0);
     });
   });
@@ -305,8 +325,77 @@ void main() {
         TurnPhaseRecord('draw', Duration(milliseconds: 39400)),
       ]);
       expect(groups.map(phaseGroupLabel), ['draw ×2 51.4s', 'reply 2.0s']);
-      expect(groups.first.spans.map((span) => span.inMilliseconds), [12000, 39400]);
+      expect(groups.first.spans.map((span) => span.inMilliseconds), [
+        12000,
+        39400,
+      ]);
       expect(groups.first.count, 2);
+    });
+  });
+
+  group('中止与迟到信号', () {
+    test('freeze 立即定格：之后的 settled/delivered 不再让读数增长', () {
+      var clock = const Duration(seconds: 1);
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start();
+      clock = const Duration(seconds: 5);
+      turn.phase('draw');
+      turn.freeze();
+      expect(turn.view.value!.finished, isTrue);
+      expect(turn.view.value!.total, const Duration(seconds: 4));
+
+      clock = const Duration(seconds: 9);
+      turn.stopped();
+      turn.delivered();
+      turn.phase('reply');
+      expect(turn.view.value!.total, const Duration(seconds: 4));
+      expect(turn.view.value!.active, isEmpty);
+    });
+
+    test('刚收表 1s 内迟到的 mark 不重开一轮（避免 0.0s）', () {
+      var clock = const Duration(seconds: 1);
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start();
+      clock = const Duration(seconds: 6);
+      turn.stopped();
+      turn.delivered();
+      expect(turn.view.value!.finished, isTrue);
+
+      clock = const Duration(seconds: 6, milliseconds: 400);
+      turn.start();
+      expect(turn.view.value!.finished, isTrue);
+      expect(turn.view.value!.total, const Duration(seconds: 5));
+
+      // 真下一轮（超过 1s）照常开表。
+      clock = const Duration(seconds: 9);
+      turn.start();
+      expect(turn.view.value!.finished, isFalse);
+      expect(turn.view.value!.total, Duration.zero);
+    });
+
+    test('折叠态并列显示两个并行阶段，超过两条收成 +N', () {
+      const two = TurnClockView(
+        total: Duration(seconds: 24),
+        active: [
+          TurnPhaseRecord('draw', Duration(milliseconds: 12300)),
+          TurnPhaseRecord('reply', Duration(milliseconds: 1600)),
+        ],
+      );
+      expect(turnLineLabel(two), '24.0s · draw 12.3s · reply 1.6s');
+
+      const three = TurnClockView(
+        total: Duration(seconds: 24),
+        active: [
+          TurnPhaseRecord('draw', Duration(seconds: 12)),
+          TurnPhaseRecord('reply', Duration(seconds: 1)),
+          TurnPhaseRecord('思考', Duration(seconds: 3)),
+        ],
+      );
+      expect(turnLineLabel(three), '24.0s · draw 12.0s · reply 1.0s +1');
     });
   });
 }

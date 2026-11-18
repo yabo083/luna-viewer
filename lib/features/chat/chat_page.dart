@@ -124,6 +124,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   StreamSubscription<SessionEvent>? _eventsSub;
   bool _eventsStarted = false;
+  Timer? _eventsRetry;
   bool _frameworkStarted = false;
 
   /// `/events` 的续传游标（`<sessionId>:<n>`）：订阅时只补日志 head 之后的帧。
@@ -198,6 +199,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 本轮里是否已经有 bot 外发消息落库：有就说明真实气泡已经在了，骨架可直接撤。
   bool _outboundInRound = false;
+
+  /// 本轮新落库的外发消息 id（按到达顺序）：脚注只盖在本轮的最后一颗气泡上，
+  /// 不能回头改写上一轮那条——否则会算出 0.0s 这种假读数。
+  final List<String> _roundOutboundIds = <String>[];
 
   /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
   /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
@@ -322,6 +327,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _unseen.dispose();
     _liveSub?.cancel();
     _eventsSub?.cancel();
+    _eventsRetry?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
     _snapshotTimer?.cancel();
@@ -346,7 +352,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   void _ensurePolling() {
     final needed = _foreground && _routeVisible && (!_loaded || _polling);
     if (needed) {
-      _pollTimer ??= Timer.periodic(_pollInterval, (_) => unawaited(_pollTick()));
+      _pollTimer ??= Timer.periodic(
+        _pollInterval,
+        (_) => unawaited(_pollTick()),
+      );
     } else {
       _stopPolling();
     }
@@ -419,7 +428,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _probeTimer?.cancel();
     _probeDeadline?.cancel();
     _probeStartedAt = DateTime.now();
-    _probeTimer = Timer.periodic(_probeInterval, (_) => unawaited(_probeTick()));
+    _probeTimer = Timer.periodic(
+      _probeInterval,
+      (_) => unawaited(_probeTick()),
+    );
     _probeDeadline = Timer(_probeSpan, _stopProbe);
     unawaited(_probeTick());
   }
@@ -505,7 +517,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     if (bot == null) return;
     setState(() {
       _botName = bot.name;
-      _botAvatar = absoluteResourceUrl(widget.base, BotIdentity.avatarFor(widget.base));
+      _botAvatar = absoluteResourceUrl(
+        widget.base,
+        BotIdentity.avatarFor(widget.base),
+      );
     });
     // 消息头像按消息 id 缓存了 Widget：身份更新后丢一次，右侧气泡才会换上真实头像。
     _itemCache.clear();
@@ -516,7 +531,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 最新一页（首次进入、重载、失败重试共用）。已经通过实时流进来的更新消息不会被丢掉。
   Future<void> _load() async {
     try {
-      final page = await widget.platform.messages(widget.conversationKey, limit: _pageSize);
+      final page = await widget.platform.messages(
+        widget.conversationKey,
+        limit: _pageSize,
+      );
       if (!mounted) return;
       _netMs ??= _since();
       setState(() {
@@ -574,7 +592,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       final transcript = await widget.repo.transcript(session.id);
       if (!mounted) return;
       // 日志 head：`/events` 从这里续传，否则整段历史重放会被当成本轮（见 [_startEvents]）。
-      _eventsSince = '${session.id}:${transcript.length > 0 ? transcript.length - 1 : 0}';
+      _eventsSince =
+          '${session.id}:${transcript.length > 0 ? transcript.length - 1 : 0}';
       final log = transcript.messages;
       // 平台消息正文 → 时间：日志里的平台消息有时没时戳，框架块也要靠它定锚。
       final platformTimes = <String, DateTime>{};
@@ -587,7 +606,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       for (var i = 0; i < log.length; i++) {
         final message = log[i];
         if (message.isFramework) continue;
-        at[i] = message.time ?? platformTimes[noticeKey(message.bodyMarkdown.trim())];
+        at[i] =
+            message.time ??
+            platformTimes[noticeKey(message.bodyMarkdown.trim())];
       }
       // 反向扫一遍：每条日志后面第一条平台消息的时间，给「前面还没有消息」的框架块当锚点。
       final following = List<DateTime?>.filled(log.length, null);
@@ -604,7 +625,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         final text = message.bodyMarkdown.trim();
         if (text.isEmpty) continue;
         if (message.isFramework) {
-          entries.add(_notice(message.id, text, message.time ?? _anchor(previous, following[i])));
+          entries.add(
+            _notice(
+              message.id,
+              text,
+              message.time ?? _anchor(previous, following[i]),
+            ),
+          );
         } else {
           previous = at[i] ?? previous;
         }
@@ -639,12 +666,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     return following == null || after.isBefore(following) ? after : previous;
   }
 
-  static TimelineNotice _notice(String id, String text, DateTime? time) => TimelineNotice(
-    // 服务端 id 优先：日志与 `/events` 同一条消息靠它去重。
-    id: id.isNotEmpty ? id : 'framework-${noticeKey(text).hashCode}',
-    text: text,
-    time: time,
-  );
+  static TimelineNotice _notice(String id, String text, DateTime? time) =>
+      TimelineNotice(
+        // 服务端 id 优先：日志与 `/events` 同一条消息靠它去重。
+        id: id.isNotEmpty ? id : 'framework-${noticeKey(text).hashCode}',
+        text: text,
+        time: time,
+      );
 
   /// 增量框架块没有时戳时的锚点：最近一条平台消息之后 1ms（一条消息都没有才用本机时钟）。
   DateTime _afterLatest() {
@@ -658,53 +686,83 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final session = _session;
     if (_eventsStarted || session == null || !_transcriptLoaded) return;
     _eventsStarted = true;
-    _eventsSub = widget.repo.events(session.id, since: _eventsSince).listen(
-      (event) {
-        if (!mounted) return;
-        // 增量窗口失效：框架块的本地增量不可信，重取一次日志。
-        if (event.truncated) {
-          unawaited(_loadFramework(force: true));
-          return;
-        }
-        // mark：轮次与阶段的权威打点（`agent/input-enqueued` / `engine/activity` / …）。
-        final mark = event.name;
-        if (mark != null) {
-          _onMark(mark, event.data ?? const <String, Object?>{}, event.time);
-          return;
-        }
-        final message = event.message;
-        if (message == null) return;
-        // tool-result 落库 = 那次工具调用真的结束了：阶段耗时按这一刻收尾。
-        // 工具之后模型还要再想一步，所以除 reply 外都接着开「思考」——
-        // reply 之后这一轮就该收尾了，再挂个思考是假的。
-        for (final block in message.blocks) {
-          if (block.type != 'tool-result') continue;
-          final closed = _clock.phaseFinished();
-          if (closed != null && closed != replyPhase) _clock.phase(thinkingPhase);
-        }
-        if (!message.isFramework) return;
-        final text = message.bodyMarkdown.trim();
-        if (text.isEmpty) return;
-        final id = message.id.isNotEmpty ? message.id : 'framework-${noticeKey(text).hashCode}';
-        if (!_frameworkIds.add(id)) return;
-        // 服务端没给时戳时用「最近一条平台消息 + 1ms」，而不是本机时钟：
-        // 它早于这一轮的回复，设备时钟偏快也不会让框架块越过回复落到底部。
-        final time = message.time ?? _afterLatest();
-        setState(() {
-          // 按时间插进框架列表，而不是无条件追加：补发的旧条目不会跑到最新。
-          // 渲染时由 `mergeTimeline` 与平台消息合并，落在视口上方的不动滚动位置。
-          final next = orderNotices([
-            ..._framework,
-            TimelineNotice(id: id, text: text, time: time),
-          ]);
-          _framework = next.length > _frameworkCap
-              ? next.sublist(next.length - _frameworkCap)
-              : next;
-        });
-      },
-      onError: (Object _) {},
-      cancelOnError: true,
-    );
+    _eventsSub = widget.repo
+        .events(session.id, since: _eventsSince)
+        .listen(
+          (event) {
+            if (!mounted) return;
+            // 续传游标：任何一帧都推进它，断线重连不会把上一轮的 mark 再放一遍。
+            final id = event.id;
+            if (id != null && id.isNotEmpty) _eventsSince = id;
+            // 单帧坏数据（解析缺口、服务端新形状）不能打断整条流，否则计时会永远没有阶段。
+            try {
+              _onSessionEvent(event);
+            } catch (_) {}
+          },
+          onError: (Object _) {
+            _eventsSub = null;
+            _restartEvents();
+          },
+          onDone: () {
+            _eventsSub = null;
+            _restartEvents();
+          },
+          cancelOnError: true,
+        );
+  }
+
+  /// 事件流断了就重来（`/events` 是长连接，切网/半死对它无解）：
+  /// 游标是最后收到的帧 id，重放只补断口之后的条目。
+  void _restartEvents() {
+    if (!mounted || _eventsRetry != null) return;
+    _eventsRetry = Timer(const Duration(seconds: 2), () {
+      _eventsRetry = null;
+      if (!mounted) return;
+      _eventsStarted = false;
+      _startEvents();
+    });
+  }
+
+  void _onSessionEvent(SessionEvent event) {
+    // 增量窗口失效：服务端随后会补最后 N 条，这里不用重取日志。
+    if (event.truncated) return;
+    // mark：轮次与阶段的权威打点（`agent/input-enqueued` / `engine/activity` / …）。
+    final mark = event.name;
+    if (mark != null) {
+      _onMark(mark, event.data ?? const <String, Object?>{}, event.time);
+      return;
+    }
+    final message = event.message;
+    if (message == null) return;
+    // tool-result 落库 = 那次工具调用真的结束了：阶段耗时按这一刻收尾。
+    // 工具之后模型还要再想一步，所以除 reply 外都接着开「思考」——
+    // reply 之后这一轮就该收尾了，再挂个思考是假的。
+    for (final block in message.blocks) {
+      if (block.type != 'tool-result') continue;
+      final closed = _clock.phaseFinished();
+      if (closed != null && closed != replyPhase) _clock.phase(thinkingPhase);
+    }
+    if (!message.isFramework) return;
+    final text = message.bodyMarkdown.trim();
+    if (text.isEmpty) return;
+    final id = message.id.isNotEmpty
+        ? message.id
+        : 'framework-${noticeKey(text).hashCode}';
+    if (!_frameworkIds.add(id)) return;
+    // 服务端没给时戳时用「最近一条平台消息 + 1ms」，而不是本机时钟：
+    // 它早于这一轮的回复，设备时钟偏快也不会让框架块越过回复落到底部。
+    final time = message.time ?? _afterLatest();
+    setState(() {
+      // 按时间插进框架列表，而不是无条件追加：补发的旧条目不会跑到最新。
+      // 渲染时由 `mergeTimeline` 与平台消息合并，落在视口上方的不动滚动位置。
+      final next = orderNotices([
+        ..._framework,
+        TimelineNotice(id: id, text: text, time: time),
+      ]);
+      _framework = next.length > _frameworkCap
+          ? next.sublist(next.length - _frameworkCap)
+          : next;
+    });
   }
 
   /// 更早一页：游标是最早一条的时间，服务端返回它之前的一页。
@@ -754,7 +812,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   void _onPlatformEvent(PlatformEvent event) {
     if (!mounted) return;
     // 两边都归一：插件帧可能是 `route:r-x:user:y`，构造参数可能是原键。
-    if (normalizeConversationKey(event.key) != normalizeConversationKey(widget.conversationKey)) {
+    if (normalizeConversationKey(event.key) !=
+        normalizeConversationKey(widget.conversationKey)) {
       return;
     }
     final message = event.message;
@@ -767,12 +826,16 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (message.outbound) {
         _stopProbe();
         _setLive(LiveState.idle);
-        // bot 的发言真的落到平台存储了：终点的一半，另一半是 `running=false`。
+        // 顺序要紧：先记下「本轮已有外发」，再收表——收表会同步触发骨架撤场判断。
+        _outboundInRound = true;
+        _roundOutboundIds.add(message.id);
         _clock.delivered();
         _verifyTurnEnd();
-        // 骨架与真实气泡的交接：本轮已有外发 → 骨架直接撤；冻结期里晚到 → 也立刻撤。
-        _outboundInRound = true;
-        if (_skeleton == _SkeletonPhase.holding) _removeSkeleton();
+        // bot 的第一条气泡上屏 = 这一轮的活动结束，骨架立刻让位（不再等 hold）。
+        if (_skeleton == _SkeletonPhase.running ||
+            _skeleton == _SkeletonPhase.holding) {
+          _removeSkeleton();
+        }
       } else {
         _armRoundProbe();
       }
@@ -806,14 +869,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       return true;
     }
     final next = [..._messages];
-    final index = next.indexWhere((existing) => existing.time.isAfter(message.time));
+    final index = next.indexWhere(
+      (existing) => existing.time.isAfter(message.time),
+    );
     next.insert(index < 0 ? next.length : index, message);
     _messages = next;
     return false;
   }
 
   String? get _bearer {
-    final raw = widget.headers['authorization'] ?? widget.headers['Authorization'];
+    final raw =
+        widget.headers['authorization'] ?? widget.headers['Authorization'];
     if (raw == null) return null;
     const prefix = 'bearer ';
     final value = raw.trim();
@@ -842,107 +908,111 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _liveDown();
     });
     _liveSub?.cancel();
-    _liveSub = widget.repo.live(session.id).listen(
-      (event) {
-        if (!mounted) return;
-        _lastLiveAt = DateTime.now();
-        // 流在说话：兜底探测立刻让位。
-        if (_probeStartedAt != null || _probeDelay != null) _stopProbe();
-        _liveMs ??= _since();
-        switch (event.kind) {
-          case LiveEventKind.snapshot:
-            // 权威帧：带 attempt 才在跑；没有 attempt 就立刻回到 idle 并清掉残留文本。
-            _snapshotSeen = true;
-            _snapshotTimer?.cancel();
-            _flushTimer?.cancel();
-            _flushTimer = null;
-            _streaming.clear();
-            // 流已接上：轮询兜底退场，信息栏回到真实阶段。
-            if (_polling) {
-              setState(() => _polling = false);
-              _ensurePolling();
+    _liveSub = widget.repo
+        .live(session.id)
+        .listen(
+          (event) {
+            if (!mounted) return;
+            _lastLiveAt = DateTime.now();
+            // 流在说话：兜底探测立刻让位。
+            if (_probeStartedAt != null || _probeDelay != null) _stopProbe();
+            _liveMs ??= _since();
+            switch (event.kind) {
+              case LiveEventKind.snapshot:
+                // 权威帧：带 attempt 才在跑；没有 attempt 就立刻回到 idle 并清掉残留文本。
+                _snapshotSeen = true;
+                _snapshotTimer?.cancel();
+                _flushTimer?.cancel();
+                _flushTimer = null;
+                _streaming.clear();
+                // 流已接上：轮询兜底退场，信息栏回到真实阶段。
+                if (_polling) {
+                  setState(() => _polling = false);
+                  _ensurePolling();
+                }
+                for (final part in event.parts) {
+                  if (part['type'] == 'text' && part['delta'] is String) {
+                    _streaming.write(part['delta'] as String);
+                  }
+                }
+                _flushStreaming();
+                // 起点：首个 active snapshot（比平台消息更早、更准）。
+                // 空 attempt 的权威快照 = 这一轮已经停了，交给终点判定等最后的投递。
+                if (event.active) {
+                  _clock.start();
+                } else {
+                  _clock.stopped();
+                }
+                // 快照里有正文就是「回复中」，否则还在思考/工具阶段。
+                _setLive(
+                  event.active
+                      ? (_streaming.isEmpty
+                            ? LiveState.thinking
+                            : LiveState.replying)
+                      : LiveState.idle,
+                );
+                _followIfAtBottom();
+              case LiveEventKind.delta:
+                _snapshotTimer?.cancel();
+                // 正文到了：思考阶段收尾，reply 阶段开表（两者都在同一轮里）。
+                _clock.endPhase(thinkingPhase);
+                _clock.phase(replyPhase);
+                _setLive(LiveState.replying);
+                _streaming.write(event.delta ?? '');
+                // 首个 delta 直接出字（从「思考中」切到「回复中」），之后才按 90ms 合并。
+                if (_streamingText.value.isEmpty) {
+                  _flushStreaming();
+                } else {
+                  _scheduleStreamFlush();
+                }
+                _followIfAtBottom();
+              case LiveEventKind.reasoning:
+                // 只有思考、没有正文：停在「思考中」；正文一到就转「回复中」。
+                _snapshotTimer?.cancel();
+                _clock.phase(thinkingPhase);
+                if (_streaming.isEmpty) _setLive(LiveState.thinking);
+              case LiveEventKind.tool:
+                _snapshotTimer?.cancel();
+                // 模型开始吐工具参数：这次调用的阶段从这里开表，思考让位。
+                // 计时在 `tool-result` 落库那一帧收尾（见 [_startEvents]）。
+                _clock.endPhase(thinkingPhase);
+                final tool = event.toolName;
+                _clock.phase(tool == null || tool.isEmpty ? 'tool' : tool);
+                if (_streaming.isEmpty) _setLive(LiveState.thinking);
+              case LiveEventKind.settled:
+                // 收尾时立刻 flush，避免最后一段 delta 卡在定时器里被丢掉。
+                // 落库的那条由 `platform/stream` 送来，这里不重取历史。
+                // 一次 attempt 结束只收阶段，**不是**整轮终点：投递与后续 step 还可能在跑。
+                _snapshotTimer?.cancel();
+                _clock.attemptSettled();
+                _flushTimer?.cancel();
+                _flushTimer = null;
+                _flushStreaming();
+                _streaming.clear();
+                _streamingText.value = '';
+                if (_awayFromBottom) _unseen.value += 1;
+                _setLive(LiveState.idle);
+              case LiveEventKind.lagged:
+                _flushTimer?.cancel();
+                _flushTimer = null;
+                _flushStreaming();
+                _streaming.clear();
+                _streamingText.value = '';
+                _setLive(LiveState.idle);
             }
-            for (final part in event.parts) {
-              if (part['type'] == 'text' && part['delta'] is String) {
-                _streaming.write(part['delta'] as String);
-              }
-            }
-            _flushStreaming();
-            // 起点：首个 active snapshot（比平台消息更早、更准）。
-            // 空 attempt 的权威快照 = 这一轮已经停了，交给终点判定等最后的投递。
-            if (event.active) {
-              _clock.start();
-            } else {
-              _clock.stopped();
-            }
-            // 快照里有正文就是「回复中」，否则还在思考/工具阶段。
-            _setLive(
-              event.active
-                  ? (_streaming.isEmpty ? LiveState.thinking : LiveState.replying)
-                  : LiveState.idle,
-            );
-            _followIfAtBottom();
-          case LiveEventKind.delta:
-            _snapshotTimer?.cancel();
-            // 正文到了：思考阶段收尾，reply 阶段开表（两者都在同一轮里）。
-            _clock.endPhase(thinkingPhase);
-            _clock.phase(replyPhase);
-            _setLive(LiveState.replying);
-            _streaming.write(event.delta ?? '');
-            // 首个 delta 直接出字（从「思考中」切到「回复中」），之后才按 90ms 合并。
-            if (_streamingText.value.isEmpty) {
-              _flushStreaming();
-            } else {
-              _scheduleStreamFlush();
-            }
-            _followIfAtBottom();
-          case LiveEventKind.reasoning:
-            // 只有思考、没有正文：停在「思考中」；正文一到就转「回复中」。
-            _snapshotTimer?.cancel();
-            _clock.phase(thinkingPhase);
-            if (_streaming.isEmpty) _setLive(LiveState.thinking);
-          case LiveEventKind.tool:
-            _snapshotTimer?.cancel();
-            // 模型开始吐工具参数：这次调用的阶段从这里开表，思考让位。
-            // 计时在 `tool-result` 落库那一帧收尾（见 [_startEvents]）。
-            _clock.endPhase(thinkingPhase);
-            final tool = event.toolName;
-            _clock.phase(tool == null || tool.isEmpty ? 'tool' : tool);
-            if (_streaming.isEmpty) _setLive(LiveState.thinking);
-          case LiveEventKind.settled:
-            // 收尾时立刻 flush，避免最后一段 delta 卡在定时器里被丢掉。
-            // 落库的那条由 `platform/stream` 送来，这里不重取历史。
-            // 一次 attempt 结束只收阶段，**不是**整轮终点：投递与后续 step 还可能在跑。
-            _snapshotTimer?.cancel();
-            _clock.attemptSettled();
-            _flushTimer?.cancel();
-            _flushTimer = null;
-            _flushStreaming();
-            _streaming.clear();
-            _streamingText.value = '';
-            if (_awayFromBottom) _unseen.value += 1;
-            _setLive(LiveState.idle);
-          case LiveEventKind.lagged:
-            _flushTimer?.cancel();
-            _flushTimer = null;
-            _flushStreaming();
-            _streaming.clear();
-            _streamingText.value = '';
-            _setLive(LiveState.idle);
-        }
-      },
-      onError: (Object _) {
-        if (!mounted) return;
-        // `/live` 断了就没法知道具体阶段：退回 3s 轮询读 running，
-        // 信息栏显示「轮询中」，消息仍由平台流补上。
-        _liveDown();
-      },
-      onDone: () {
-        if (!mounted) return;
-        _liveDown();
-      },
-      cancelOnError: true,
-    );
+          },
+          onError: (Object _) {
+            if (!mounted) return;
+            // `/live` 断了就没法知道具体阶段：退回 3s 轮询读 running，
+            // 信息栏显示「轮询中」，消息仍由平台流补上。
+            _liveDown();
+          },
+          onDone: () {
+            if (!mounted) return;
+            _liveDown();
+          },
+          cancelOnError: true,
+        );
   }
 
   /// 重建 `/live`：手机切网或长时间待机后，旧连接常常收不到 FIN，
@@ -1020,15 +1090,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final tail = name.split('/').last.toLowerCase();
     // 信号自带的落库时间：比本机收到早多少，起点就往前回填多少（上限 3s，挡时钟偏差）。
     final lead = turnStartLead(at, DateTime.now());
-    // 本轮起点：入队（没唤醒的不算，它不会真的开一轮）。
+    // 入队只是「有消息等着跑」，不一定马上开轮（`target:"next-turn"` 要等定时/唤醒）。
+    // 计时起点交给真正开跑的 `agent/input-admitted` / `engine/activity` / `prompt`。
     if (tail == 'input-enqueued') {
       if (data['wakeup'] == false) return;
-      _clock.start(lead: lead);
+      _armRoundProbe();
       return;
     }
     // 工具打点（实例暂未使用）。
-    final toolish = tail == 'tool-before' || tail == 'tool-start' || tail == 'tool-call';
-    final toolDone = tail == 'tool-after' || tail == 'tool-end' || tail == 'tool-result';
+    final toolish =
+        tail == 'tool-before' || tail == 'tool-start' || tail == 'tool-call';
+    final toolDone =
+        tail == 'tool-after' || tail == 'tool-end' || tail == 'tool-result';
     if (toolish || toolDone) {
       final raw = data['tool'] ?? data['toolName'] ?? data['name'];
       if (toolish) {
@@ -1060,8 +1133,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _clock.delivered();
         _verifyTurnEnd();
       case 'agent/input-admitted' || 'request/context':
-        // 输入被 agent 收下 / 请求已装配：进一步证明这一轮真的在跑。
-        _clock.start(lead: lead);
+        // 输入被 agent 收下 / 请求已装配：这一轮真的开跑了（也是中止冻结的解锁点）。
+        _clock.start(lead: lead, force: true);
     }
   }
 
@@ -1070,11 +1143,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 计时通知：只在「开轮 / 收表」两个转折上动列表，tick 本身不触发页面重建。
   void _onClockTick() {
     final view = _clock.view.value;
-    if (view == null || !mounted) return;
+    if (!mounted || view == null) return;
     if (!view.finished) {
-      if (_skeleton == _SkeletonPhase.none) _startSkeleton();
+      // 新的一轮（读数从 0 起）：上一轮的外发标记不能带进来。
+      if (view.total < const Duration(milliseconds: 400)) {
+        _outboundInRound = false;
+        _roundOutboundIds.clear();
+      }
+      // 本轮已经出过真实气泡：不再补骨架（等 running=false 收表即可）。
+      if (_skeleton == _SkeletonPhase.none && !_outboundInRound) _startSkeleton();
       return;
     }
+    // 骨架可能在本轮第一条外发气泡上屏时就被撤掉（比收表早），
+    // 脚注不能跟着骨架一起走：收表这一刻无条件补上。
+    if (_stampTurnEnd(view)) setState(() {});
     if (_skeleton == _SkeletonPhase.running) _endSkeleton(view);
   }
 
@@ -1085,6 +1167,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _skeletonFade = null;
     _skeletonAborted = false;
     _outboundInRound = false;
+    _roundOutboundIds.clear();
     _skeletonResend = _lastInboundText();
     setState(() => _skeleton = _SkeletonPhase.running);
     // 只在插入时滚一次；之后不因 tick 滚动。
@@ -1104,24 +1187,33 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       return;
     }
     setState(() => _skeleton = _SkeletonPhase.holding);
-    _skeletonHold = Timer(const Duration(milliseconds: 1800), _fadeSkeleton);
+    // 总时长已写进气泡脚注：骨架只停 0.5s 让眼睛跟上，不长期占位。
+    _skeletonHold = Timer(const Duration(milliseconds: 500), _fadeSkeleton);
   }
 
-  /// 最后一条 out 气泡脚注：`turnStartedAt`/`turnEndedAt` 是本地推算，服务端没有。
-  void _stampTurnEnd(TurnClockView view) {
+  /// 本轮最后一颗 out 气泡的脚注：`turnStartedAt`/`turnEndedAt` 是本地推算，服务端没有。
+  /// 只写本轮新落库的消息（[_roundOutboundIds]）：改写上一轮那条会得出 0.0s 的假读数。
+  bool _stampTurnEnd(TurnClockView view) {
+    if (_roundOutboundIds.isEmpty) return false;
+    if (view.total < const Duration(milliseconds: 200)) return false;
     PlatformMessage? last;
-    for (var i = _messages.length - 1; i >= 0; i--) {
-      if (_messages[i].outbound) {
-        last = _messages[i];
-        break;
+    for (final id in _roundOutboundIds.reversed) {
+      for (var i = _messages.length - 1; i >= 0; i--) {
+        final message = _messages[i];
+        if (message.id == id) {
+          last = message;
+          break;
+        }
       }
+      if (last != null) break;
     }
-    if (last == null) return;
+    if (last == null || last.turnEndedAt != null) return false;
     final end = DateTime.now();
     last.turnEndedAt = end;
     last.turnStartedAt = end.subtract(view.total);
     // 缓存键含脚注：丢掉这条消息的旧 Widget，脚注才会出现在气泡右下。
     _itemCache.removeWhere((key, _) => key.startsWith('m:${last!.id}:'));
+    return true;
   }
 
   String? _lastInboundText() {
@@ -1170,7 +1262,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (mounted) setState(() => _cancelling = false);
     }
   }
-
 
   void _scheduleStreamFlush() {
     _flushTimer ??= Timer(_streamFlushInterval, () {
@@ -1231,6 +1322,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (!mounted) return;
       // 中止的这一轮保留骨架：显示「已中止 12.4s」+ 重新发送，而不是让用户滚回去找。
       if (_skeleton == _SkeletonPhase.running) _skeletonAborted = true;
+      // 先冻结读数再清状态：否则骨架上的数字会一直涨到服务端 settled 才停。
+      _clock.freeze();
       _flushTimer?.cancel();
       _flushTimer = null;
       _streaming.clear();
@@ -1341,7 +1434,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       ),
       NoticeItem(:final notice) => (
         'n:${notice.id}',
-        () => FrameworkNoticeCard(foldKey: notice.id, text: notice.text, open: _noticeOpen),
+        () => FrameworkNoticeCard(
+          foldKey: notice.id,
+          text: notice.text,
+          open: _noticeOpen,
+        ),
       ),
       MessageItem(:final message, :final showHeader) => (
         'm:${message.id}:$showHeader:${message.turnEndedAt?.millisecondsSinceEpoch ?? 0}',
@@ -1358,9 +1455,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           senderName: message.outbound ? _botName : message.userName,
           time: message.time,
           // 骨架撤掉后总时长留在这条气泡的右下角（本地观测，重开页面就没有了）。
+          // 与 `HH:mm` 并排时加单位，避免把 9.4s 读成时钟。
           footnote: switch (message.turnStartedAt) {
             final start? when message.turnEndedAt != null =>
-              formatElapsed(message.turnEndedAt!.difference(start)),
+              '用时 ${formatElapsed(message.turnEndedAt!.difference(start))}',
             _ => null,
           },
           showHeader: showHeader,
@@ -1441,8 +1539,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           // 会话级操作只对已加载会话开放：未加载的会话在服务端没有日志与 agent。
           if (_loaded) ...[
             IconButton(
-              // 生成中（思考或回复）就能按；请求在途时置灰，避免连点两次 cancel。
-              onPressed: _live.generating && !_cancelling ? _cancel : null,
+              // 只要有生成在等就保持高亮：`/live` 常常不出帧，不能拿它决定按钮死活。
+              // 没有生成时按下去是幂等的（服务端 `cancel` 返回 ok，界面不动）。
+              onPressed: _cancelling ? null : _cancel,
               icon: const Icon(Icons.stop_circle_outlined),
               tooltip: '中止当前生成',
             ),
@@ -1508,7 +1607,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(_error!, style: TextStyle(color: theme.colorScheme.error)),
+                        Text(
+                          _error!,
+                          style: TextStyle(color: theme.colorScheme.error),
+                        ),
                         const SizedBox(height: 12),
                         FilledButton(onPressed: _load, child: const Text('重试')),
                       ],
@@ -1591,7 +1693,10 @@ class _SkeletonBubble extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final screen = MediaQuery.sizeOf(context).width;
-    final width = math.min(screen * 0.6, screen * 0.86 - (_avatarSize + _avatarGap));
+    final width = math.min(
+      screen * 0.6,
+      screen * 0.86 - (_avatarSize + _avatarGap),
+    );
     return AnimatedSize(
       duration: const Duration(milliseconds: 160),
       curve: Curves.easeOut,
@@ -1617,8 +1722,12 @@ class _SkeletonBubble extends StatelessWidget {
                           width: width,
                           padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
                           decoration: BoxDecoration(
-                            color: scheme.surfaceContainerHighest.withValues(alpha: 0.3),
-                            border: Border.all(color: scheme.primary.withValues(alpha: 0.38)),
+                            color: scheme.surfaceContainerHighest.withValues(
+                              alpha: 0.3,
+                            ),
+                            border: Border.all(
+                              color: scheme.primary.withValues(alpha: 0.38),
+                            ),
                             borderRadius: const BorderRadius.only(
                               topLeft: Radius.circular(16),
                               topRight: Radius.circular(4),
@@ -1626,15 +1735,7 @@ class _SkeletonBubble extends StatelessWidget {
                               bottomRight: Radius.circular(16),
                             ),
                           ),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _skeletonBar(theme, widthFactor: 1),
-                              const SizedBox(height: 7),
-                              _skeletonBar(theme, widthFactor: 0.62),
-                            ],
-                          ),
+                          child: const _SkeletonBars(),
                         ),
                         Positioned(
                           top: -7,
@@ -1646,13 +1747,17 @@ class _SkeletonBubble extends StatelessWidget {
                             child: ValueListenableBuilder<TurnClockView?>(
                               valueListenable: clock,
                               builder: (context, view, _) => Text(
-                                view == null ? '' : turnLineLabel(view, aborted: aborted),
+                                view == null
+                                    ? ''
+                                    : turnLineLabel(view, aborted: aborted),
                                 maxLines: 1,
                                 style: theme.textTheme.labelSmall?.copyWith(
                                   fontSize: 11.5,
                                   height: 1.2,
                                   color: scheme.onSurfaceVariant,
-                                  fontFeatures: const [FontFeature.tabularFigures()],
+                                  fontFeatures: const [
+                                    FontFeature.tabularFigures(),
+                                  ],
                                 ),
                               ),
                             ),
@@ -1666,7 +1771,8 @@ class _SkeletonBubble extends StatelessWidget {
                         child: TextButton.icon(
                           onPressed: onResend,
                           icon: const Icon(Icons.refresh, size: 16),
-                          label: const Text('重新发送'),
+                          // 走的是 `POST /steer`（把原文追加进会话继续跑），不是平台的「发送消息」。
+                          label: const Text('重发这条'),
                           style: TextButton.styleFrom(
                             visualDensity: VisualDensity.compact,
                             padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -1685,15 +1791,70 @@ class _SkeletonBubble extends StatelessWidget {
       ),
     );
   }
+}
 
-  Widget _skeletonBar(ThemeData theme, {required double widthFactor}) => FractionallySizedBox(
+/// 骨架灰条：横向流光在两条灰条上穿过，读起来是「正在生成」而不是一张静态占位。
+/// 动画只在骨架挂载期间跑，骨架撤场即随 State 销毁。
+class _SkeletonBars extends StatefulWidget {
+  const _SkeletonBars();
+
+  @override
+  State<_SkeletonBars> createState() => _SkeletonBarsState();
+}
+
+class _SkeletonBarsState extends State<_SkeletonBars>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1400),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final base = scheme.onSurfaceVariant.withValues(alpha: 0.14);
+    final highlight = scheme.onSurfaceVariant.withValues(alpha: 0.34);
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final head = _controller.value * 1.6 - 0.3;
+        double at(double stop) => stop.clamp(0.0, 1.0);
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _bar(base, highlight, head, at, widthFactor: 1),
+            const SizedBox(height: 7),
+            _bar(base, highlight, head, at, widthFactor: 0.62),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _bar(
+    Color base,
+    Color highlight,
+    double head,
+    double Function(double) at, {
+    required double widthFactor,
+  }) => FractionallySizedBox(
     alignment: Alignment.centerLeft,
     widthFactor: widthFactor,
     child: Container(
       height: 9,
       decoration: BoxDecoration(
-        color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.18),
         borderRadius: BorderRadius.circular(6),
+        gradient: LinearGradient(
+          colors: [base, highlight, base],
+          stops: [at(head - 0.35), at(head), at(head + 0.35)],
+        ),
       ),
     ),
   );
@@ -1718,8 +1879,9 @@ class _DayDivider extends StatelessWidget {
     final label = switch (diff) {
       0 => '今天',
       1 => '昨天',
-      _ => '${day.year}-${day.month.toString().padLeft(2, '0')}-'
-          '${day.day.toString().padLeft(2, '0')}',
+      _ =>
+        '${day.year}-${day.month.toString().padLeft(2, '0')}-'
+            '${day.day.toString().padLeft(2, '0')}',
     };
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
@@ -1806,7 +1968,8 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     }
   }
 
-  static String _keyOf(String provider, String model) => '$provider\u0000$model';
+  static String _keyOf(String provider, String model) =>
+      '$provider\u0000$model';
 
   @override
   Widget build(BuildContext context) {
@@ -1818,7 +1981,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
       // 键盘弹出时把弹层抬到键盘之上；高度上限 70% 屏高。
       minimum: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
       child: ConstrainedBox(
-        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.7),
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+        ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1840,8 +2005,15 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                   hintStyle: theme.textTheme.bodySmall?.copyWith(
                     color: scheme.onSurfaceVariant,
                   ),
-                  prefixIcon: Icon(Icons.search, size: 18, color: scheme.onSurfaceVariant),
-                  prefixIconConstraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                  prefixIcon: Icon(
+                    Icons.search,
+                    size: 18,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  prefixIconConstraints: const BoxConstraints(
+                    minWidth: 36,
+                    minHeight: 36,
+                  ),
                   suffixIcon: _search.text.isEmpty
                       ? null
                       : IconButton(
@@ -1853,8 +2025,13 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                           icon: const Icon(Icons.close, size: 16),
                         ),
                   filled: true,
-                  fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                  fillColor: scheme.surfaceContainerHighest.withValues(
+                    alpha: 0.5,
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 10,
+                  ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                     borderSide: BorderSide.none,
@@ -1867,7 +2044,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
                 child: Text(
                   _error!,
-                  style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: scheme.error,
+                  ),
                 ),
               ),
             Flexible(
@@ -1882,8 +2061,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                   }
                   if (snapshot.hasError) {
                     final error = snapshot.error;
-                    final message =
-                        error is ApiFailure ? '${error.code}：${error.message}' : '$error';
+                    final message = error is ApiFailure
+                        ? '${error.code}：${error.message}'
+                        : '$error';
                     return Padding(
                       padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
                       child: Column(
@@ -1906,7 +2086,8 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                       ),
                     );
                   }
-                  final grouped = snapshot.data ?? const <String, List<ModelOption>>{};
+                  final grouped =
+                      snapshot.data ?? const <String, List<ModelOption>>{};
                   final rows = _rowsFor(grouped, query);
                   if (rows.isEmpty) {
                     return Padding(
@@ -1940,7 +2121,10 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
 
   /// 弹层是「分组头 + 模型行」的扁平序列，交给 `ListView.builder` 按需构建。
   /// 搜索只过滤模型行；分组头跟着存活的分组走，计数是过滤后的数量。
-  List<_PickRow> _rowsFor(Map<String, List<ModelOption>> grouped, String query) {
+  List<_PickRow> _rowsFor(
+    Map<String, List<ModelOption>> grouped,
+    String query,
+  ) {
     final rows = <_PickRow>[];
     for (final entry in grouped.entries) {
       final models = query.isEmpty
@@ -2002,7 +2186,10 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-      decoration: BoxDecoration(color: fill, borderRadius: BorderRadius.circular(20)),
+      decoration: BoxDecoration(
+        color: fill,
+        borderRadius: BorderRadius.circular(20),
+      ),
       child: Text(
         label,
         style: theme.textTheme.labelSmall?.copyWith(
@@ -2020,13 +2207,17 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     final scheme = theme.colorScheme;
     final current = widget.current;
     final selected =
-        current != null && current.provider == provider && current.model == option.id;
+        current != null &&
+        current.provider == provider &&
+        current.model == option.id;
     final saving = _pending == _keyOf(provider, option.id);
     final name = option.name?.trim();
     final title = name == null || name.isEmpty
         ? shortModelLabel(ModelRef(provider, option.id))
         : name;
-    final subtitle = option.id == title || option.label == option.id ? null : option.id;
+    final subtitle = option.id == title || option.label == option.id
+        ? null
+        : option.id;
     return ListTile(
       dense: true,
       visualDensity: const VisualDensity(horizontal: -2, vertical: -2),
@@ -2036,7 +2227,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
       enabled: _pending == null,
       leading: SizedBox(
         width: 22,
-        child: selected ? Icon(Icons.check, size: 18, color: scheme.primary) : null,
+        child: selected
+            ? Icon(Icons.check, size: 18, color: scheme.primary)
+            : null,
       ),
       title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: subtitle == null
@@ -2045,7 +2238,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
               subtitle,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
             ),
       trailing: saving
           ? const SizedBox(

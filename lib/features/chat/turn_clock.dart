@@ -24,14 +24,26 @@ String normalizeTurnPhase(String raw) {
   if (name.isEmpty) return thinkingPhase;
   final tail = name.split(RegExp(r'[/:.]+')).where((part) => part.isNotEmpty);
   if (tail.isNotEmpty) name = tail.last;
-  if (name.startsWith('tool-') && !name.startsWith('tool-before') && !name.startsWith('tool-after')) {
+  if (name.startsWith('tool-') &&
+      !name.startsWith('tool-before') &&
+      !name.startsWith('tool-after')) {
     name = name.substring('tool-'.length);
   }
   if (name.startsWith('tools-')) name = name.substring('tools-'.length);
   return switch (name) {
     '' => thinkingPhase,
-    'reasoning' || 'think' || 'thinking' || 'prompt' || 'generate' || 'prepare' => thinkingPhase,
-    'text' || 'assistant' || 'assistant-stream' || 'send' || 'message' || 'reply-tool' => replyPhase,
+    'reasoning' ||
+    'think' ||
+    'thinking' ||
+    'prompt' ||
+    'generate' ||
+    'prepare' => thinkingPhase,
+    'text' ||
+    'assistant' ||
+    'assistant-stream' ||
+    'send' ||
+    'message' ||
+    'reply-tool' => replyPhase,
     _ => name.length > 16 ? name.substring(0, 16) : name,
   };
 }
@@ -64,15 +76,29 @@ String formatElapsed(Duration elapsed) {
 String turnLineLabel(TurnClockView view, {bool aborted = false}) {
   final total = formatElapsed(view.total);
   if (aborted) return '已中止 $total';
-  final phase = view.phase;
-  if (phase == null) return total;
-  return '$total · $phase ${formatElapsed(view.phaseElapsed ?? Duration.zero)}';
+  final phases = view.active.isNotEmpty
+      ? [
+          for (final phase in view.active.take(2))
+            '${phase.name} ${formatElapsed(phase.elapsed)}',
+        ]
+      : [
+          if (view.phase != null)
+            '${view.phase} ${formatElapsed(view.phaseElapsed ?? Duration.zero)}',
+        ];
+  if (phases.isEmpty) return total;
+  // 并行的第三阶段起收成 `+1`，避免把边框标签撑破。
+  final extra = view.active.length > 2 ? ' +${view.active.length - 2}' : '';
+  return '$total · ${phases.join(' · ')}$extra';
 }
 
 /// 阶段直方的一段：名称、耗时、占整轮的比例。
 @immutable
 class PhaseShare {
-  const PhaseShare({required this.name, required this.elapsed, required this.share});
+  const PhaseShare({
+    required this.name,
+    required this.elapsed,
+    required this.share,
+  });
 
   final String name;
   final Duration elapsed;
@@ -89,7 +115,9 @@ List<PhaseShare> phaseHistogram(List<TurnPhaseRecord> phases, Duration total) {
       PhaseShare(
         name: phase.name,
         elapsed: phase.elapsed,
-        share: round <= 0 ? 0 : (phase.elapsed.inMilliseconds / round).clamp(0.0, 1.0),
+        share: round <= 0
+            ? 0
+            : (phase.elapsed.inMilliseconds / round).clamp(0.0, 1.0),
       ),
   ];
 }
@@ -98,7 +126,11 @@ List<PhaseShare> phaseHistogram(List<TurnPhaseRecord> phases, Duration total) {
 /// 不让同名阶段在明细里串成一长排。
 @immutable
 class PhaseGroup {
-  const PhaseGroup({required this.name, required this.total, required this.spans});
+  const PhaseGroup({
+    required this.name,
+    required this.total,
+    required this.spans,
+  });
 
   final String name;
   final Duration total;
@@ -144,6 +176,7 @@ class TurnClockView {
     required this.total,
     this.phase,
     this.phaseElapsed,
+    this.active = const [],
     this.recent = const [],
     this.finished = false,
     this.previous = false,
@@ -151,6 +184,9 @@ class TurnClockView {
 
   /// 整轮已耗时；[finished] 之后是冻结的最终值。
   final Duration total;
+
+  /// 此刻仍在跑的全部阶段（按进入顺序）。折叠态取前两条。
+  final List<TurnPhaseRecord> active;
 
   /// 当前正在进行的阶段名：折叠态只显示它（并行阶段里最近开始的那个）。
   final String? phase;
@@ -173,7 +209,8 @@ class TurnClockView {
 /// 阶段**可以并行**（`draw` 与 `reply` 可能同时在跑，`reply` 还可能重试），所以这里是
 /// 一张表而不是一个栈：每个阶段各自计时，各阶段耗时之和允许超过整轮。
 class TurnPhaseLog {
-  final LinkedHashMap<String, Duration> _active = LinkedHashMap<String, Duration>();
+  final LinkedHashMap<String, Duration> _active =
+      LinkedHashMap<String, Duration>();
   final List<TurnPhaseRecord> _done = <TurnPhaseRecord>[];
 
   /// 折叠态显示的阶段：最近进入/续期的那个。
@@ -219,7 +256,17 @@ class TurnPhaseLog {
   }
 
   /// 最近的阶段，最新在前。
-  List<TurnPhaseRecord> get recent => List<TurnPhaseRecord>.unmodifiable(_done.reversed);
+  List<TurnPhaseRecord> get recent =>
+      List<TurnPhaseRecord>.unmodifiable(_done.reversed);
+
+  /// 此刻仍在跑的阶段（按进入顺序）：折叠态一次显示两条，并行时名字不会来回跳。
+  List<TurnPhaseRecord> activeAt(Duration now) => [
+    for (final entry in _active.entries)
+      TurnPhaseRecord(
+        entry.key,
+        now < entry.value ? Duration.zero : now - entry.value,
+      ),
+  ];
 }
 
 /// 本轮终点：生成已停 + 最后一条 bot 外发已落库，取更晚的那个。
@@ -264,15 +311,17 @@ Duration turnStartLead(
 class TurnClock {
   TurnClock({
     Duration Function()? now,
-    this.tickInterval = const Duration(milliseconds: 200),
+    this.tickInterval = const Duration(milliseconds: 100),
     this.hold = const Duration(seconds: 2),
     this.deliveryGrace = const Duration(seconds: 3),
   }) : _now = now ?? _stopwatchNow();
 
   /// 只有这一枚小字监听它，页面和列表不随 tick 重建。
-  final ValueNotifier<TurnClockView?> view = ValueNotifier<TurnClockView?>(null);
+  final ValueNotifier<TurnClockView?> view = ValueNotifier<TurnClockView?>(
+    null,
+  );
 
-  /// 阶段计时精确到 0.1s，200ms 的 tick 看起来就是连续的。
+  /// 阶段计时精确到 0.1s，100ms 的 tick 让读数连续跳动，不是每 0.2s 跳一格。
   final Duration tickInterval;
 
   /// 结束后冻结时长：够看清一眼，又不至于一直占着信息栏。
@@ -289,6 +338,7 @@ class TurnClock {
   Duration? _deliveredAt;
   Duration? _end;
   bool _previous = false;
+  bool _frozen = false;
   Timer? _tick;
   Timer? _holdTimer;
 
@@ -297,7 +347,17 @@ class TurnClock {
 
   /// 本轮开始。[lead] 是信号比本地收到早的那点时间（见 [turnStartLead]）。
   /// 已经开始的一轮只接受更早的起点，不重置——同一步里 reasoning 与 tool 帧会反复报到。
-  void start({Duration lead = Duration.zero}) {
+  void start({Duration lead = Duration.zero, bool force = false}) {
+    // 中止后定格：只有明确的新一轮（`input-enqueued`，force）能重开表。
+    if (_frozen && !force) return;
+    // 刚收表的一轮：迟到的 mark（settled 之后的 delivered、下一轮的 admitted）不能重开一个 0.0s 的轮次。
+    if (!force &&
+        !running &&
+        _end != null &&
+        _now() - _end! < const Duration(seconds: 1)) {
+      return;
+    }
+    _frozen = false;
     final candidate = _now() - (lead.isNegative ? Duration.zero : lead);
     if (running) {
       final current = _start!;
@@ -320,6 +380,7 @@ class TurnClock {
   /// 某个阶段有活动：开始计时，或把已经停下的表重新打开（有新帧 = 这一轮还在跑，
   /// 上一轮的冻结读数就此让位）。
   void phase(String name) {
+    if (_frozen) return;
     if (!running) start();
     _stopAt = null;
     _phases.enter(_now(), normalizeTurnPhase(name));
@@ -350,6 +411,21 @@ class TurnClock {
     _publish();
   }
 
+  /// 用户中止：立即冻结读数（停表 + 关阶段），骨架保留「已中止 Ns」，
+  /// 之后到齐的 `settled` / `delivered` 不再让数字继续涨。
+  void freeze() {
+    if (!running) return;
+    _frozen = true;
+    final now = _now();
+    _end = now;
+    _stopAt = now;
+    _phases.leaveAll(now);
+    _stopTick();
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _publish();
+  }
+
   /// `running=false`：`engine/activity settle`、无 attempt 的快照、轮询读到的 false。
   void stopped() {
     if (!running) return;
@@ -361,7 +437,7 @@ class TurnClock {
   /// bot 的最后一条外发落库（`chat/delivered` mark / 平台流里的 `dir=out`）。
   /// 同一轮多条时取最后一条的时刻。
   void delivered() {
-    if (_start == null) return;
+    if (_frozen || _start == null) return;
     final now = _now();
     if (_deliveredAt == null || now > _deliveredAt!) _deliveredAt = now;
     if (_end != null) {
@@ -441,6 +517,7 @@ class TurnClock {
       total: now < start ? Duration.zero : now - start,
       phase: current,
       phaseElapsed: phaseStart == null ? null : now - phaseStart,
+      active: _end == null ? _phases.activeAt(now) : const [],
       recent: _phases.recent,
       finished: _end != null,
       previous: _previous,
