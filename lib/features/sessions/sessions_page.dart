@@ -6,9 +6,9 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../core/capability/platform_repository.dart';
+import '../../core/capability/platform_stream.dart';
 import '../../core/capability/sessions_repository.dart';
-import '../../core/capability/traffic_repository.dart';
-import '../../core/capability/traffic_stream.dart';
 import '../../core/model/models.dart';
 import '../../core/store/connection_store.dart';
 import '../../core/transport/api_client.dart';
@@ -17,7 +17,6 @@ import '../../core/update/update_checker.dart';
 import '../chat/assistant_avatar.dart';
 import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
-import '../traffic/traffic_page.dart';
 
 class SessionsPage extends StatefulWidget {
   const SessionsPage({
@@ -40,32 +39,34 @@ class SessionsPage extends StatefulWidget {
 class _SessionsPageState extends State<SessionsPage> {
   late final ApiClient _api = ApiClient(base: widget.connection.base, token: widget.connection.token);
   late final SessionsRepository _repo = SessionsRepository(_api);
-  final List<SessionSummary> _items = [];
+  late final PlatformRepository _platform = PlatformRepository(_api);
+
+  /// 插件侧的会话真源：列表的每一行都出自这里。
+  final List<PlatformConversation> _conversations = [];
+
+  /// `/api/sessions` 的已加载会话：只补充状态胶囊、模型与「运行中」排序，不是消息来源。
+  final List<SessionSummary> _loaded = [];
+  String? _cursor;
+  bool _loadingMore = false;
+
+  /// 实时流的帧：新会话出现、已有会话的计数/最后一条就地更新，不重排整页。
+  PlatformStream? _stream;
+  StreamSubscription<PlatformEvent>? _streamSub;
+  bool _syncing = false;
+
   final TextEditingController _search = TextEditingController();
-
-  /// 仅流量会话的原料：归一会话键 → 该会话最新的一条流量记录。
-  /// `/api/sessions` 里没有的会话靠它合成一行；已加载的会话永远优先。
-  final Map<String, TrafficEntry> _seeds = {};
-
-  /// 列表页自己也订阅一次旁路流：新会话的第一条消息不用等下拉刷新就能出现。
-  TrafficStream? _trafficStream;
-  StreamSubscription<TrafficEntry>? _trafficSub;
-
-  /// 种子表上限：服务端是内存环形缓冲，这里只留最近活跃的一批。
-  static const _seedLimit = 200;
 
   bool _searching = false;
   BotProfile? _bot;
   bool _loading = true;
   String? _error;
-  String? _cursor;
   bool _showDevInfo = false;
 
   @override
   void initState() {
     super.initState();
     _refresh();
-    _startTrafficWatch();
+    _startStream();
     _checkUpdate();
     _loadBot();
     _loadUiPrefs();
@@ -116,34 +117,40 @@ class _SessionsPageState extends State<SessionsPage> {
 
   @override
   void dispose() {
-    _trafficSub?.cancel();
-    _trafficStream?.dispose();
+    _streamSub?.cancel();
+    _stream?.dispose();
     _search.dispose();
     _api.close();
     super.dispose();
   }
 
+  /// 下拉刷新 = 全量对齐：插件会话表 + 已加载会话表一起重取。
   Future<void> _refresh() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      // 两条路并行：`/api/sessions` 给已加载会话，`/api/traffic` 给「有消息但还没加载」的会话。
-      // 后者自己吞错返回空表，所以先 await 前者：ApiFailure 原样抛给下面的分支。
-      final listing = _repo.list();
-      final snapshot = _trafficSnapshot();
-      final page = await listing;
-      final traffic = await snapshot;
+      // 已加载会话只是补充信息：这一层失败不该让列表空白（插件仍然是真源）。
+      var loaded = const <SessionSummary>[];
+      String? cursor;
+      try {
+        final page = await _repo.list();
+        loaded = page.items;
+        cursor = page.nextCursor;
+      } on ApiFailure catch (e) {
+        if (e.isUnauthorized) rethrow;
+      }
+      final conversations = await _platform.conversations();
       if (!mounted) return;
       setState(() {
-        _items
+        _loaded
           ..clear()
-          ..addAll(page.items);
-        _cursor = page.nextCursor;
-        _seeds
+          ..addAll(loaded);
+        _cursor = cursor;
+        _conversations
           ..clear()
-          ..addAll(_groupSeeds(traffic));
+          ..addAll(conversations);
       });
     } on ApiFailure catch (e) {
       if (e.isUnauthorized) {
@@ -160,112 +167,71 @@ class _SessionsPageState extends State<SessionsPage> {
     if (_bot == null) _loadBot();
   }
 
-  /// 一次拉 200 条旁路记录（服务端是内存环形缓冲，200 条覆盖最近的活跃会话）。
-  /// 端点不可用（旧实例）时返回空表：列表退化成纯 `/api/sessions`，不报错。
-  Future<List<TrafficEntry>> _trafficSnapshot() async {
+  /// 只重取会话表（详情页返回、或流里冒出未知会话时）：不动已加载会话、不动滚动位置。
+  Future<void> _syncConversations() async {
+    if (_syncing) return;
+    _syncing = true;
     try {
-      return await TrafficRepository(_api).list(limit: 200);
-    } catch (_) {
-      return const [];
+      final conversations = await _platform.conversations();
+      if (!mounted) return;
+      setState(() => _conversations
+        ..clear()
+        ..addAll(conversations));
+    } on ApiFailure {
+      // 列表已经有内容：这一拍补齐失败就等下一页/下拉刷新，不弹错。
+    } finally {
+      _syncing = false;
     }
   }
 
-  /// 按归一会话键分组，每组只留最后一条（标题与时间都取它）。
-  static Map<String, TrafficEntry> _groupSeeds(List<TrafficEntry> entries) {
-    final seeds = <String, TrafficEntry>{};
-    for (final entry in entries) {
-      final key = trafficConversationKey(entry);
-      if (key.isEmpty) continue;
-      final prev = seeds[key];
-      if (prev == null || entry.time.isAfter(prev.time)) seeds[key] = entry;
-    }
-    return seeds;
-  }
-
-  /// 仅流量会话：`/api/sessions` 里没有、但有入站消息的会话。
-  /// 已经被某个已加载会话覆盖的种子直接丢掉——同一会话不能出现两行：
-  /// 归一键相同（新插件）或频道 id 出现在该会话标题里（旧插件）都算覆盖。
-  List<SessionSummary> get _derivedSessions {
-    final loaded = {for (final item in _items) normalizeConversationKey(item.id)};
-    final loadedIds = {
-      for (final item in _items) ...candidateIdsOf(item.title),
-    };
-    final derived = <SessionSummary>[];
-    for (final entry in _seeds.values) {
-      final key = trafficConversationKey(entry);
-      if (key.isEmpty || loaded.contains(key)) continue;
-      if (_coveredByTitle(loadedIds, entry)) continue;
-      derived.add(
-        SessionSummary(
-          // 用 `route:` 前缀：详情页原样归一回来，就能和流量条目对上同一把键。
-          id: 'route:$key',
-          title: entry.channelLabel,
-          createdAt: entry.time,
-          origin: 'satori',
-          engine: '',
-          running: false,
-          trafficOnly: true,
-        ),
-      );
-    }
-    derived.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    return derived;
-  }
-
-  /// 频道 / 群号出现在某个已加载会话的标题里：那是同一个会话（旧插件没有会话键）。
-  static bool _coveredByTitle(Set<String> ids, TrafficEntry entry) {
-    if (ids.isEmpty) return false;
-    for (final value in <String?>[entry.channelId, entry.guildId]) {
-      if (value == null || value.isEmpty) continue;
-      if (ids.contains(value.toLowerCase())) return true;
-    }
-    return false;
-  }
-
-  /// 列表页也订阅旁路流：会话还没被 ChatLuna 加载时，第一条消息就能让这一行出现。
-  /// 平时它在，打开详情页会额外再开一条（列表不能因为跳转而停止更新）；
-  /// 断线退避与 404 退化都在 [TrafficStream] 内部，这里只收消息。
-  void _startTrafficWatch() {
+  /// 列表页也订阅实时流：新消息让对应行自己更新，不用下拉刷新。
+  void _startStream() {
     final token = widget.connection.token;
     if (token.isEmpty) return;
-    final stream = TrafficStream(widget.connection.base, token);
-    _trafficStream = stream;
-    _trafficSub = stream.entries.listen(_onTrafficEntry, onError: (Object _) {});
+    final stream = PlatformStream(widget.connection.base, token);
+    _stream = stream;
+    // 断线退避在 PlatformStream 内部，这里只收帧。
+    _streamSub = stream.events.listen(_onBeat, onError: (Object _) {});
   }
 
-  void _onTrafficEntry(TrafficEntry entry) {
+  void _onBeat(PlatformEvent event) {
     if (!mounted) return;
-    final key = trafficConversationKey(entry);
+    final key = normalizeConversationKey(event.key);
     if (key.isEmpty) return;
-    // 已加载的会话本来就在列表里：标题与顺序归服务端，不再种种子。
-    if (_items.any((item) => normalizeConversationKey(item.id) == key)) return;
-    if (_coveredByTitle({for (final item in _items) ...candidateIdsOf(item.title)}, entry)) {
+    final index = _conversations.indexWhere(
+      (conversation) => normalizeConversationKey(conversation.key) == key,
+    );
+    if (index < 0) {
+      // 插件里还没有这个会话（第一条消息刚到）：补一次会话表拿标题等元数据。
+      // 这是「新增一行」，不是重排整页——已加载的表与滚动位置都不动。
+      _syncConversations();
       return;
     }
-    final prev = _seeds[key];
-    if (prev != null && !entry.time.isAfter(prev.time)) return;
+    final current = _conversations[index];
+    final last = current.last;
+    final message = event.message;
+    // 重连会回放各会话最近 5 条：比手上的最后一条更早就不改这一行。
+    if (last != null && !message.time.isAfter(last.time)) return;
     setState(() {
-      _seeds[key] = entry;
-      if (_seeds.length > _seedLimit) {
-        final oldest = _seeds.entries.reduce(
-          (a, b) => a.value.time.isBefore(b.value.time) ? a : b,
-        );
-        _seeds.remove(oldest.key);
-      }
+      _conversations[index] = current.copyWith(count: current.count + 1, last: message);
     });
   }
 
   Future<void> _loadMore() async {
-    if (_cursor == null || _loading) return;
+    if (_cursor == null || _loading || _loadingMore) return;
+    _loadingMore = true;
     try {
       final page = await _repo.list(cursor: _cursor);
       if (!mounted) return;
       setState(() {
-        _items.addAll(page.items);
+        final known = {for (final session in _loaded) session.id};
+        _loaded.addAll(page.items.where((session) => !known.contains(session.id)));
         _cursor = page.nextCursor;
       });
     } on ApiFailure catch (e) {
       _toast('${e.code}：${e.message}');
+    } finally {
+      _loadingMore = false;
     }
   }
 
@@ -297,19 +263,24 @@ class _SessionsPageState extends State<SessionsPage> {
     setState(() {});
   }
 
-  /// 标题（紧凑名与原始名）、引擎、模型都要能搜到；不区分大小写。
-  bool _matches(SessionSummary session, String query) {
+  /// 会话名（插件名与原始 id）、平台、引擎、模型都要能搜到；不区分大小写。
+  bool _matches(_SessionRow row, String query) {
     final needle = query.toLowerCase();
-    final title = parseSessionTitle(session.title);
+    final session = row.session;
+    final parsed = parseSessionTitle(row.title);
     final fields = <String>[
-      session.title,
-      title.label,
-      title.tail ?? '',
-      title.compact,
-      session.engine,
-      session.model?.toString() ?? '',
+      row.title,
+      row.key,
+      parsed.label,
+      parsed.tail ?? '',
+      parsed.compact,
+      row.conversation?.platform ?? '',
+      if (session != null) session.title,
+      if (session != null) parseSessionTitle(session.title).compact,
+      if (session != null) session.engine,
+      if (session?.model case final model?) model.toString(),
     ];
-    return fields.any((field) => field.toLowerCase().contains(needle));
+    return fields.any((field) => field.isNotEmpty && field.toLowerCase().contains(needle));
   }
 
   Future<void> _openSettings() async {
@@ -322,16 +293,6 @@ class _SessionsPageState extends State<SessionsPage> {
     switch (picked) {
       case 'theme':
         await _pickTheme();
-      case 'traffic':
-        if (!mounted) return;
-        await Navigator.of(context).push(
-          CupertinoPageRoute<void>(
-            builder: (_) => TrafficPage(
-              repo: TrafficRepository(_api),
-              onUnauthorized: widget.onDisconnect,
-            ),
-          ),
-        );
       case 'update':
         final update = await UpdateChecker.check();
         if (!mounted) return;
@@ -382,14 +343,6 @@ class _SessionsPageState extends State<SessionsPage> {
                 }),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: () => Navigator.pop(context, 'theme'),
-              ),
-              const _SheetSectionLabel('记录'),
-              ListTile(
-                leading: const Icon(Icons.receipt_long_outlined),
-                title: const Text('消息记录'),
-                subtitle: const Text('指令等未进入会话的入站消息'),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () => Navigator.pop(context, 'traffic'),
               ),
               const _SheetSectionLabel('更新'),
               ListTile(
@@ -481,41 +434,34 @@ class _SessionsPageState extends State<SessionsPage> {
     }
   }
 
-  Future<void> _open(SessionSummary session) async {
-    // 先把历史取回来再推路由：详情页第一帧就有内容，不会出现「空白/残影」再加载的过程。
-    // 仅流量会话不在服务端，取历史只会拿到 404：交给详情页自己判「仅实时」模式。
-    Transcript? initial;
-    if (!session.trafficOnly) {
-      try {
-        initial = await _repo.transcript(session.id);
-      } on ApiFailure catch (e) {
-        // 404 说明会话已不在服务端（还没加载 / 已卸载）：详情页会退化成仅实时模式，
-        // 这里不该弹一条错误。
-        if (e.code != 'NOT_FOUND' && e.status != 404) _toast('${e.code}：${e.message}');
-      }
-    }
+  Future<void> _open(_SessionRow row) async {
     if (!mounted) return;
     await Navigator.of(context).push(
       // 三键导航栏没有系统边缘手势；用 Cupertino 路由把「左缘右滑返回」做进 App。
       CupertinoPageRoute<void>(
         builder: (_) => ChatPage(
           repo: _repo,
+          platform: _platform,
           base: widget.connection.base,
           headers: _api.authHeaders,
+          conversationKey: row.key,
+          title: row.title,
+          origin: row.conversation?.platform ?? row.session?.origin ?? '',
+          session: row.session,
           avatarUrl: _bot?.avatar,
           botName: _bot?.name,
-          initial: initial,
-          session: session,
           showDeveloperInfo: _showDevInfo,
         ),
       ),
     );
-    await _refresh();
+    // 详情页自己订阅了实时流；回来只补一次会话表元数据（计数/最后一条），不整页刷新。
+    await _syncConversations();
   }
 
-  Future<void> _actions(SessionSummary session) async {
-    if (session.trafficOnly) {
-      _toast('该会话尚未被 ChatLuna 加载，只能查看实时消息。');
+  Future<void> _actions(_SessionRow row) async {
+    final session = row.session;
+    if (session == null) {
+      _toast('该会话尚未被 ChatLuna 加载，只能查看消息。');
       return;
     }
     if (!session.writable) {
@@ -673,13 +619,57 @@ class _SessionsPageState extends State<SessionsPage> {
     );
   }
 
-  /// 列表页看到的全集：已加载会话在前（服务端顺序），仅流量会话按最后消息时间倒序接在后面。
-  List<SessionSummary> get _visible => [..._items, ..._derivedSessions];
+  /// 列表全集：插件会话在前（每行可能挂着一份已加载会话），已加载但插件里没有的接在后面。
+  /// 排序：运行中优先，其后按最后一条消息时间倒序。
+  List<_SessionRow> get _rows {
+    final loadedByKey = <String, SessionSummary>{};
+    for (final session in _loaded) {
+      final key = normalizeConversationKey(session.id);
+      if (key.isEmpty) continue;
+      loadedByKey.putIfAbsent(key, () => session);
+    }
+    final rows = <_SessionRow>[];
+    for (final conversation in _conversations) {
+      final key = normalizeConversationKey(conversation.key);
+      if (key.isEmpty) continue;
+      final session = loadedByKey.remove(key);
+      final last = conversation.last;
+      rows.add(
+        _SessionRow(
+          key: key,
+          title: conversation.title.isEmpty ? key : conversation.title,
+          subtitle: last?.preview,
+          count: conversation.count,
+          time: last?.time ?? session?.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0),
+          conversation: conversation,
+          session: session,
+        ),
+      );
+    }
+    // 已加载但插件里没有的会话照旧列出（标题退回 App 侧的解析规则）。
+    for (final session in loadedByKey.values) {
+      rows.add(
+        _SessionRow(
+          key: normalizeConversationKey(session.id),
+          title: parseSessionTitle(session.title).compact,
+          subtitle: null,
+          count: 0,
+          time: session.createdAt,
+          session: session,
+        ),
+      );
+    }
+    rows.sort((a, b) {
+      if (a.running != b.running) return a.running ? -1 : 1;
+      return b.time.compareTo(a.time);
+    });
+    return rows;
+  }
 
   Widget _content() {
-    final sessions = _visible;
-    if (_loading && sessions.isEmpty) return const Center(child: CircularProgressIndicator());
-    if (sessions.isEmpty) {
+    final rows = _rows;
+    if (_loading && rows.isEmpty) return const Center(child: CircularProgressIndicator());
+    if (rows.isEmpty) {
       if (_error != null) {
         return _StatusView(
           icon: Icons.cloud_off_outlined,
@@ -705,69 +695,56 @@ class _SessionsPageState extends State<SessionsPage> {
       );
     }
     final query = _search.text.trim();
-    if (query.isNotEmpty) {
-      final matches = sessions.where((item) => _matches(item, query)).toList();
-      if (matches.isEmpty) {
-        return _StatusView(
-          icon: Icons.search_off,
-          title: '没有匹配的会话',
-          message: '换个关键词，或清空搜索查看全部会话',
-          action: OutlinedButton.icon(
-            onPressed: _clearSearch,
-            icon: const Icon(Icons.backspace_outlined, size: 18),
-            label: const Text('清空搜索'),
-          ),
-        );
-      }
-      // 搜索要覆盖全部会话，所以和普通视图一样继续翻页。
-      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
-        children: [
-          for (final session in matches) _tile(session),
-          SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
-        ],
+    final shown = query.isEmpty ? rows : rows.where((row) => _matches(row, query)).toList();
+    if (shown.isEmpty) {
+      return _StatusView(
+        icon: Icons.search_off,
+        title: '没有匹配的会话',
+        message: '换个关键词，或清空搜索查看全部会话',
+        action: OutlinedButton.icon(
+          onPressed: _clearSearch,
+          icon: const Icon(Icons.backspace_outlined, size: 18),
+          label: const Text('清空搜索'),
+        ),
       );
     }
+    // 已加载会话是分页取的：列表走到末尾就补下一页，搜索要覆盖全部会话。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    // 全集已经按「运行中 → 时间」排好，这里只切两段。
+    final active = [
+      for (final row in shown)
+        if (row.running) row,
+    ];
+    final rest = [
+      for (final row in shown)
+        if (!row.running) row,
+    ];
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
       children: [
-        for (final row in _rows()) row,
+        if (active.isNotEmpty) ...[
+          _SectionHeader(label: '运行中会话', count: active.length, highlighted: true, topPadding: 8),
+          for (final row in active) _tile(row),
+        ],
+        if (rest.isNotEmpty) ...[
+          _SectionHeader(
+            label: active.isEmpty ? '全部会话' : '其他会话',
+            count: rest.length,
+            topPadding: active.isEmpty ? 8 : 12,
+          ),
+          for (final row in rest) _tile(row),
+        ],
         SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
       ],
     );
   }
 
-  /// 分组顺序：运行中 → 其他已加载（服务端时间序）→ 仅流量会话（最后消息时间倒序）。
-  /// 全集本身已经是这个顺序，这里只按 `running` 切两段，不再重排。
-  List<Widget> _rows() {
-    final sessions = _visible;
-    final active = sessions.where((item) => item.running).toList();
-    final rest = sessions.where((item) => !item.running).toList();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
-    return [
-      if (active.isNotEmpty) ...[
-        _SectionHeader(label: '运行中会话', count: active.length, highlighted: true, topPadding: 8),
-        for (final session in active) _tile(session),
-      ],
-      if (rest.isNotEmpty) ...[
-        _SectionHeader(
-          label: active.isEmpty ? '全部活跃会话' : '其他会话',
-          count: rest.length,
-          topPadding: active.isEmpty ? 8 : 12,
-        ),
-        for (final session in rest) _tile(session),
-      ],
-    ];
-  }
-
-  Widget _tile(SessionSummary session) => _SessionTile(
-    session: session,
+  Widget _tile(_SessionRow row) => _SessionTile(
+    row: row,
     avatarUrl: _bot?.avatar,
-    onTap: () => _open(session),
-    onLongPress: () => _actions(session),
+    onTap: () => _open(row),
+    onLongPress: () => _actions(row),
   );
 }
 
@@ -779,6 +756,50 @@ String _relativeTime(DateTime time) {
   if (day == today) return '今天 $hm';
   if (today.difference(day).inDays == 1) return '昨天 $hm';
   return '${time.month.toString().padLeft(2, '0')}-${time.day.toString().padLeft(2, '0')} $hm';
+}
+
+/// 列表一行：插件会话（[conversation]）与它可能对应的已加载会话（[session]）。
+/// 两者都有 = 已加载；只有 [conversation] = 插件有消息但 ChatLuna 还没加载它。
+class _SessionRow {
+  const _SessionRow({
+    required this.key,
+    required this.title,
+    required this.subtitle,
+    required this.count,
+    required this.time,
+    this.conversation,
+    this.session,
+  });
+
+  /// 归一后的会话键：打开详情页、订阅实时流都用它。
+  final String key;
+
+  /// 展示名：插件给的 title；已加载但插件里没有的会话用 App 侧的紧凑名。
+  final String title;
+
+  /// 最后一条消息的正文（压成一行）；没有消息时为 null。
+  final String? subtitle;
+
+  /// 插件统计的消息条数。
+  final int count;
+
+  /// 最后一条消息的时间；没有消息时退回已加载会话的创建时间。
+  final DateTime time;
+  final PlatformConversation? conversation;
+  final SessionSummary? session;
+
+  bool get running => session?.running ?? false;
+
+  /// 没有最后一条消息时的副标题：已加载会话退回平台/引擎/模型，未加载就没有副标题。
+  String? get fallbackSubtitle {
+    final session = this.session;
+    if (session == null) return null;
+    return [
+      session.origin,
+      if (session.engine.isNotEmpty) session.engine,
+      if (session.model != null) session.model!.toString(),
+    ].join(' · ');
+  }
 }
 
 class _SectionHeader extends StatelessWidget {
@@ -834,10 +855,11 @@ class _SectionHeader extends StatelessWidget {
   }
 }
 
-/// 会话行：运行中的左侧留 2px 色条，标题最多两行，时间用更弱的一级字重。
+/// 会话行：运行中的左侧留 2px 色条，标题最多两行，副标题是最后一条消息。
+/// 右侧是最后消息时间与插件的消息计数。
 class _SessionTile extends StatelessWidget {
   const _SessionTile({
-    required this.session,
+    required this.row,
     required this.avatarUrl,
     required this.onTap,
     required this.onLongPress,
@@ -845,7 +867,7 @@ class _SessionTile extends StatelessWidget {
 
   static const _runningDot = Color(0xFF22C55E);
 
-  final SessionSummary session;
+  final _SessionRow row;
   final String? avatarUrl;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
@@ -854,13 +876,8 @@ class _SessionTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final detail = [
-      session.origin,
-      if (session.engine.isNotEmpty) session.engine,
-      if (session.model != null) session.model!.toString(),
-      // 仅流量会话：服务端还没加载它，只有实时消息可看。
-      if (session.trafficOnly) '未加载',
-    ].join(' · ');
+    final subtitle = row.subtitle ?? row.fallbackSubtitle;
+    final showTime = row.time.millisecondsSinceEpoch > 0;
     return Stack(
       children: [
         InkWell(
@@ -878,63 +895,90 @@ class _SessionTile extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        parseSessionTitle(session.title).compact,
+                        row.title,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.titleSmall?.copyWith(
                           height: 1.25,
-                          fontWeight: session.running ? FontWeight.w600 : FontWeight.w500,
+                          fontWeight: row.running ? FontWeight.w600 : FontWeight.w500,
                         ),
                       ),
-                      const SizedBox(height: 3),
-                      Text(
-                        detail,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: scheme.onSurfaceVariant.withValues(alpha: 0.85),
+                      if (subtitle != null && subtitle.isNotEmpty) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: scheme.onSurfaceVariant.withValues(alpha: 0.85),
+                          ),
                         ),
-                      ),
+                      ],
                     ],
                   ),
                 ),
                 const SizedBox(width: 12),
                 SizedBox(
-                  width: 92,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
+                  width: 88,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Flexible(
-                        child: Text(
-                          _relativeTime(session.createdAt),
-                          maxLines: 1,
-                          softWrap: false,
-                          overflow: TextOverflow.fade,
-                          textAlign: TextAlign.end,
-                          style: theme.textTheme.labelSmall?.copyWith(
-                            color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
-                          ),
-                        ),
-                      ),
-                      if (session.running) ...[
-                        const SizedBox(width: 6),
-                        Tooltip(
-                          message: '运行中',
-                          child: Container(
-                            width: 16,
-                            height: 16,
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: _runningDot.withValues(alpha: 0.16),
-                            ),
-                            child: Container(
-                              width: 7,
-                              height: 7,
-                              decoration: const BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: _runningDot,
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          if (showTime)
+                            Flexible(
+                              child: Text(
+                                _relativeTime(row.time),
+                                maxLines: 1,
+                                softWrap: false,
+                                overflow: TextOverflow.fade,
+                                textAlign: TextAlign.end,
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                  color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
+                                ),
                               ),
+                            ),
+                          if (row.running) ...[
+                            const SizedBox(width: 6),
+                            Tooltip(
+                              message: '运行中',
+                              child: Container(
+                                width: 16,
+                                height: 16,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: _runningDot.withValues(alpha: 0.16),
+                                ),
+                                child: Container(
+                                  width: 7,
+                                  height: 7,
+                                  decoration: const BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: _runningDot,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      if (row.count > 0) ...[
+                        const SizedBox(height: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: scheme.surfaceContainerHighest.withValues(alpha: 0.8),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            '${row.count}',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              height: 1.4,
+                              fontWeight: FontWeight.w600,
+                              color: scheme.onSurfaceVariant,
                             ),
                           ),
                         ),
@@ -946,7 +990,7 @@ class _SessionTile extends StatelessWidget {
             ),
           ),
         ),
-        if (session.running)
+        if (row.running)
           Positioned(
             left: 0,
             top: 12,

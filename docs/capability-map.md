@@ -36,9 +36,17 @@
 | 多 agent | `GET /api/agents` | `[{rootSessionId,members:[…]}]` |
 | 待审批 | `GET /api/interaction/pending?routeId=` / `POST /api/interaction/answer {routeId,answer}` | 回合会挂起等待 |
 | 附件（storage） | `GET /files/:name` | 无鉴权、无 `/api` 前缀 |
-| 消息旁路记录（伴侣插件） | `GET /api/traffic?limit=&platform=&channelId=` | 入站 + 出站消息环形缓冲（`dir`），含未进入会话的指令与 bot 的框架回复 |
-| 旁路实时流（伴侣插件） | `GET /api/traffic/stream`（SSE） | `event: traffic`；先回放最近 20 条（旧→新）再实时推，15 s 一次 `: ping`；条目新增 `conversationKey`（`r-<hash>`，与会话 id 去掉 `route:`/`:user:` 后相等）与 `dir`（`in`/`out`） |
 | 工作区文件（伴侣插件） | `GET /api/workspace?path=<相对路径>` | 需 Bearer；路径限定在 `data/chatluna/agents-work`；消息里的相对 `<img src>` 走这里 |
+
+## 平台消息（伴侣插件，App 的真源）
+
+| 事 | 调用 | 说明 |
+|---|---|---|
+| 会话列表 | `GET /api/platform/conversations` | `{items:[{key,platform,selfId,channelId,guildId,kind,title,count,last}]}`，按最后消息倒序 |
+| 消息分页 | `GET /api/platform/messages?key=&limit=&before=` | 时间升序，`before` 取更早一页，`hasMore` 判定 |
+| 实时流 | `GET /api/platform/stream`（SSE） | 帧 `{key,message:{id,time,dir,userId,content}}`，连上先回放每会话最近 5 条 |
+
+App 的会话与消息都以此为准；`/api/sessions*` 只提供已加载会话的状态与操作（模型、压缩、分叉、中止）。
 
 ## 平台与 bot
 
@@ -84,6 +92,17 @@ abstract class SessionRepository {
   Future<CompactResult> compact(String id, {int? keep});
   Future<SessionSummary> fork(String id, {Object? boundary});
   Future<void> setModel(String id, ModelRef model);
+}
+
+abstract class PlatformRepository {
+  Future<List<PlatformConversation>> conversations();
+  Future<PlatformMessagePage> messages(String key, {int limit = 50, DateTime? before});
+}
+
+/// `GET /api/platform/stream`：帧 `{key,message}`，服务端不过滤，调用方按 key 过滤。
+abstract class PlatformStream {
+  Stream<PlatformEvent> get events;
+  void dispose();
 }
 
 abstract class ConfigRepository {

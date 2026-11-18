@@ -71,7 +71,6 @@ class SessionSummary {
     required this.running,
     required this.engine,
     this.model,
-    this.trafficOnly = false,
   });
 
   final String id;
@@ -81,10 +80,6 @@ class SessionSummary {
   final bool running;
   final String engine;
   final ModelRef? model;
-
-  /// 只由入站流量推导出来的会话：`/api/sessions` 里没有它（ChatLuna 还没加载），
-  /// 因此没有历史日志、没有模型、也不能中止/压缩 —— 详情页只有实时消息。
-  final bool trafficOnly;
 
   bool get writable => origin == 'web';
 
@@ -106,6 +101,143 @@ class Page<T> {
   final String? nextCursor;
 }
 
+/// `/api/platform/conversations` 的一项：伴侣插件维护的平台会话真源。
+/// App 的列表与详情都只读它；`SessionSummary` 只在会话被 ChatLuna 加载后补充状态与操作。
+class PlatformConversation {
+  const PlatformConversation({
+    required this.key,
+    required this.platform,
+    required this.selfId,
+    required this.channelId,
+    required this.guildId,
+    required this.kind,
+    required this.title,
+    required this.count,
+    required this.last,
+  });
+
+  /// 插件侧会话键：已加载会话的 id 归一化后与它相等（见 `normalizeConversationKey`）。
+  final String key;
+  final String platform;
+  final String selfId;
+  final String channelId;
+  final String? guildId;
+
+  /// 插件判定的会话形态（`group` / `private`），原样透传，只用于展示。
+  final String kind;
+
+  /// 插件给的展示名；为空时调用方退回 [key]。
+  final String title;
+
+  /// 插件统计的消息条数。
+  final int count;
+
+  /// 最后一条消息：还没有落消息的会话为 null。
+  final PlatformMessage? last;
+
+  /// 实时帧到达时只改这两项：插件是唯一知道新消息计数的地方，App 只在最后一页上推进。
+  PlatformConversation copyWith({int? count, PlatformMessage? last}) => PlatformConversation(
+    key: key,
+    platform: platform,
+    selfId: selfId,
+    channelId: channelId,
+    guildId: guildId,
+    kind: kind,
+    title: title,
+    count: count ?? this.count,
+    last: last ?? this.last,
+  );
+
+  static PlatformConversation? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final key = _platformText(json['key']).trim();
+    if (key.isEmpty) return null;
+    return PlatformConversation(
+      key: key,
+      platform: _platformText(json['platform']),
+      selfId: _platformText(json['selfId']),
+      channelId: _platformText(json['channelId']),
+      guildId: json['guildId'] == null ? null : _platformText(json['guildId']),
+      kind: _platformText(json['kind']),
+      title: _platformText(json['title']).trim(),
+      count: (json['count'] as num?)?.toInt() ?? 0,
+      last: PlatformMessage.fromJson(json['last']),
+    );
+  }
+}
+
+/// 一条平台消息：`/api/platform/messages` 的一项，也是 `platform/stream` 帧里的 `message`。
+class PlatformMessage {
+  PlatformMessage({
+    required this.id,
+    required this.time,
+    required this.outbound,
+    required this.userId,
+    required this.content,
+  });
+
+  final String id;
+  final DateTime time;
+
+  /// `dir == 'out'`：机器人自己发出的回复；否则是收到的消息。
+  final bool outbound;
+  final String userId;
+  final String content;
+
+  /// 渲染模型：出站是助手气泡（markdown + 头像）。入站不走这里——详情页把它画成纯文本气泡。
+  /// 平台消息逐条都是发言，没有框架/指令形态，因此关掉指令启发式。
+  late final ChatMessage view = ChatMessage(
+    id: id,
+    role: outbound ? 'assistant' : 'user',
+    blocks: [ChatBlock('text', {'text': content})],
+    form: 'message',
+    detectCommands: false,
+  );
+
+  /// 逐条比较用的正文：多行折成一行，供列表副标题与去重日志使用。
+  String get preview => content.replaceAll(_platformSpaces, ' ').trim();
+
+  static PlatformMessage? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final time = _platformTime(json['time']);
+    final content = _platformText(json['content'] ?? json['text']);
+    final rawId = _platformText(json['id']).trim();
+    return PlatformMessage(
+      // 缺 id 的旧数据（或半截帧）退回「时间 + 正文」，保证同一帧不会被画两遍。
+      id: rawId.isNotEmpty ? rawId : '${time.millisecondsSinceEpoch}\u0000$content',
+      time: time,
+      outbound: _platformText(json['dir']) == 'out',
+      userId: _platformText(json['userId']),
+      content: content,
+    );
+  }
+}
+
+/// `GET /api/platform/messages` 的一页：`items` 时间升序，`hasMore` 表示更早还有。
+class PlatformMessagePage {
+  const PlatformMessagePage(this.items, this.hasMore);
+
+  final List<PlatformMessage> items;
+  final bool hasMore;
+}
+
+final RegExp _platformSpaces = RegExp(r'\s+');
+
+String _platformText(Object? value) => value is String ? value : '';
+
+/// 平台时间戳：毫秒（13 位）/ 秒（10 位）数字或 ISO 串都接受。
+DateTime _platformTime(Object? raw) {
+  if (raw is num) {
+    final value = raw.toInt();
+    return DateTime.fromMillisecondsSinceEpoch(value < 100000000000 ? value * 1000 : value);
+  }
+  final text = raw?.toString().trim() ?? '';
+  if (text.isEmpty) return DateTime.fromMillisecondsSinceEpoch(0);
+  final epoch = int.tryParse(text);
+  if (epoch != null) return _platformTime(epoch);
+  return DateTime.tryParse(text) ?? DateTime.fromMillisecondsSinceEpoch(0);
+}
+
 class ChatBlock {
   const ChatBlock(this.type, this.data);
 
@@ -122,6 +254,7 @@ class ChatMessage {
     required this.blocks,
     this.form = '',
     bool isFramework = false,
+    this.detectCommands = true,
   }) : _declaredFramework = isFramework;
 
   final String id;
@@ -135,9 +268,13 @@ class ChatMessage {
   /// （`source.kind == 'plugin'`）。
   final bool _declaredFramework;
 
+  /// 是否套用「指令文本」启发式（见 [isCommandMessage]）。只对会话日志成立：
+  /// 平台消息（[PlatformMessage]）是逐条发言，`chatluna …` 也只是用户说的一句话。
+  final bool detectCommands;
+
   /// 框架消息：不属于对话双方，渲染成居中的弱化块。
   /// 除服务端声明外，用户角色下的指令/帮助文本也并进来（见 [isCommandMessage]）。
-  bool get isFramework => _declaredFramework || isCommandMessage;
+  bool get isFramework => _declaredFramework || (detectCommands && isCommandMessage);
 
   bool get isUser => role == 'user';
 
@@ -165,23 +302,6 @@ class ChatMessage {
       isFramework: (form.isNotEmpty && form != 'message') || sourceKind == 'plugin',
     );
   }
-
-  /// 合成消息：不存在于会话日志、由页面侧旁路数据生成的一条（`/api/traffic` 的指令与
-  /// 机器人已发出的回复）。[form] 标明来源；[framework] 为假时按普通消息渲染（bot 回复）。
-  /// `id` 由调用方保证唯一，去重靠它。
-  factory ChatMessage.synthetic({
-    required String id,
-    required String form,
-    required String text,
-    String role = 'user',
-    bool framework = true,
-  }) => ChatMessage(
-    id: id,
-    role: role,
-    blocks: [ChatBlock('text', {'text': text})],
-    form: form,
-    isFramework: framework,
-  );
 
   /// 角色引擎把正文包在 `<message>…</message>` 里；图片是 `<img src="…">`；`<status/>` 是状态栏，不展示。
   /// 输出是 markdown：`<img>` 已转成 `![](url)`，其余标签剥掉（`<br>` 保留）。

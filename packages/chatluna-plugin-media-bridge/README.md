@@ -1,6 +1,9 @@
 # chatluna-plugin-media-bridge
 
-ChatLuna v2（Cordis 4）单文件插件：把实例 agent 工作区里的文件通过**带鉴权**的 HTTP 路由暴露给客户端。
+ChatLuna v2（Cordis 4）单文件插件，提供两件事：
+
+1. 把实例 agent 工作区里的文件通过**带鉴权**的 HTTP 路由暴露给客户端（移动端消息里的图片）；
+2. 在事件层按会话记录**入站 + 出站平台消息**，作为 App 的唯一消息源。
 
 移动端会话里图片的 src 是工作区相对路径（如 `medialuna/angela_cloak.png`），默认没有任何 HTTP 出口，
 本插件补上这一层：
@@ -14,79 +17,115 @@ Authorization: Bearer <实例 token 或登录 session>
 - 文件不存在 → 404；未带凭证 → 401（`/api` 前缀由 `@chatluna/server` 的守卫统一拦截）。
 - 响应带 `cache-control: public, max-age=3600` 与常见图片/音视频 MIME。
 
-## 消息记录（`GET /api/traffic`）
+## 平台消息（`GET /api/platform/conversations`）
 
 纯指令消息（如 `chatluna-菜单`）在 Koishi 的指令层就被消费，既不落会话日志也不加载 agent；
 bot 借框架之口发的回复（`session.send`，指令回复就是这条路）同样只发到平台、不进 agent 日志。
-客户端两边都看不到，所以插件在事件层抄一份到 500 条的内存环形缓冲，供 App 的「消息记录」页查看：
+App 之前靠会话日志 + 旁路流量拼消息，会重复、重组、普通消息不及时。本插件在事件层直接落一份
+**按会话分组**的消息，App 只消费下面三个接口。
+
+会话列表按最后一条消息时间倒序：
 
 ```
-GET /api/traffic?limit=50&platform=qq&channelId=C3A7...
+GET /api/platform/conversations
 Authorization: Bearer <实例 token 或登录 session>
 
-{"items":[{"id","dir","time","platform","selfId","userId","channelId","guildId","content","conversationKey","routeId"}]}
+{"items":[{
+  "key":"r-1a2b3c4d5e6f","platform":"qq","selfId":"...",
+  "channelId":"...","guildId":"..."|null,"kind":"group"|"private",
+  "title":"群聊 · 53FB78","count":12,
+  "last":{"id":"...","time":1795...,"dir":"in","text":"..."}
+}]}
 ```
 
-- 新 → 旧；`limit` 默认 50（1–200），`platform` / `channelId` 空串表示不过滤。
+- `key` 是归一后的会话键：优先 `session.conversation.key`（群聊形如 `r-1a2b3c4d5e6f`，
+  个人/泳道配置会带 `:user:` / `:lane:` 后缀），取不到时退回 `channelId`。与 ChatLuna App
+  会话 id 同一套标识，不要用标题里的 `A1338876…`（那是 ChatLuna 会话 id，不是平台 `C…` 频道 id）。
+- `kind`：`guildId` 非空且 `guildId === channelId` → `group`，否则 `private`
+  （QQ 群消息的 `guildId` 与 `channelId` 相同，私聊没有 `guildId`）。
+- `title`：`群聊/私聊 · ` + 频道 id 尾 6 位；频道 id 缺失时退回会话键尾 6 位。
+- `count` 是当前缓冲里该会话的条数（上限 300，不是历史总数）。
+- `last.text` 就是最后一条消息的 `content`（已翻译成可读文本并压成一行）。
+
+## 消息分页（`GET /api/platform/messages`）
+
+```
+GET /api/platform/messages?key=r-1a2b3c4d5e6f&limit=50&before=1795...
+Authorization: Bearer <实例 token 或登录 session>
+
+{"items":[{"id","time","dir","userId","content"}],"hasMore":true}
+```
+
+- **时间升序**（旧 → 新），直接追加到列表尾部即可。
+- `limit` 默认 50（1–200），取该范围内**最新**的一页。
+- `before=<毫秒时间戳>` 取比它更早的一页；把本页第一条的 `time` 传回来即可继续往前翻。
+- `hasMore` 表示还有更早的消息；`before` 翻到头后为 `false`。
+- `key` 缺失 → 400；会话不存在或已被淘汰 → 200 + 空 `items`（客户端按空态处理即可）。
 - `dir`：`in` 是收到的消息（`ctx.on('message')`），`out` 是 bot 自己发出的回复。
-- `conversationKey` 是 ChatLuna 的 `session.conversation.key`（群聊形如 `r-1a2b3c4d5e6f`，
-  个人/泳道配置会带 `:user:` / `:lane:` 后缀），`routeId` 是同一路由的 id；会话标题里那种
-  `A1338876…` 与 `channelId`/`guildId` 的 `C…` 不是同一命名空间，**客户端匹配会话要用
-  `conversationKey`（或 `routeId`），不要用标题 id 对 `channelId`**。
-- 降级：`session.conversation` 由 chat 插件惰性挂在 Session 原型上且依赖 `routing` 服务，
-  取不到时 `conversationKey` 退回 `channelId`（两者都没有才是 `null`）；运行环境没有
-  `@chatluna/satori` 时条目里不出现 `routeId` 键。此时客户端只能退回标题 id 匹配。
-- `time` 是毫秒时间戳；`content` 由 `session.elements` 翻译成可读文本（文本原样、`at` → `@尾4位`、
-  `img`/`image` → `[图片]`、`face`/`emoji` → `[表情]`、`quote` → `[引用]`、`file`/`audio`/`video` →
-  `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
-- 只在内存里，重启实例清空；未带凭证 → 401（同上，`/api` 守卫）。
+- `content` 由 `session.elements` 翻译成可读文本（文本原样、`at` → `@尾4位`、
+  `img`/`image` → `[图片]`、`face`/`emoji` → `[表情]`、`quote` → `[引用]`、
+  `file`/`audio`/`video` → `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
 
 ### 出站（`dir: "out"`）
 
 适配器的 `send` 事件（`ctx.on('send')`）在消息真正落到平台之后才发，带真实消息 id（`id` 就是它），
-但它传进来的 session 是新造的 `bot.session()`，**没有** `elements`（`@satorijs/adapter-qq` 的
-flush 里 `decodeMessage` 那一行还是注释掉的）。正文只能在 `before-send`（`MessageEncoder` 渲染前）
-那一刻拿到，所以：
+但传进来的 session 是新造的 `bot.session()`，**没有** `elements`。正文只能在 `before-send`
+（`MessageEncoder` 渲染前）那一刻拿到，所以：
 
-- `ctx.on('before-send')` 只把「这个频道最近要发什么」（正文、`conversationKey`）存成快照，2s 过期；
-- `ctx.on('send')` 才落一条 `dir: "out"` 的条目，正文取自快照，`id` 取平台消息 id
+- `ctx.on('before-send')` 只把「这个频道最近要发什么」（正文、会话键）存成快照，2s 过期；
+- `ctx.on('send')` 才落一条 `dir: "out"` 的消息，正文取自快照，`id` 取平台消息 id
   （平台不给 id 时退回 `out-<selfId>:<时间>:<序号>`，客户端靠 `id` 去重）。
-- 快照过期/缺失（例如有代码绕过 `MessageEncoder` 直接调 `bot.internal`）时**不写**条目：正文不可知，
-  写空正文只会污染「消息记录」。
+- 快照过期/缺失（例如有代码绕过 `MessageEncoder` 直接调 `bot.internal`）时**不写**消息：
+  正文不可知，写空正文只会污染列表。
 - 去重：同一条出站可能被多个 bot 实例/适配器各上报一次，一次回复也可能被拆成多段 flush；同一个
   `channelId` + 同样的正文在 500ms 内只记一条（去重键不含 `selfId`）。
-- 出站条目的 `userId` 是 bot 自己（`selfId`）：`send` 的 session 不带 user。
-- `conversationKey` / `routeId` **沿用该频道最近一条入站消息的值**：`send` 的 session 是
-  `bot.session()` 新造的，`isDirect` 这类挂在 Session 原型上的访问器没被复制过去，私聊会被算成
-  「频道」路由（少了 `:user:`），和 App 看到的会话 id 对不上。回复总是发回它来的那个频道，所以
-  这样取才是同一个会话；该频道还没有入站记录（主动推送）时才退回 `before-send` 时算出的键。
+- 出站消息的 `userId` 是 bot 自己（`selfId`）：`send` 的 session 不带 user。
+- 会话键**优先沿用该频道最近一条入站消息的值**：`send` 的 session 没复制 `isDirect` 这类访问器，
+  私聊会被算成「频道」路由（少了 `:user:`）。回复总是发回它来的那个频道，所以这样取才是同一个会话；
+  该频道还没有入站记录（主动推送）时才退回 `before-send` / `send` 自己算出的键。
 - 只记录，不回灌 `message` 事件，所以不会形成「自己发的消息被当成入站」的回环。
+- 该路径依赖适配器走 Satori 的 `MessageEncoder`（QQ 适配器会发 `before-send` / `send`）。
+  `@chatluna/adapter-web` 直接覆写 `sendMessage` 返回消息 id，既不发 `before-send` 也不发
+  `send`，因此 web 平台的出站消息不会出现在本接口里；App 的会话只读，不受影响。
 
-## 消息推送（`GET /api/traffic/stream`）
+## 实时流（`GET /api/platform/stream`）
 
-同一份环形缓冲的 Server-Sent Events 出口，App 会话页保持长连接即可实时看到入站与出站消息
-（包括纯指令消息与 bot 的回复）：
+Server-Sent Events 出口，App 保持长连接即可实时拿到入站与出站消息：
 
 ```
 curl -N -H "Authorization: Bearer <实例 token 或登录 session>" \
-  http://127.0.0.1:5028/api/traffic/stream
+  http://127.0.0.1:5028/api/platform/stream
 ```
 
-- 连接建立后先补最近 20 条（旧 → 新，客户端按序追加），字段与 `/api/traffic` 的 `items` 完全一致。
-- 之后每条新入站消息推一帧：`event: traffic`，`data` 是单条 JSON（无 `items` 包装）。
+- 连接建立后先按时间顺序回放**每个会话最近 5 条**（旧 → 新），之后实时推。
+- 帧格式：`event: platform`，`data` 是单条 JSON：
+
+```json
+{"key":"r-1a2b3c4d5e6f","message":{"id":"...","time":1795...,"dir":"in","userId":"...","content":"..."}}
+```
+
+- 客户端按 `message.id` 去重（回放 + 重连会重复拿到同一批）。
 - 每 15s 一行 `: ping` 注释保活；响应带 `x-accel-buffering: no`，代理不会缓冲首帧。
 - 客户端断开或 `close` 时服务端移除订阅者；未带凭证 → 401（同上，`/api` 守卫）。
 - 实现复用 `@chatluna/server`（实例 `node_modules` 里）的 `openStream`：头、flushHeaders、
   心跳、close 清理都由它负责，本插件只维护订阅者集合。
 
+## 存储
+
+- 每个会话一个独立环形缓冲，cap 300 条；同一 `time` 视为同一条消息（多 bot 实例/适配器重复
+  上报、SSE 重放都不会翻倍）。时间戳回退时按升序插入，接口永远返回升序。
+- 会话表 cap 200，超出时淘汰「最后一条消息时间最早」的会话。
+- **全部只在内存里**：实例重启后清空，App 重连后从新消息重新积累。重启前的平台消息
+  没有持久化副本（会话日志只保存进过 agent 的那部分，不能当平台真源的备份）。
+
 ## 安装
 
-1. 拷到实例：`/root/chatluna/external/chatluna-plugin-media-bridge/index.mjs`
+1. 拷到实例：`/root/chatluna/external/workspace-files/index.mjs`
 2. 在 `chatluna.yml` 的**非隔离**组（如 `platforms`）加一条：
 
 ```yaml
-    - id: media-bridge
-      name: file:///root/chatluna/external/chatluna-plugin-media-bridge/index.mjs
+    - id: workspace-files
+      name: file:///root/chatluna/external/workspace-files/index.mjs
 ```
 
 不要放进 `extensions` 组：该组 `isolate: {server: chatluna}`，插件拿到的是另一个 server 实例，路由不会生效。

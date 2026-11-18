@@ -1,7 +1,7 @@
 {
   "name": "chatluna-plugin-media-bridge",
   "version": "0.1.0",
-  "description": "Expose ChatLuna v2 agent workspace files over an authenticated HTTP route for mobile clients.",
+  "description": "Platform message store and authenticated workspace file bridge for ChatLuna v2 mobile clients.",
   "type": "module",
   "main": "index.mjs",
   "files": ["index.mjs", "README.md"],

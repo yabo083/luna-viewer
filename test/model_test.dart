@@ -1,8 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:chatluna_mobile/core/capability/platform_repository.dart';
 import 'package:chatluna_mobile/core/model/models.dart';
-import 'package:chatluna_mobile/core/capability/traffic_repository.dart';
-import 'package:chatluna_mobile/core/capability/traffic_stream.dart';
 import 'package:chatluna_mobile/core/update/update_checker.dart';
 import 'package:chatluna_mobile/core/store/connection_store.dart';
 
@@ -262,34 +261,53 @@ void main() {
     });
   });
 
-  group('traffic matching', () {
-    test('会话 id 与服务器键按归一后比较', () {
+  group('platform', () {
+    test('会话键归一：去掉 route: 前缀与 :user:/:lane: 段', () {
       expect(normalizeConversationKey('route:r-abc123:user:664B'), 'r-abc123');
       expect(normalizeConversationKey('r-abc123:lane:1'), 'r-abc123');
       expect(normalizeConversationKey('route:r-abc123'), 'r-abc123');
     });
 
-    test('serverKey 优先，缺省退回频道键', () {
-      TrafficEntry make(String? serverKey) => TrafficEntry(
-        id: 'm1',
-        time: DateTime(2026, 11, 18),
-        platform: 'qq',
-        selfId: 'self',
-        userId: 'user',
-        channelId: 'C',
-        guildId: null,
-        content: 'chatluna 菜单',
-        serverKey: serverKey,
-      );
-      expect(trafficConversationKey(make('route:r-x')), 'r-x');
-      expect(trafficConversationKey(make(null)), 'qq\u0000C');
+    test('消息帧接受毫秒/秒时间戳与缺 id 的兜底', () {
+      final ms = PlatformMessage.fromJson({'id': 'm1', 'time': 1763000000000, 'dir': 'out', 'content': 'hi'});
+      expect(ms, isNotNull);
+      expect(ms!.outbound, isTrue);
+      expect(ms.time.millisecondsSinceEpoch, 1763000000000);
+      expect(ms.view.isFramework, isFalse);
+      expect(ms.view.isUser, isFalse);
+
+      final seconds = PlatformMessage.fromJson({'time': 1763000000, 'dir': 'in', 'content': '你好'});
+      expect(seconds!.time.millisecondsSinceEpoch, 1763000000000);
+      expect(seconds.id, isNotEmpty);
+      expect(seconds.view.isUser, isTrue);
     });
 
-    test('指令判定只看 chatluna 前缀或斜杠', () {
-      expect(isCommandish('chatluna 菜单'), isTrue);
-      expect(isCommandish('  ChatLuna help'), isTrue);
-      expect(isCommandish('/reset'), isTrue);
-      expect(isCommandish('你好 chatluna'), isFalse);
+    test('平台消息不做指令卡：chatluna 前缀仍是用户气泡', () {
+      final message = PlatformMessage.fromJson({
+        'id': 'm2',
+        'time': 1763000000000,
+        'dir': 'in',
+        'content': 'chatluna 菜单',
+      });
+      expect(message!.view.isFramework, isFalse);
+      expect(message.view.bodyMarkdown, 'chatluna 菜单');
+    });
+
+    test('会话列表项：last 用 text 字段，缺省为空', () {
+      final conversation = PlatformConversation.fromJson({
+        'key': 'r-abc123',
+        'platform': 'qq',
+        'title': '群聊 · 1234',
+        'count': 3,
+        'last': {'id': 'm3', 'time': 1763000000000, 'dir': 'in', 'text': '最后一句'},
+      });
+      expect(conversation, isNotNull);
+      expect(conversation!.count, 3);
+      expect(conversation.last?.content, '最后一句');
+      expect(conversation.last?.time.millisecondsSinceEpoch, 1763000000000);
+      expect(conversation.copyWith(count: 4).count, 4);
+
+      expect(PlatformConversation.fromJson({'title': 'x'}), isNull);
     });
   });
 
