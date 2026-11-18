@@ -707,14 +707,15 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   }
 
   /// 本地合成一条框架块：服务端没有对应 mark 时用（例如工具被转到后台）。
-  /// 文本即去重键，同一句只出现一次。
+  /// 时间锚在「最近一条平台消息之后 1ms」，与本机时钟无关——否则它会越过
+  /// 已经到达但时戳偏早的 bot 气泡，看起来时序错乱。
   void _pushFrameworkNotice(String text) {
-    final id = 'local-${noticeKey(text)}';
+    final id = 'local-${DateTime.now().microsecondsSinceEpoch}';
     if (!_frameworkIds.add(id)) return;
     setState(() {
       _framework = orderNotices([
         ..._framework,
-        TimelineNotice(id: id, text: text, time: DateTime.now()),
+        TimelineNotice(id: id, text: text, time: _afterLatest()),
       ]);
     });
     _followIfAtBottom();
