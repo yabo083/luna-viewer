@@ -710,6 +710,88 @@ class ChatMessage {
   }
 }
 
+/// `chatluna` 指令帮助里的一条子命令。
+class CommandHelpItem {
+  const CommandHelpItem({required this.command, required this.desc});
+
+  /// 完整调用片段，例如 `chatluna archive`（中间空白已归一成一个空格）。
+  final String command;
+
+  /// 紧跟其后的说明，两端装饰（冒号、破折号、句点）已剥掉。
+  final String desc;
+}
+
+/// bot 发来的 `chatluna` 指令帮助：把一大段文本拆成「开场一句 + 逐条命令」。
+///
+/// 插件把子命令清单连写成一整段——`指令：chatluna ChatLuna 主命令 可用的子指令有：
+/// chatluna archive 归档当前会话 chatluna ban 封禁用户 …`——也可能按行排，
+/// 两种形态都由 [parse] 归一。判定要求同时满足：
+///   - 文本里出现 ≥ [_minItems] 段 `chatluna <子命令>`；
+///   - 每段后面紧跟 ≥2 个字符的说明。
+/// 只认**小写**子命令：`chatluna ChatLuna 主命令` 里的 `ChatLuna` 是命令名本身，
+/// 把它当子命令会把开场白吃掉一条。普通句子里偶尔提到一次命令因此不会命中。
+class CommandHelp {
+  const CommandHelp._({required this.intro, required this.items});
+
+  /// 第一条子命令之前的开场文字；空串表示文本以命令开头，卡片不画开场行。
+  final String intro;
+
+  /// 去重保序的子命令条目。
+  final List<CommandHelpItem> items;
+
+  /// 少于这么多条就不当帮助列表（人话里提一句命令很常见）。
+  static const int _minItems = 3;
+
+  /// 说明至少这么长才算「紧跟描述」：`chatluna help` 后面空着或只有一个标点的不算。
+  static const int _minDescLength = 2;
+
+  static final RegExp _commandPattern = RegExp(r'chatluna\s+[a-z][a-z0-9_-]*');
+
+  /// 说明两端的装饰：冒号、逗号、句号、破折号、竖线、圆点、尖括号、斜杠。
+  static final RegExp _descLead = RegExp(r'^[\s:：,，.。;；\-–—|/\\·•>»]+');
+  static final RegExp _descTail = RegExp(r'[\s:：,，.。;；\-–—|/\\·•<«]+$');
+  static final RegExp _spaces = RegExp(r'\s+');
+
+  /// 不是帮助列表时返回 null；调用方据此决定走卡片还是普通正文。
+  static CommandHelp? parse(String text) {
+    if (text.isEmpty) return null;
+    final matches = _commandPattern.allMatches(text).toList(growable: false);
+    if (matches.length < _minItems) return null;
+    final items = <CommandHelpItem>[];
+    final seen = <String>{};
+    for (var i = 0; i < matches.length; i++) {
+      final match = matches[i];
+      // 一段说明跑到下一条命令之前为止；最后一条跑到文本末尾。
+      final end = i + 1 < matches.length ? matches[i + 1].start : text.length;
+      final desc = _cleanDesc(text.substring(match.end, end));
+      if (desc.length < _minDescLength) continue;
+      final command = match.group(0)!.replaceAll(_spaces, ' ');
+      if (!seen.add(command)) continue;
+      items.add(CommandHelpItem(command: command, desc: desc));
+    }
+    if (items.length < _minItems) return null;
+    return CommandHelp._(
+      intro: _cleanIntro(text.substring(0, matches.first.start)),
+      items: List<CommandHelpItem>.unmodifiable(items),
+    );
+  }
+
+  /// 说明只取第一行有内容的那行：换行列表里一条命令占一行，下一行是别的段落。
+  static String _cleanDesc(String raw) {
+    for (final line in raw.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty) continue;
+      final collapsed = trimmed.replaceAll(_spaces, ' ');
+      final lead = collapsed.replaceFirst(_descLead, '');
+      return lead.replaceFirst(_descTail, '').trim();
+    }
+    return '';
+  }
+
+  /// 开场行只归一空白，不动标点：`…可用的子指令有：` 读起来就是原样。
+  static String _cleanIntro(String raw) => raw.replaceAll(_spaces, ' ').trim();
+}
+
 class Transcript {
   const Transcript(this.messages, this.length, this.cacheBreaks);
 

@@ -334,4 +334,61 @@ void main() {
       expect(session.writable, isFalse);
     });
   });
+
+  group('CommandHelp.parse', () {
+    test('连写形式：开场行 + 逐条命令，重复命令去重保序', () {
+      final help = CommandHelp.parse(
+        '指令：chatluna ChatLuna 主命令 可用的子指令有： '
+        'chatluna archive 归档当前会话 '
+        'chatluna ban 封禁用户 '
+        'chatluna help 查看全部子指令 '
+        'chatluna archive 归档当前会话',
+      )!;
+
+      expect(help.intro, '指令：chatluna ChatLuna 主命令 可用的子指令有：');
+      expect(help.items.map((item) => item.command).toList(), [
+        'chatluna archive',
+        'chatluna ban',
+        'chatluna help',
+      ]);
+      expect(help.items.map((item) => item.desc).toList(), [
+        '归档当前会话',
+        '封禁用户',
+        '查看全部子指令',
+      ]);
+    });
+
+    test('换行形式：一行一条，说明两端的标点与破折号剥掉', () {
+      final help = CommandHelp.parse(
+        '可用命令：\n'
+        'chatluna archive   归档当前会话\n'
+        'chatluna ban — 封禁用户\n'
+        'chatluna help: 查看全部子指令\n',
+      )!;
+
+      expect(help.intro, '可用命令：');
+      expect(help.items.map((item) => item.command).toList(), [
+        'chatluna archive',
+        'chatluna ban',
+        'chatluna help',
+      ]);
+      expect(help.items.map((item) => item.desc).toList(), [
+        '归档当前会话',
+        '封禁用户',
+        '查看全部子指令',
+      ]);
+    });
+
+    test('误判反例：普通句子提一次命令不是帮助列表', () {
+      expect(CommandHelp.parse('你可以先发 chatluna help 看看有哪些子指令。'), isNull);
+      // 两条片段也不够：阈值是 3 条。
+      expect(
+        CommandHelp.parse('chatluna archive 归档当前会话，chatluna ban 封禁用户'),
+        isNull,
+      );
+      // 三条片段但后面没有说明，同样不是帮助清单。
+      expect(CommandHelp.parse('chatluna archive chatluna ban chatluna help'), isNull);
+      expect(CommandHelp.parse(''), isNull);
+    });
+  });
 }

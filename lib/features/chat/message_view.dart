@@ -97,6 +97,9 @@ class MessageView extends StatelessWidget {
         ? scheme.onPrimary.withValues(alpha: 0.72)
         : scheme.onSurfaceVariant.withValues(alpha: 0.75);
 
+    // bot 把 `chatluna` 的帮助清单发成一整段文本：排版成卡片，其余正文一律走原路径。
+    final help = showBody ? CommandHelp.parse(body) : null;
+
     final content = <Widget>[
       if (reasoning.isNotEmpty)
         _Foldable(
@@ -108,7 +111,15 @@ class MessageView extends StatelessWidget {
             style: theme.textTheme.bodySmall?.copyWith(height: 1.5, color: mutedForeground),
           ),
         ),
-      if (showBody)
+      if (help != null)
+        _CommandHelpCard(
+          key: ValueKey('command-help-${message.id}'),
+          help: help,
+          foreground: foreground,
+          muted: mutedForeground,
+          commandColor: outbound ? foreground : scheme.primary,
+        )
+      else if (showBody)
         // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
         message.hasMarkup
             ? _Markdown(data: body, base: base, headers: headers, foreground: foreground)
@@ -405,6 +416,121 @@ class _Markdown extends StatelessWidget {
   }
 
   Uri _resolve(String url) => _resolveAsset(base, url);
+}
+
+/// `chatluna` 指令帮助卡片：bot 把子命令清单发成一整段文本时，按行排版成「命令 + 说明」。
+/// 顶部是弱化的开场行（[CommandHelp.intro]），下面每行一条命令，行距 6。
+///
+/// 超过 [visibleRows] 条先折起来，末行可点「展开全部 N 条」（再点收起）。
+/// 折叠状态是本地 state：卡片在气泡里，滚动重建（`ListView.builder` 销毁离屏元素）后回到折叠，
+/// 与框架消息的页面级 [MessageView.noticeOpen] 不同——帮助卡一眼看完就该折叠，不该被记住。
+class _CommandHelpCard extends StatefulWidget {
+  const _CommandHelpCard({
+    super.key,
+    required this.help,
+    required this.foreground,
+    required this.muted,
+    required this.commandColor,
+  });
+
+  final CommandHelp help;
+
+  /// 气泡前景色：右侧主色底与左侧中性底都用它，卡片里不引出第二种正文色。
+  final Color foreground;
+
+  /// 弱化色：开场行与折叠按钮用它，跟着气泡的 muted 走。
+  final Color muted;
+
+  /// 命令色：等宽主色；右侧主色气泡上主色不可读，调用方改传气泡前景色。
+  final Color commandColor;
+
+  /// 折叠阈值：一次最多铺 8 行——帮助清单动辄十几条，全铺开会顶掉半屏对话。
+  static const int visibleRows = 8;
+
+  @override
+  State<_CommandHelpCard> createState() => _CommandHelpCardState();
+}
+
+class _CommandHelpCardState extends State<_CommandHelpCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final items = widget.help.items;
+    final folded = !_expanded && items.length > _CommandHelpCard.visibleRows;
+    final shown = folded ? items.take(_CommandHelpCard.visibleRows) : items;
+    final intro = widget.help.intro;
+    // 卡片底色只借一点前景色，右侧主色底与左侧中性底都成立；描边把卡片从气泡底上分出来。
+    final fill = widget.foreground;
+    return Container(
+      // 卡片自己再夹一道：气泡本身已是 86% 宽，这里不额外撑宽，两侧都只占内容宽度。
+      constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * MessageView._maxWidthRatio),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: fill.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: fill.withValues(alpha: 0.14)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        spacing: 6,
+        children: [
+          if (intro.isNotEmpty)
+            Text(
+              intro,
+              style: theme.textTheme.bodySmall?.copyWith(height: 1.4, color: widget.muted),
+            ),
+          for (final item in shown)
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  item.command,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    height: 1.35,
+                    fontWeight: FontWeight.w600,
+                    color: widget.commandColor,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    item.desc,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      height: 1.35,
+                      color: widget.foreground,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          if (folded || _expanded)
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Text(
+                    _expanded ? '收起' : '展开全部 ${items.length} 条',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: widget.muted,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }
 
 /// 富媒体地址解析，markdown 图片与平台消息媒体共用同一套规则：
