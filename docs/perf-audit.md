@@ -37,3 +37,22 @@
 1. 分页滚动时 markdown 渲染成本（每页 50 条，滚到尽头才取更早一页）。
 2. platform/stream SSE 在后台（App 切到后台/息屏）是否仍保持连接；是否需要退订。
 3. 插件 `ctx.on('message')` 对**所有** bot 生效，是否有其它插件同样监听导致重复开销。
+
+
+## 首轮基线（2026-11-18，vivo V2425A / Android 16，release APK）
+
+| 指标 | 实测 | 口径 |
+|---|---|---|
+| 冷启动到首帧 | 284 / 297 / 411 ms（3 次） | `am start -W` 的 TotalTime，release 包 |
+| 详情页 PSS | 177.7 MB | 打开会话 6 s 后 `dumpsys meminfo` |
+| 详情页 RSS | 345.2 MB | 同上 |
+| App 空闲 CPU | 0.0% | `top -b -n 1`，停在详情页 |
+| 插件进程 RSS | 72.6 MB | `ps -o rss`，Node 常驻 |
+| 插件空闲 CPU | 0.0% | `top` 单次 |
+| SSE 连接 | 3 | `ss state established sport = :5028`（App 开详情页时） |
+| 安装包 | release 21 MB / debug 162 MB | arm64 单 ABI |
+
+结论与疑点：
+- 启动 300 ms 量级，主要成本是 Flutter 引擎 + secure storage 初始化；可接受。
+- PSS 177 MB 偏高，需归因：图片缓存（`_ChatImage` 解码后是否按 260×320 约束）、Markdown 树、SSE 缓冲。下一步用 DevTools memory snapshot 拆解。
+- 插件 RSS 72.6 MB 是实例整包，插件本身占比未知；需要在插件里加一个 `/api/diag` 返回 `process.memoryUsage()` 差值来定位。

@@ -3,7 +3,9 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:markdown_widget/markdown_widget.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/model/models.dart';
 import 'assistant_avatar.dart';
@@ -13,6 +15,9 @@ import 'assistant_avatar.dart';
 /// 框架消息不参与左右布局，仍是居中的单卡片。
 ///
 /// 头像槽左右各留一份：`showHeader` 为 false 时留空占位，连续消息因此保持缩进对齐。
+///
+/// 媒体（[PlatformMessage.media]）在气泡里单独成块：图片走缩略图/网格，视频/音频/文件走一行胶囊。
+/// 正文只剩占位文案（`[图片]`）时不再重复显示——媒体本身已经把这层信息表达完了。
 class MessageView extends StatelessWidget {
   const MessageView({
     super.key,
@@ -21,6 +26,7 @@ class MessageView extends StatelessWidget {
     required this.headers,
     required this.noticeOpen,
     this.noticeCount = 1,
+    this.media = const <PlatformMedia>[],
     this.avatarUrl,
     this.senderName,
     this.time,
@@ -39,6 +45,9 @@ class MessageView extends StatelessWidget {
 
   /// 这一条虚拟消息里合并了几条框架消息（相邻同标题的合并块）；>1 时标题后缀显示 `· N 条`。
   final int noticeCount;
+
+  /// 平台消息的媒体附件。空列表 = 纯文本，渲染路径与以前完全一致。
+  final List<PlatformMedia> media;
 
   /// 发送者头像：bot 用自己的，其他人用平台消息带的；缺失时画首字母圆头像。
   final String? avatarUrl;
@@ -62,9 +71,12 @@ class MessageView extends StatelessWidget {
     final scheme = theme.colorScheme;
     final body = message.bodyMarkdown;
     final reasoning = message.reasoningText;
-    if (body.isEmpty && reasoning.isEmpty && message.toolCalls.isEmpty) {
+    if (body.isEmpty && reasoning.isEmpty && message.toolCalls.isEmpty && media.isEmpty) {
       return const SizedBox.shrink();
     }
+
+    // 有媒体时，正文只剩 `[图片]` 这类占位就是重复信息：媒体块已经把它表达完了。
+    final showBody = body.isNotEmpty && !(media.isNotEmpty && _placeholderOnly(body));
 
     // 框架消息不参与左右布局：先短路，省掉整棵 markdown 构建。
     if (message.isFramework) {
@@ -96,7 +108,7 @@ class MessageView extends StatelessWidget {
             style: theme.textTheme.bodySmall?.copyWith(height: 1.5, color: mutedForeground),
           ),
         ),
-      if (body.isNotEmpty)
+      if (showBody)
         // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
         message.hasMarkup
             ? _Markdown(data: body, base: base, headers: headers, foreground: foreground)
@@ -104,6 +116,15 @@ class MessageView extends StatelessWidget {
                 body,
                 style: theme.textTheme.bodyMedium?.copyWith(height: 1.5, color: foreground),
               ),
+      if (media.isNotEmpty)
+        _MediaBlock(
+          key: ValueKey('media-${message.id}'),
+          media: media,
+          base: base,
+          headers: headers,
+          foreground: foreground,
+          muted: mutedForeground,
+        ),
       if (message.toolCalls.isNotEmpty)
         _Foldable(
           key: ValueKey('tools-${message.id}'),
@@ -322,16 +343,41 @@ class _Markdown extends StatelessWidget {
     );
   }
 
-  Uri _resolve(String url) {
-    if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
-      return Uri.parse(url);
-    }
-    // storage 附件（`file` 块的 reference）由实例直接提供，不需要 Bearer。
-    if (url.startsWith('/files/')) return base.resolve(url.substring(1));
-    final name = url.startsWith('/') ? url.substring(1) : url;
-    // 相对路径是 agent 工作区（data/chatluna/agents-work）里的文件，由 companion 插件以 Bearer 提供。
-    return base.replace(path: '/api/workspace', queryParameters: {'path': name});
+  Uri _resolve(String url) => _resolveAsset(base, url);
+}
+
+/// 富媒体地址解析，markdown 图片与平台消息媒体共用同一套规则：
+/// 绝对 `http(s)` / `data:` / `base64:` 原样使用；`/files/` 是实例静态附件（不需要 Bearer）；
+/// 其余相对路径是 agent 工作区（data/chatluna/agents-work）里的文件，由 companion 插件以 Bearer 提供。
+Uri _resolveAsset(Uri base, String url) {
+  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
+    return Uri.parse(url);
   }
+  // `base64://` 的载荷在调用处已经归一成 `data:`；万一漏进来，只当它是一个不透明 URI。
+  if (url.startsWith('base64:')) return Uri(scheme: 'base64', path: url);
+  if (url.startsWith('/files/')) return base.resolve(url.substring(1));
+  final name = url.startsWith('/') ? url.substring(1) : url;
+  return base.replace(path: '/api/workspace', queryParameters: {'path': name});
+}
+
+/// 图片请求要不要带实例的 Bearer：只有解回本实例的 `/files` 与工作区需要。
+/// 插件给的外部图床不能收到我们的 token。
+bool _needsAuth(Uri base, Uri uri) =>
+    uri.host == base.host &&
+    uri.port == base.port &&
+    (uri.path.startsWith('/files/') || uri.path == '/api/workspace');
+
+/// 正文占位文案：插件在「没有文字、只有媒体」时写的就是这些。
+final RegExp _mediaPlaceholder = RegExp(
+  r'\[\s*(?:图片|照片|截图|视频|视频消息|语音|语音消息|音频|文件|表情|动画表情|贴图|贴纸|引用|卡片|小程序|未知消息)\s*\]',
+);
+final RegExp _placeholderPunctuation = RegExp(r'[\s\.,，。、;;；:：!！?？~～\-—_|*（）()【】\[\]]+');
+
+/// 去掉占位文案与标点后什么都不剩 = 正文本来只是媒体的旁白，跳过它。
+bool _placeholderOnly(String text) {
+  if (!_mediaPlaceholder.hasMatch(text)) return false;
+  final rest = text.replaceAll(_mediaPlaceholder, '').replaceAll(_placeholderPunctuation, '');
+  return rest.isEmpty;
 }
 
 class _ChatImage extends StatefulWidget {
@@ -545,31 +591,11 @@ class _ChatImageState extends State<_ChatImage> {
             ? null
             : () => showDialog<void>(
                 context: context,
-                builder: (_) => Dialog.fullscreen(
-                  backgroundColor: Colors.black,
-                  child: Stack(
-                    children: [
-                      Positioned.fill(
-                        child: InteractiveViewer(
-                          child: bytes != null
-                              ? Image.memory(bytes, fit: BoxFit.contain)
-                              : Image.network(
-                                  uri.toString(),
-                                  fit: BoxFit.contain,
-                                  headers: widget.headers,
-                                ),
-                        ),
-                      ),
-                      Positioned(
-                        top: 8,
-                        right: 8,
-                        child: IconButton.filledTonal(
-                          onPressed: () => Navigator.pop(context),
-                          icon: const Icon(Icons.close),
-                        ),
-                      ),
-                    ],
-                  ),
+                builder: (_) => _ImageViewer(
+                  images: [
+                    _ImageSource(source: source, uri: uri, headers: widget.headers, bytes: bytes),
+                  ],
+                  initialIndex: 0,
                 ),
               ),
         child: ClipRRect(

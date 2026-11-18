@@ -47,6 +47,9 @@ Authorization: Bearer <实例 token 或登录 session>
 - `title`：群聊优先 `session.event.guild.name`（缺失再试 `channel.name` 与
   `bot.getGuild`），私聊优先对方昵称（`user.name` / `member.name`）；
   都拿不到才退回 `群聊/私聊 · ` + 频道 id 尾 6 位（频道 id 缺失用会话键尾 6 位）。
+- 名称会做编码修复：UTF-8 字节被按 latin1 解出的乱码先 `latin1 → utf8` 还原；
+  仍带控制字符/Latin 扩展字符的 `<...>` 片段（如 `<$ǿĀD\u000e>`）直接剥掉。
+  `title`、`userName`、群名、昵称都走这一步，`avatar` 不受影响。
 - `avatar`：群聊取群头像（`guild.avatar`），私聊取对方头像；拿不到为 `null`。
 - `count` 是当前缓冲里该会话的条数（上限 300，不是历史总数）。
 - `last` 是最新一条消息的摘要，字段与消息条目一致（`text` 即 `content`）。

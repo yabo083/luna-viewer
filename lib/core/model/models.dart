@@ -172,6 +172,106 @@ class PlatformConversation {
   }
 }
 
+/// 一条平台消息里的一个媒体附件：插件 `media` 数组的一项。
+/// 四个字段都可缺省，UI 按「有没有 url / ref」决定画图片、胶囊还是占位 chip。
+class PlatformMedia {
+  const PlatformMedia({required this.kind, this.url, this.name, this.ref});
+
+  /// `image` / `video` / `audio` / `file`：插件声明值已归一，未知值按 `file` 处理。
+  final String kind;
+
+  /// 可取用的地址：`http(s)://`、`data:`、`base64://` 或实例/工作区的相对路径；null 表示只有 [ref]。
+  final String? url;
+
+  /// 展示名：插件给的文件名/标题。
+  final String? name;
+
+  /// 只有引用没有地址时的本地标识（插件侧文件、`storage://` 引用等），UI 只能展示与复制。
+  final String? ref;
+
+  bool get isImage => kind == 'image';
+
+  /// 展示名回退链：`name` → URL/引用末段 → 类型中文名。
+  String get label {
+    final given = name?.trim();
+    if (given != null && given.isNotEmpty) return given;
+    final tail = _tailOf(url ?? ref ?? '');
+    return tail.isNotEmpty ? tail : kindLabel(kind);
+  }
+
+  /// 类型中文名：胶囊在拿不到文件名时用它。
+  static String kindLabel(String kind) => switch (kind) {
+    'image' => '图片',
+    'video' => '视频',
+    'audio' => '语音',
+    'file' => '文件',
+    _ => '附件',
+  };
+
+  static PlatformMedia? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final url = _optionalText(json['url'] ?? json['src'] ?? json['href']);
+    final ref = _optionalText(json['ref'] ?? json['reference']);
+    final name = _optionalText(json['name'] ?? json['filename'] ?? json['fileName'] ?? json['title']);
+    // 三样都没有的项没有可渲染的东西（半截帧/占位对象），直接丢。
+    if (url == null && ref == null && name == null) return null;
+    return PlatformMedia(
+      kind: _kindOf(json['kind'] ?? json['type'] ?? json['mediaType'], url),
+      url: url,
+      name: name,
+      ref: ref,
+    );
+  }
+
+  /// 容错：`media` 缺失、为 null、不是数组、项不是对象时都当空列表。
+  static List<PlatformMedia> listFrom(Object? raw) => [
+    if (raw is List)
+      for (final item in raw)
+        if (fromJson(item) case final media?) media,
+  ];
+
+  /// 类型归一：插件声明优先，缺失或无法识别时从地址猜（`data:image/`、视频扩展名）。
+  static String _kindOf(Object? raw, String? url) {
+    final text = _platformText(raw).trim().toLowerCase();
+    if (text.startsWith('image/')) return 'image';
+    if (text.startsWith('video/')) return 'video';
+    if (text.startsWith('audio/')) return 'audio';
+    switch (text) {
+      case 'image' || 'img' || 'photo' || 'picture' || 'sticker':
+        return 'image';
+      case 'video':
+        return 'video';
+      case 'audio' || 'voice':
+        return 'audio';
+      case 'file' || 'document' || 'attachment':
+        return 'file';
+    }
+    final src = url ?? '';
+    if (src.startsWith('data:image/') || src.startsWith('base64:')) return 'image';
+    if (src.startsWith('data:video/') ||
+        RegExp(r'\.(mp4|mov|webm|m4v)(\?|$)', caseSensitive: false).hasMatch(src)) {
+      return 'video';
+    }
+    if (src.startsWith('data:audio/') ||
+        RegExp(r'\.(mp3|wav|ogg|m4a|silk|amr)(\?|$)', caseSensitive: false).hasMatch(src)) {
+      return 'audio';
+    }
+    return 'file';
+  }
+
+  /// URL/引用末段当文件名：`data:` / `base64://` 的载荷没有名字，返回空串。
+  static String _tailOf(String link) {
+    if (link.isEmpty || link.startsWith('data:') || link.startsWith('base64:')) return '';
+    final path = link.split('?').first.split('#').first;
+    final tail = path.substring(path.lastIndexOf('/') + 1);
+    try {
+      return Uri.decodeComponent(tail).trim();
+    } on ArgumentError {
+      return tail.trim();
+    }
+  }
+}
+
 /// 一条平台消息：`/api/platform/messages` 的一项，也是 `platform/stream` 帧里的 `message`。
 class PlatformMessage {
   PlatformMessage({
@@ -182,6 +282,7 @@ class PlatformMessage {
     required this.content,
     this.userName,
     this.avatar,
+    this.media = const <PlatformMedia>[],
   });
 
   final String id;
@@ -198,6 +299,10 @@ class PlatformMessage {
   /// 发送者头像（插件后续提供）；缺失时用首字母圆头像。
   final String? avatar;
 
+  /// 媒体附件（图片/视频/音频/文件）：与 [content] 分开渲染，**不**混进正文。
+  /// 插件没给这项时是空列表，正文照旧。
+  final List<PlatformMedia> media;
+
   /// 渲染模型：`out` 与 `in` 都用它，详情页按 `outbound` 决定左右与配色。
   /// 平台消息逐条都是发言，没有框架/指令形态，因此关掉指令启发式。
   late final ChatMessage view = ChatMessage(
@@ -209,7 +314,13 @@ class PlatformMessage {
   );
 
   /// 逐条比较用的正文：多行折成一行，供列表副标题与去重日志使用。
-  String get preview => content.replaceAll(_platformSpaces, ' ').trim();
+  /// 没有正文但有媒体时用媒体类型拼一句（`[图片] [文件]`），列表行才不至于只剩时间。
+  String get preview {
+    final body = content.replaceAll(_platformSpaces, ' ').trim();
+    if (body.isNotEmpty) return body;
+    if (media.isEmpty) return '';
+    return media.map((item) => '[${PlatformMedia.kindLabel(item.kind)}]').toSet().join(' ');
+  }
 
   static PlatformMessage? fromJson(Object? json) {
     if (json is! Map) return null;
@@ -225,6 +336,7 @@ class PlatformMessage {
       content: content,
       userName: _optionalText(json['userName'] ?? json['user'] ?? json['nick']),
       avatar: _optionalText(json['avatar']),
+      media: PlatformMedia.listFrom(json['media']),
     );
   }
 }

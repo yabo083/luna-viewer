@@ -8,6 +8,7 @@
 // 流量拼消息。指令回复这类「只到平台、不进 agent 日志」的消息同样在这里落一份。
 import { readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { openStream } from '@chatluna/server'
 
 export const name = 'chatluna-workspace-files'
@@ -44,6 +45,13 @@ const OUTBOUND_SLOT_TTL = 2000
 // 所以「同一个频道 + 同样的正文」在 500ms 内只记一条。
 const OUTBOUND_DEDUPE_MS = 500
 
+// 一条消息最多带 8 个媒体：再多的图片/语音客户端也不会在一屏里渲染完。
+const MEDIA_LIMIT = 8
+// `file://` / 裸文件 id 换可访问地址（`bot.internal.getFile`）的等待上限；拿不到就退回 `ref`。
+const MEDIA_FETCH_TIMEOUT = 1200
+// 换地址的结果（含失败）缓存 60s：同一条消息被重复上报时不再打平台接口。
+const MEDIA_REF_TTL = 60_000
+
 // `session.content` 是元素序列化后的原始标记（`<img .../>`、`<at id=.../>`），
 // 直接给人看没有意义；按元素类型翻译成可读片段。
 const ELEMENT_LABELS = {
@@ -67,6 +75,27 @@ function intParam(value, fallback, min, max) {
 
 function textOf(value) {
   return typeof value === 'string' ? value : value == null ? '' : String(value)
+}
+
+// 平台偶尔把 UTF-8 字节按 latin1 解出，名称会出现 `Ã©` / `ðŸ` 这类乱码：按 latin1 还原
+// 成字节再用 UTF-8 解一次。修完出现替换字符说明不是这种损坏，保留原值。
+function fixEncoding(value) {
+  const text = textOf(value)
+  if (!text || !/[\u0080-\u00ff]/.test(text)) return text
+  const repaired = Buffer.from(text, 'latin1').toString('utf8')
+  return repaired.includes('\uFFFD') ? text : repaired
+}
+
+// 名称专用：latin1 修复后仍有坏片段时，删掉带控制字符或 Latin 扩展字符的 `<...>`
+// （QQ 群名里出现过 `<$ǿĀD\u000e>` 这种前缀），其余零散控制字符压成空格。
+function cleanName(value) {
+  let name = fixEncoding(value)
+  if (!name) return ''
+  name = name.replace(/<[^<>]*>/g, (segment) =>
+    /[\u0000-\u001f\u007f-\u009f\u0080-\u024f]/.test(segment) ? '' : segment
+  )
+  name = name.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+  return name.replace(/\s+/g, ' ').trim()
 }
 
 // `rest` 是标签名之后的原始属性串；QQ 的附件标记用逗号分隔属性，且允许无引号，
@@ -151,6 +180,140 @@ function normalizeContent(elements, fallback) {
   return stripRawTags(describeElements(elements) || textOf(fallback)).replace(/\s+/g, ' ').trim()
 }
 
+// ── 媒体 ───────────────────────────────────────────────────────────────
+// `content` 只保留可读占位（`[图片]`）；能渲染的东西另放 `media`，客户端据此画
+// 缩略图/播放器。取不到可访问地址时给 `ref`，客户端退回占位。
+const IMAGE_ELEMENTS = new Set(['img', 'image', 'mface', 'sticker'])
+const VIDEO_ELEMENTS = new Set(['video'])
+const AUDIO_ELEMENTS = new Set(['audio', 'voice', 'record'])
+
+// 元素类型/附件 MIME → `media.kind`。QQ 附件把 `voice`/`file` 直接写在 content_type 里。
+// MIME 比标签名更具体：`<file type="image/png">` 是图片，客户端可以按 image 渲染。
+function mediaKind(type, mime) {
+  const tag = textOf(type).toLowerCase()
+  const value = textOf(mime).toLowerCase()
+  if (IMAGE_ELEMENTS.has(tag) || value.startsWith('image/')) return 'image'
+  if (VIDEO_ELEMENTS.has(tag) || value.startsWith('video/')) return 'video'
+  if (AUDIO_ELEMENTS.has(tag) || value === 'voice' || value.startsWith('audio/')) return 'audio'
+  if (tag === 'file' || value === 'file' || value) return 'file'
+  if (tag.startsWith('attachment')) return 'file'
+  return ''
+}
+
+// 能直接交给客户端的值：`https://`、`//host/path`（QQ 附件常见）、`base64://`、
+// `data:`。其余（`file://`、裸文件 id）交给 resolveReference 换地址。
+function normalizeMediaUrl(value) {
+  const raw = textOf(value).trim()
+  if (!raw) return ''
+  if (/^https?:\/\//i.test(raw)) return raw
+  if (raw.startsWith('//')) return 'https:' + raw
+  if (/^(base64:|data:)/i.test(raw)) return raw
+  if (/^[\w-]+(\.[\w-]+)+\//.test(raw)) return 'https://' + raw
+  return ''
+}
+
+// 工作区相对路径（`medialuna/angela_cloak.png`）：客户端本来就按这个形态走
+// `/api/workspace`，可以直接当 `url` 用。
+function isWorkspacePath(value) {
+  const raw = textOf(value)
+  return /^[\w.-]+(\/[\w.\- ]+)+$/.test(raw) && /\.[a-z0-9]{2,5}$/i.test(raw)
+}
+
+// 没有 mime 的 base64 载荷补成 `data:` URI；客户端只认 `data:` / `base64://` / URL。
+function isBase64Payload(value) {
+  const raw = textOf(value).replace(/\s+/g, '')
+  return raw.length >= 64 && /^[A-Za-z0-9+/=]+$/.test(raw)
+}
+
+// `<attachmentType="image/jpeg",...>`：标记名后紧跟的值就是 MIME，`attrOf` 只认
+// `key=value`，所以单独取一次。
+function leadingAttrValue(rest) {
+  const matched = rest.match(/^\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,>]+))/)
+  return matched ? matched[1] ?? matched[2] ?? matched[3] ?? '' : ''
+}
+
+// 原始标记串里的媒体：`<img src=.../>`、`<attachment url=.../>`、`<file .../>`、
+// `<attachmentType="image/jpeg",url=...>`（QQ 附件标记，逗号分隔属性）。
+function rawMediaTags(text) {
+  const found = []
+  if (typeof text !== 'string' || !text.includes('<')) return found
+  const pattern = /<(\/?)([a-zA-Z][\w:-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g
+  for (const match of text.matchAll(pattern)) {
+    if (match[1]) continue
+    const tag = match[2].toLowerCase()
+    const rest = match[3]
+    const attachment = tag.startsWith('attachment')
+    const mime = attrOf(rest, 'mediaType') ||
+      attrOf(rest, 'mimeType') ||
+      attrOf(rest, 'contentType') ||
+      attrOf(rest, 'content_type') ||
+      attrOf(rest, 'type') ||
+      (attachment ? leadingAttrValue(rest) : '')
+    const kind = mediaKind(attachment ? 'attachment' : tag, mime)
+    if (!kind) continue
+    found.push({
+      kind,
+      mime,
+      source: attrOf(rest, 'src') ||
+        attrOf(rest, 'url') ||
+        attrOf(rest, 'file') ||
+        attrOf(rest, 'fileId') ||
+        attrOf(rest, 'file_id') ||
+        attrOf(rest, 'reference'),
+      name: attrOf(rest, 'filename') || attrOf(rest, 'name') || attrOf(rest, 'title'),
+      size: attrOf(rest, 'size')
+    })
+  }
+  return found
+}
+
+// 一个 Satori 元素 → 媒体候选。`src` 是标准字段，`url` 是部分适配器的写法；
+// ChatLuna 的 `file` 块把载荷放在 `data`（`{type:'url'|'data'|'reference', ...}`）。
+function elementMedia(element) {
+  const type = textOf(element?.type).toLowerCase()
+  const attrs = element?.attrs ?? {}
+  const mime = textOf(
+    attrs.mediaType ?? attrs.mimeType ?? attrs.mime_type ??
+    attrs.contentType ?? attrs.content_type ?? attrs.type
+  )
+  const kind = mediaKind(type, mime)
+  if (!kind) return null
+  const block = attrs.data && typeof attrs.data === 'object' ? attrs.data : null
+  const source = textOf(attrs.src) ||
+    textOf(attrs.url) ||
+    textOf(typeof attrs.data === 'string' ? attrs.data : '') ||
+    textOf(block?.url) ||
+    textOf(block?.reference) ||
+    textOf(block?.data) ||
+    textOf(attrs.reference) ||
+    textOf(attrs.fileId ?? attrs.file_id) ||
+    textOf(attrs.id)
+  return {
+    kind,
+    mime,
+    source,
+    name: textOf(attrs.filename ?? attrs.name ?? attrs.title),
+    size: attrs.size
+  }
+}
+
+// `getFile` 这类接口的返回形状各适配器不同：字符串、`{url}`、`{data:{url}}` 都见过。
+function urlOfFileResult(result) {
+  if (!result) return ''
+  if (typeof result === 'string') return normalizeMediaUrl(result)
+  for (const candidate of [
+    result.url,
+    result.src,
+    result.data?.url,
+    result.data?.src,
+    result.file?.url
+  ]) {
+    const url = normalizeMediaUrl(candidate)
+    if (url) return url
+  }
+  return ''
+}
+
 // 标题里的 id（`A1338876…`）是 ChatLuna 会话 id，平台侧的 `channelId`/`guildId` 是适配器
 // 的 `C…`，两者不同命名空间，靠标题 id 匹配群会话必然失败。`session.conversation.key`
 // 才是 App 会话 id 同一套标识，归一键直接复用它。
@@ -176,7 +339,8 @@ function tailOf(value, length) {
 }
 
 function conversationTitle(kind, channelId, key, name) {
-  if (name) return name
+  const clean = cleanName(name)
+  if (clean) return clean
   const source = channelId || key
   return (kind === 'group' ? '群聊 · ' : '私聊 · ') + tailOf(source, 6)
 }
@@ -201,7 +365,9 @@ function messageEntry(session, dir = 'in') {
     // 由 resolveIdentity 填充；record 只认非空值，避免出站消息覆盖已有群名/昵称。
     conversationName: '',
     conversationAvatar: null,
-    content: clipContent(normalizeContent(session.elements, session.content))
+    content: clipContent(normalizeContent(session.elements, session.content)),
+    // 由 collectMedia 填充：可渲染的图片/视频/语音/文件，`content` 里只有占位。
+    media: []
   }
 }
 
@@ -213,7 +379,8 @@ function publicMessage(message) {
     userId: message.userId,
     userName: message.userName,
     avatar: message.avatar,
-    content: message.content
+    content: message.content,
+    media: message.media ?? []
   }
 }
 
@@ -249,38 +416,44 @@ export function apply(ctx) {
     )
   })
 
-  const resolveProfile = async (scope, platform, id, seed, fetcher) => {
+  // `requireAvatar` 给群头像用：入站事件的 `guild` 通常只有名字、没有头像，必须再问一次
+  // `bot.getGuild`。查到（或查明没有）就记进缓存，之后同一群的消息不再重复请求；
+  // 失败一律 `null`，**不回退 bot 自己头像**（群会话顶着 bot 头像比空着更误导）。
+  const resolveProfile = async (scope, platform, id, seed, fetcher, { requireAvatar = false } = {}) => {
     if (!id) return null
     const cacheKey = scope + ':' + platform + '\u0000' + id
     const cached = profileCache.get(cacheKey)
-    const seedName = textOf(seed?.name)
+    const seedName = cleanName(seed?.name)
     const seedAvatar = textOf(seed?.avatar) || null
-    if (seedName || seedAvatar) {
-      const value = {
-        name: seedName || cached?.name || '',
-        avatar: seedAvatar || cached?.avatar || null
-      }
-      profileCache.set(cacheKey, value)
-      return value
+    const known = {
+      name: seedName || cached?.name || '',
+      avatar: seedAvatar || cached?.avatar || null,
+      fetched: cached?.fetched === true
     }
-    if (cached) return cached
+    // 事件里已经给全了（名字齐全；要求头像时还要有头像）就不用问 bot。
+    if (known.fetched || (known.name && (!requireAvatar || known.avatar))) {
+      profileCache.set(cacheKey, known)
+      return known
+    }
     const pending = profilePending.get(cacheKey)
     if (pending) return pending
     const promise = (async () => {
+      let value
       try {
         const profile = await withTimeout(fetcher, PROFILE_TIMEOUT)
-        if (!profile) return null
-        const value = {
-          name: textOf(profile.name) || textOf(profile.nick) || '',
-          avatar: textOf(profile.avatar) || null
+        value = {
+          name: known.name || cleanName(profile?.name) || cleanName(profile?.nick) || '',
+          avatar: known.avatar || textOf(profile?.avatar) || null,
+          fetched: true
         }
-        if (value.name || value.avatar) profileCache.set(cacheKey, value)
-        return value
       } catch {
-        return null
+        value = { ...known, fetched: true }
       } finally {
         profilePending.delete(cacheKey)
       }
+      // `fetched` 连同空结果一起缓存：查不到的群不会每条消息都再打一次接口。
+      profileCache.set(cacheKey, value)
+      return value
     })()
     profilePending.set(cacheKey, promise)
     return promise
@@ -316,15 +489,131 @@ export function apply(ctx) {
         platform,
         entry.guildId,
         { name: textOf(guild?.name), avatar: textOf(guild?.avatar) },
-        () => session.bot?.getGuild?.(entry.guildId)
+        () => session.bot?.getGuild?.(entry.guildId),
+        { requireAvatar: true }
       )
-      entry.conversationName = profile?.name || textOf(channel?.name) || ''
+      entry.conversationName = profile?.name || cleanName(channel?.name) || ''
       entry.conversationAvatar = profile?.avatar ?? null
     } else {
-      entry.conversationName = sender?.name || textOf(channel?.name) || ''
+      entry.conversationName = sender?.name || cleanName(channel?.name) || ''
       entry.conversationAvatar = sender?.avatar ?? null
     }
   }
+
+  // ── 媒体 ─────────────────────────────────────────────────────────────
+  // 换地址的结果（含失败）短期缓存：同一条消息被重复上报、或同一文件被多次引用时不再打接口。
+  const mediaRefCache = new Map()
+
+  // `file://` 落在工作区里时直接换成 `/api/workspace` 能取的相对路径，客户端本来就认这个形态。
+  const workspaceRelativeOf = (value) => {
+    const raw = textOf(value)
+    if (!/^file:\/\//i.test(raw)) return ''
+    let path
+    try {
+      path = fileURLToPath(raw)
+    } catch {
+      return ''
+    }
+    const target = resolve(path)
+    if (target === root || !target.startsWith(root + sep)) return ''
+    return target.slice(root.length + 1).split(sep).join('/')
+  }
+
+  // `file://` 或裸文件 id → 平台可访问 URL。适配器各写各的：`bot.internal.getFile`
+  // （onebot 系）最常用，其次 `bot.getFile`，再 `internal.getFileUrl`；都拿不到返回空串。
+  const resolveReference = async (bot, reference) => {
+    const cached = mediaRefCache.get(reference)
+    if (cached && Date.now() - cached.at < MEDIA_REF_TTL) return cached.url
+    const internal = bot?.internal
+    const attempts = [
+      () => internal?.getFile?.(reference),
+      () => bot?.getFile?.(reference),
+      () => internal?.getFileUrl?.(reference)
+    ]
+    let url = ''
+    for (const attempt of attempts) {
+      const result = await withTimeout(attempt, MEDIA_FETCH_TIMEOUT)
+      url = urlOfFileResult(result)
+      if (url) break
+    }
+    if (mediaRefCache.size > 64) mediaRefCache.clear()
+    mediaRefCache.set(reference, { url, at: Date.now() })
+    return url
+  }
+
+  // 入站/出站统一入口：元素优先，其次 `event.message` 的原始附件与标记串，
+  // 最后退回 `content`（老适配器只给序列化文本）。同一个 URL 只留一条。
+  const collectMedia = async (source) => {
+    const bot = source?.bot
+    const items = []
+    const seen = new Set()
+
+    const add = async (descriptor) => {
+      if (!descriptor || items.length >= MEDIA_LIMIT) return
+      const raw = textOf(descriptor.source).trim()
+      const mime = textOf(descriptor.mime).trim()
+      const name = cleanName(descriptor.name)
+      const size = Number(descriptor.size) > 0 ? Number(descriptor.size) : undefined
+
+      let url = ''
+      let ref = ''
+      if (raw) {
+        const local = workspaceRelativeOf(raw)
+        if (local) url = local
+        else url = normalizeMediaUrl(raw)
+        if (!url && isWorkspacePath(raw)) url = raw
+        if (!url && mime && isBase64Payload(raw)) url = `data:${mime};base64,${raw}`
+        if (!url) {
+          url = await resolveReference(bot, raw)
+          // 换不到地址就原样留 ref：客户端据此显示占位/重试，不会误以为是 URL。
+          if (!url) ref = raw
+        }
+      }
+      const identity = url || ref
+      if (!identity || seen.has(identity)) return
+      seen.add(identity)
+
+      const item = { kind: descriptor.kind }
+      if (url) item.url = url
+      if (ref) item.ref = ref
+      if (name) item.name = name
+      if (mime) item.mime = mime
+      if (size) item.size = size
+      items.push(item)
+    }
+
+    for (const element of Array.isArray(source?.elements) ? source.elements : []) {
+      await add(elementMedia(element))
+    }
+    const eventMessage = source?.event
+    if (eventMessage && typeof eventMessage === 'object') {
+      for (const element of Array.isArray(eventMessage.elements) ? eventMessage.elements : []) {
+        await add(elementMedia(element))
+      }
+      for (const attachment of Array.isArray(eventMessage.attachments) ? eventMessage.attachments : []) {
+        const mime = textOf(attachment?.content_type ?? attachment?.contentType)
+        await add({
+          kind: mediaKind('attachment', mime),
+          source: textOf(attachment?.url ?? attachment?.src),
+          mime,
+          name: textOf(attachment?.filename),
+          size: attachment?.size
+        })
+      }
+      for (const descriptor of rawMediaTags(textOf(eventMessage.content))) await add(descriptor)
+    }
+    for (const descriptor of rawMediaTags(textOf(source?.content))) await add(descriptor)
+    return items
+  }
+
+  // 消息里所有能换地址的地方：`session.elements`、`session.content` 与事件原始消息。
+  // 出站只能在 `before-send` 抓到这份快照（`send` 的 session 没有 elements）。
+  const mediaSnapshot = (session) => ({
+    bot: session.bot,
+    elements: session.elements,
+    content: session.content,
+    event: session.event?.message
+  })
 
   // 落一条消息；同一个会话、同一个 time 视为同一条（多 bot 实例/适配器重复上报）。
   // 返回真正入库的消息（重复则 null），调用方据此决定是否推实时帧。
@@ -380,7 +669,8 @@ export function apply(ctx) {
       userId: textOf(entry.userId),
       userName: textOf(entry.userName),
       avatar: entry.avatar ? textOf(entry.avatar) : null,
-      content: textOf(entry.content)
+      content: textOf(entry.content),
+      media: Array.isArray(entry.media) ? entry.media : []
     }
 
     // 正常是追加；时间戳回退（适配器补发/重试）时插到正确位置，保持升序。
@@ -434,6 +724,7 @@ export function apply(ctx) {
     if (!key) return
     const entry = messageEntry(session, 'in')
     await resolveIdentity(session, entry)
+    entry.media = await collectMedia(mediaSnapshot(session))
     const message = record(key, entry)
     rememberInboundKey(entry, key)
     if (message) notify(key, message)
@@ -465,13 +756,15 @@ export function apply(ctx) {
   ctx.on('before-send', (session) => {
     outboundSlots.set(textOf(session.channelId), {
       content: normalizeContent(session.elements, session.content),
+      // `send` 的 session 没有 elements，媒体也只能在这一刻抓。
+      media: mediaSnapshot(session),
       conversationKey: conversationKeyOf(session),
       time: Date.now()
     })
     pruneOutbound()
   })
 
-  ctx.on('send', (session) => {
+  ctx.on('send', async (session) => {
     const channelId = textOf(session.channelId)
     const now = Date.now()
     const slot = outboundSlots.get(channelId)
@@ -487,15 +780,16 @@ export function apply(ctx) {
 
     const entry = messageEntry(session, 'out')
     entry.content = clipContent(slot.content)
+    entry.media = await collectMedia(slot.media)
     // 出站消息的作者是 bot 自己：`send` 的 session 是新造的，没有 user。
     if (!entry.userId) entry.userId = entry.selfId
     const botUser = session.bot?.user
-    entry.userName = textOf(botUser?.name) || entry.selfId
+    entry.userName = cleanName(botUser?.name) || entry.selfId
     entry.avatar = textOf(botUser?.avatar) || null
     // 主动推送时可能没有入站消息打过底，这里顺手用 send 事件自带的 guild 补群名。
     const eventGuild = session.event?.guild
     if (conversationKind(entry.guildId, entry.channelId) === 'group' && eventGuild?.name) {
-      entry.conversationName = textOf(eventGuild.name)
+      entry.conversationName = cleanName(eventGuild.name)
       entry.conversationAvatar = textOf(eventGuild.avatar) || null
     }
     // 平台回了消息 id 就用它；否则退回本地键——客户端靠 id 去重，空 id 会让同一条消息反复出现。
