@@ -119,14 +119,32 @@ class ChatTitle extends StatelessWidget {
   }
 }
 
+/// 信息栏常驻状态灯：四种状态共用同一枚胶囊（[_PillSurface]，22dp 高、圆角 20），
+/// 只有圆点颜色与底色档位随状态变化，呼吸动画只在 [StatusLight.thinking] 时挂载。
+enum StatusLight {
+  /// 待机：`onSurfaceVariant` 静态点，中性底色 —— 与模型胶囊同一块底，安静但不消失。
+  idle('待机'),
+
+  /// 思考中：主色圆点呼吸。
+  thinking('思考中'),
+
+  /// 回复中：主色静态圆点，不抢正文的注意力。
+  replying('回复中'),
+
+  /// 轮询中（SSE 断开）：warning 色静态圆点。
+  polling('轮询中');
+
+  const StatusLight(this.label);
+
+  final String label;
+}
+
 /// 会话信息栏：一行可横向滚动的轻量 pills，不再用整条灰底色块。
 class ChatInfoBar extends StatelessWidget {
   const ChatInfoBar({
     super.key,
     required this.session,
-    required this.running,
-    required this.liveOk,
-    this.statusLabel,
+    required this.light,
     this.botName,
     this.avatarUrl,
     this.debugMetrics = const [],
@@ -135,16 +153,15 @@ class ChatInfoBar extends StatelessWidget {
   });
 
   final SessionSummary session;
-  final bool running;
-  final bool liveOk;
 
-  /// 「思考中 / 回复中」；为空时不留胶囊（待机）。
-  final String? statusLabel;
+  /// 常驻状态灯：待机也留一盏静灯，用户随时能确认会话没有卡住。
+  final StatusLight light;
   final String? botName;
   final String? avatarUrl;
   final List<String> debugMetrics;
 
-  /// 开发者信息（平台 / 引擎 / 轮询状态 / 计时）默认隐藏，由设置里的开关打开。
+  /// 开发者信息（平台 / 引擎 / 计时）默认隐藏，由设置里的开关打开。
+  /// 轮询状态不在这里：它由常驻状态灯始终显示。
   final bool showDeveloperInfo;
   final VoidCallback? onModelTap;
 
@@ -161,7 +178,10 @@ class ChatInfoBar extends StatelessWidget {
           if (name != null && name.isNotEmpty)
             _InfoPill(
               label: name,
-              leading: AssistantAvatar(size: 16, imageUrl: avatarUrl),
+              leading: AssistantAvatar(
+                size: _PillSurface.contentHeight,
+                imageUrl: avatarUrl,
+              ),
             ),
           if (showDeveloperInfo) ...[
             if (session.origin.isNotEmpty) _InfoPill(label: session.origin),
@@ -178,17 +198,9 @@ class ChatInfoBar extends StatelessWidget {
               icon: Icons.memory_outlined,
               onTap: onModelTap,
             ),
-          if (running && statusLabel != null) _RunningPill(label: statusLabel!),
-          if (showDeveloperInfo) ...[
-            if (!liveOk)
-              const _InfoPill(
-                label: '轮询中',
-                icon: Icons.cloud_off_outlined,
-                tone: _PillTone.warning,
-              ),
-            for (final metric in debugMetrics)
-              _InfoPill(label: metric, tone: _PillTone.muted),
-          ],
+          _StatusPill(light: light),
+          if (showDeveloperInfo)
+            for (final metric in debugMetrics) _InfoPill(label: metric),
         ],
       ),
     );
@@ -205,53 +217,54 @@ String shortModelLabel(ModelRef ref) {
   return name.substring(cut + 1);
 }
 
-enum _PillTone { neutral, muted, warning }
+/// 胶囊底色档位：只决定底色，尺寸/字号/内边距全部由 [_PillSurface] 固定。
+enum _PillTone {
+  /// 中性：模型名、开发者信息、待机状态灯。
+  neutral,
 
+  /// 主色态：思考中 / 回复中。
+  accent,
+
+  /// 警示：轮询中。
+  alert,
+}
+
+/// 胶囊内文字：11px / 行高 1.2 / 字距 0.2，颜色由调用方按档位给定。
+TextStyle _pillLabelStyle(BuildContext context, Color color) {
+  final base = Theme.of(context).textTheme.labelSmall ?? const TextStyle();
+  return base.copyWith(fontSize: 11, height: 1.2, letterSpacing: 0.2, color: color);
+}
+
+/// 信息栏里不带状态的胶囊：bot 名（可带头像）、平台/引擎/计时、模型。
 class _InfoPill extends StatelessWidget {
   const _InfoPill({
     required this.label,
     this.icon,
     this.leading,
     this.onTap,
-    this.tone = _PillTone.neutral,
   });
 
   final String label;
   final IconData? icon;
   final Widget? leading;
   final VoidCallback? onTap;
-  final _PillTone tone;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final (Color fill, Color foreground) = switch (tone) {
-      _PillTone.neutral => (
-        scheme.surfaceContainerHighest.withValues(alpha: 0.38),
-        scheme.onSurfaceVariant,
-      ),
-      _PillTone.muted => (Colors.transparent, scheme.onSurfaceVariant.withValues(alpha: 0.6)),
-      _PillTone.warning => (scheme.errorContainer.withValues(alpha: 0.3), scheme.error),
-    };
+    final scheme = Theme.of(context).colorScheme;
     return _PillSurface(
-      fill: fill,
       onTap: onTap,
-      padding: EdgeInsets.fromLTRB(leading != null ? 3 : 9, 3, 9, 3),
       child: Row(
         mainAxisSize: MainAxisSize.min,
+        spacing: _PillSurface.gap,
         children: [
-          if (leading != null) ...[leading!, const SizedBox(width: 5)],
-          if (icon != null) ...[Icon(icon, size: 13, color: foreground), const SizedBox(width: 4)],
+          ?leading,
+          if (icon case final iconData?)
+            Icon(iconData, size: 13, color: scheme.onSurfaceVariant),
           Text(
             label,
             maxLines: 1,
-            style: theme.textTheme.labelSmall?.copyWith(
-              fontSize: 11,
-              height: 1.2,
-              letterSpacing: 0.2,
-              color: foreground,
-            ),
+            style: _pillLabelStyle(context, scheme.onSurfaceVariant),
           ),
         ],
       ),
@@ -259,38 +272,73 @@ class _InfoPill extends StatelessWidget {
   }
 }
 
-/// 运行中：低饱和胶囊 + 呼吸圆点，不抢消息区的注意力。
-class _RunningPill extends StatelessWidget {
-  const _RunningPill({required this.label});
+/// 常驻状态灯：与模型胶囊同款底座 + 圆点 + 文案。
+/// 底色档位与圆点颜色随状态变化；只有「思考中」挂呼吸动画，其余状态是静态圆点。
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.light});
 
-  final String label;
+  final StatusLight light;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    return _PillSurface(
-      fill: scheme.primary.withValues(alpha: 0.15),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _PulseDot(color: scheme.primary),
-          const SizedBox(width: 5),
-          Text(
-            label,
-            style: theme.textTheme.labelSmall?.copyWith(
-              fontSize: 11,
-              height: 1.2,
-              letterSpacing: 0.2,
-              color: scheme.primary,
+    final scheme = Theme.of(context).colorScheme;
+    final (Color dot, Color foreground, _PillTone tone) = switch (light) {
+      StatusLight.idle => (
+        scheme.onSurfaceVariant,
+        scheme.onSurfaceVariant,
+        _PillTone.neutral,
+      ),
+      StatusLight.thinking || StatusLight.replying => (
+        scheme.primary,
+        scheme.primary,
+        _PillTone.accent,
+      ),
+      StatusLight.polling => (scheme.error, scheme.error, _PillTone.alert),
+    };
+    return Semantics(
+      label: '状态：${light.label}',
+      excludeSemantics: true,
+      child: _PillSurface(
+        tone: tone,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          spacing: _PillSurface.gap,
+          children: [
+            if (light == StatusLight.thinking)
+              _PulseDot(color: dot)
+            else
+              _Dot(color: dot),
+            Text(
+              light.label,
+              maxLines: 1,
+              style: _pillLabelStyle(context, foreground),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 }
 
+/// 静态圆点：待机 / 回复中 / 轮询中的指示灯，不持有 ticker。
+class _Dot extends StatelessWidget {
+  const _Dot({required this.color});
+
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 6,
+      height: 6,
+      child: DecoratedBox(
+        decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+      ),
+    );
+  }
+}
+
+/// 呼吸圆点：只在「思考中」挂载，胶囊销毁动画即停。
 class _PulseDot extends StatefulWidget {
   const _PulseDot({required this.color});
 
@@ -318,42 +366,64 @@ class _PulseDotState extends State<_PulseDot> with SingleTickerProviderStateMixi
 
   @override
   Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _opacity,
-      child: SizedBox(
-        width: 6,
-        height: 6,
-        child: DecoratedBox(
-          decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
-        ),
-      ),
-    );
+    return FadeTransition(opacity: _opacity, child: _Dot(color: widget.color));
   }
 }
 
+/// 信息栏所有胶囊的唯一底座：固定 22dp 高、圆角 20、内边距 8/4/10/4、无描边，
+/// 底色只由 [_PillTone] 决定。模型胶囊、开发者信息胶囊、状态灯都走这里，
+/// 所以并排不会出现两套尺寸。
 class _PillSurface extends StatelessWidget {
   const _PillSurface({
     required this.child,
-    required this.fill,
+    this.tone = _PillTone.neutral,
     this.onTap,
-    this.padding = const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
   });
 
+  /// 胶囊总高（含上下各 4dp 内边距）。
+  static const double height = 22;
+
+  /// 内容可用高度 = [height] − 上下内边距，头像/图标按它对齐。
+  static const double contentHeight = 14;
+
+  /// 圆角：小尺寸胶囊统一取 20（视觉上接近胶囊形）。
+  static const double radius = 20;
+
+  /// 圆点/图标/头像与文字之间的间距。
+  static const double gap = 5;
+
+  static const EdgeInsets padding = EdgeInsets.fromLTRB(8, 4, 10, 4);
+
   final Widget child;
-  final Color fill;
+  final _PillTone tone;
   final VoidCallback? onTap;
-  final EdgeInsets padding;
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final fill = switch (tone) {
+      _PillTone.neutral => scheme.surfaceContainerHighest.withValues(alpha: 0.6),
+      _PillTone.accent => scheme.primary.withValues(alpha: 0.12),
+      _PillTone.alert => scheme.errorContainer.withValues(alpha: 0.3),
+    };
     return Material(
       color: fill,
-      shape: const StadiumBorder(),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.all(Radius.circular(radius)),
+      ),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
-        customBorder: const StadiumBorder(),
-        child: Padding(padding: padding, child: child),
+        customBorder: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(radius)),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: height),
+          child: Padding(
+            padding: padding,
+            child: child,
+          ),
+        ),
       ),
     );
   }

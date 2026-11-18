@@ -130,6 +130,8 @@ class _SessionsPageState extends State<SessionsPage> {
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+    // WS 取头像可能被网络抢先失败，刷新时补一次。
+    if (_bot == null) _loadBot();
   }
 
   Future<void> _loadMore() async {
@@ -151,12 +153,21 @@ class _SessionsPageState extends State<SessionsPage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
-  void _toggleSearch() {
+  /// 搜索框从标题位「拉出」：只替换 AppBar 内部内容，列表一行都不让。
+  Future<void> _openSearch() async {
+    await HapticFeedback.selectionClick();
+    if (!mounted || _searching) return;
+    setState(() => _searching = true);
+  }
+
+  void _exitSearch() {
+    // 先收焦点再切换：输入框随动画离场时键盘已经开始收起，不会残留光标。
     FocusScope.of(context).unfocus();
+    if (!_searching) return;
     setState(() {
-      _searching = !_searching;
+      _searching = false;
       // 退出搜索就清空关键词，回到原来的分组视图。
-      if (!_searching) _search.clear();
+      _search.clear();
     });
   }
 
@@ -437,49 +448,97 @@ class _SessionsPageState extends State<SessionsPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('会话'),
-        actions: [
-          IconButton(
-            onPressed: _toggleSearch,
-            icon: Icon(_searching ? Icons.close : Icons.search),
-            tooltip: _searching ? '退出搜索' : '搜索',
+        // 标题槽在「会话」与搜索框之间横切切换。AppBar 高度只由 toolbarHeight 决定，
+        // 两种标题内容都压在 40dp 以内，所以进出搜索不会改变 AppBar 尺寸。
+        title: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 180),
+          switchInCurve: Curves.easeOutCubic,
+          switchOutCurve: Curves.easeInCubic,
+          layoutBuilder: (current, previous) => Stack(
+            alignment: Alignment.centerLeft,
+            children: [...previous, ?current],
           ),
-          IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: '刷新'),
-          if (!_searching)
-            IconButton(onPressed: _openSettings, icon: const Icon(Icons.tune), tooltip: '设置'),
-        ],
-      ),
-      body: Column(
-        children: [
-          if (_searching) _searchBar(),
-          Expanded(
-            child: RefreshIndicator(onRefresh: _refresh, child: _content()),
+          transitionBuilder: (child, animation) => FadeTransition(
+            opacity: animation,
+            child: SizeTransition(
+              sizeFactor: animation,
+              axis: Axis.horizontal,
+              axisAlignment: -1,
+              child: child,
+            ),
           ),
-        ],
+          child: _searching ? _searchField() : const Text('会话', key: ValueKey('title')),
+        ),
+        actions: _appBarActions(),
       ),
+      // 列表直接交给 body：搜索态不再插入额外一行，切换前后位置完全一致。
+      body: RefreshIndicator(onRefresh: _refresh, child: _content()),
     );
   }
 
-  Widget _searchBar() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-      child: SearchBar(
-        controller: _search,
-        autoFocus: true,
-        hintText: '搜索会话名、引擎或模型',
-        leading: const Icon(Icons.search),
-        trailing: [
+  List<Widget> _appBarActions() {
+    if (_searching) {
+      return [
+        IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: '刷新'),
+        IconButton(onPressed: _exitSearch, icon: const Icon(Icons.close), tooltip: '退出搜索'),
+      ];
+    }
+    return [
+      IconButton(onPressed: _openSearch, icon: const Icon(Icons.search), tooltip: '搜索'),
+      IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: '刷新'),
+      IconButton(onPressed: _openSettings, icon: const Icon(Icons.tune), tooltip: '设置'),
+    ];
+  }
+
+  /// 无边框、透明填充的行内输入框：左侧搜索图标、右侧清除，都是 36dp 热区。
+  Widget _searchField() {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return SizedBox(
+      key: const ValueKey('search'),
+      height: 40,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 36,
+            height: 36,
+            child: Icon(Icons.search, size: 20, color: scheme.onSurfaceVariant),
+          ),
+          Expanded(
+            child: TextField(
+              controller: _search,
+              autofocus: true,
+              textInputAction: TextInputAction.search,
+              style: theme.textTheme.bodyLarge,
+              cursorColor: scheme.primary,
+              decoration: InputDecoration(
+                isDense: true,
+                filled: true,
+                fillColor: Colors.transparent,
+                border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                contentPadding: EdgeInsets.zero,
+                hintText: '搜索会话名、引擎或模型',
+                hintStyle: theme.textTheme.bodyLarge?.copyWith(color: scheme.onSurfaceVariant),
+              ),
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => setState(() {}),
+            ),
+          ),
           if (_search.text.isNotEmpty)
-            IconButton(
-              onPressed: _clearSearch,
-              icon: const Icon(Icons.close),
-              tooltip: '清除',
+            SizedBox(
+              width: 36,
+              height: 36,
+              child: IconButton(
+                onPressed: _clearSearch,
+                padding: EdgeInsets.zero,
+                iconSize: 18,
+                tooltip: '清除',
+                icon: const Icon(Icons.close),
+              ),
             ),
         ],
-        elevation: const WidgetStatePropertyAll<double?>(0),
-        textInputAction: TextInputAction.search,
-        onChanged: (_) => setState(() {}),
-        onSubmitted: (_) => setState(() {}),
       ),
     );
   }

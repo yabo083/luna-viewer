@@ -3,11 +3,13 @@
 // GET /api/workspace?path=<相对路径> 暴露给客户端（移动端渲染消息里的图片）。
 // 只读；路径必须落在工作区内。后续版本会在这里加：上传、临时签名、缩略图。
 //
-// 另外提供 GET /api/traffic：入站消息的旁路记录。纯指令消息（如 `chatluna-菜单`）
-// 在 Koishi 的指令层就被消费掉了，既不落会话日志也不加载 agent，客户端完全看不到；
-// 这里在事件层抄一份环形缓冲，让 App 的「消息记录」页能看见它们。
+// 另外提供 GET /api/traffic 与 GET /api/traffic/stream：入站消息的旁路记录。纯指令消息
+// （如 `chatluna-菜单`）在 Koishi 的指令层就被消费掉了，既不落会话日志也不加载 agent，
+// 客户端完全看不到；这里在事件层抄一份环形缓冲，让 App 的「消息记录」页能看见它们，
+// 并通过 SSE 实时推送。
 import { readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize, resolve, sep } from 'node:path'
+import { openStream } from '@chatluna/server'
 
 export const name = 'chatluna-workspace-files'
 export const inject = ['server']
@@ -31,6 +33,8 @@ const MIME = {
 // 环形缓冲：500 条足够覆盖「刚发完指令回 App 查看」的窗口，再多只是吃内存。
 const TRAFFIC_CAPACITY = 500
 const TRAFFIC_MAX_CONTENT = 500
+// 新连接先补最近 20 条，够 App 开局把「刚发的指令」补上；更早的走 /api/traffic 翻。
+const TRAFFIC_STREAM_HISTORY = 20
 
 // `session.content` 是元素序列化后的原始标记（`<img .../>`、`<at id=.../>`），
 // 直接给人看没有意义；按元素类型翻译成可读片段。
@@ -96,9 +100,19 @@ export function apply(ctx) {
 
   // 指令在 `message` 事件之后才被匹配执行，所以这里能看到没进会话的那部分。
   const traffic = []
+  // 在线 SSE 订阅者；连接关闭时自己摘除，插件卸载时统一收尾，避免计时器/写句柄泄漏。
+  const subscribers = new Set()
+  ctx.on('dispose', () => {
+    for (const stream of subscribers) stream.close()
+    subscribers.clear()
+  })
+
   ctx.on('message', (session) => {
-    traffic.push(trafficEntry(session))
+    const entry = trafficEntry(session)
+    traffic.push(entry)
     if (traffic.length > TRAFFIC_CAPACITY) traffic.splice(0, traffic.length - TRAFFIC_CAPACITY)
+    // 推送失败（背压/已断开）不影响缓冲：客户端重连时靠历史帧补齐。
+    for (const stream of subscribers) stream.send({ event: 'traffic', data: entry })
   })
 
   const serve = async (relative, res) => {
@@ -159,5 +173,16 @@ export function apply(ctx) {
     res.headers.set('content-type', 'application/json; charset=utf-8')
     res.headers.set('cache-control', 'no-store')
     res.body = JSON.stringify({ items })
+  })
+
+  // SSE：先补最多 20 条历史（旧 → 新，客户端可顺序追加），之后每条入站消息一帧。
+  // openStream 负责 text/event-stream 头、flushHeaders、15s `: ping` 心跳与断开清理。
+  ctx.server.get('/api/traffic/stream', async (req, res) => {
+    const stream = openStream(ctx, res)
+    subscribers.add(stream)
+    stream.onClose(() => subscribers.delete(stream))
+    for (const entry of traffic.slice(-TRAFFIC_STREAM_HISTORY)) {
+      stream.send({ event: 'traffic', data: entry })
+    }
   })
 }

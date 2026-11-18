@@ -116,8 +116,8 @@ class ChatMessage {
     required this.role,
     required this.blocks,
     this.form = '',
-    this.isFramework = false,
-  });
+    bool isFramework = false,
+  }) : _declaredFramework = isFramework;
 
   final String id;
   final String role;
@@ -126,9 +126,13 @@ class ChatMessage {
   /// 服务端标记的消息形态：`notice` 是引擎/插件注入的内部消息（wake、turn 装配），不是用户发言。
   final String form;
 
-  /// 框架消息：`form` 不是 `message`（如 `notice`），或来源是插件（`source.kind == 'plugin'`）。
-  /// 这类消息不属于对话双方，渲染成居中的弱化块。
-  final bool isFramework;
+  /// 服务端/插件声明的框架消息：`form` 不是 `message`（如 `notice`），或来源是插件
+  /// （`source.kind == 'plugin'`）。
+  final bool _declaredFramework;
+
+  /// 框架消息：不属于对话双方，渲染成居中的弱化块。
+  /// 除服务端声明外，用户角色下的指令/帮助文本也并进来（见 [isCommandMessage]）。
+  bool get isFramework => _declaredFramework || isCommandMessage;
 
   bool get isUser => role == 'user';
 
@@ -176,6 +180,35 @@ class ChatMessage {
     body = body.replaceAll(RegExp(r'</(turn|status|message|mood|bond|state)>'), '');
     body = body.replaceAll(RegExp(r'<(?!br\s*/?>)(/?[a-zA-Z][^>]*)>'), '');
     return body.trim();
+  }
+
+  /// 指令类文本：只认用户角色（避免把模型正文里引用命令的帮助文字误判成指令）。
+  /// - 首行（trim 后）以 `chatluna ` 开头：单条命令或单行说明；
+  /// - 或 ≥ [_commandListLines] 个非空行都以 `chatluna ` 开头：`chatluna help` 之类的命令清单。
+  /// 判定基于已清洗的 [bodyMarkdown]（XML 标签已剥掉），因此不会读到 `<turn>` 之类的噪声。
+  late final bool isCommandMessage = _isCommandMessage();
+
+  /// 命令前缀：插件命令空间，命令与参数之间必有一个空格。
+  static const String _commandPrefix = 'chatluna ';
+
+  /// 清单阈值：3 行以上同时以命令前缀开头就不再像人话，而是帮助列表。
+  static const int _commandListLines = 3;
+
+  bool _isCommandMessage() {
+    if (role != 'user') return false;
+    final body = bodyMarkdown;
+    if (body.isEmpty) return false;
+    final lines = [
+      for (final line in body.split('\n'))
+        if (line.trim().isNotEmpty) line.trim(),
+    ];
+    if (lines.isEmpty) return false;
+    if (lines.first.startsWith(_commandPrefix)) return true;
+    var commands = 0;
+    for (final line in lines) {
+      if (line.startsWith(_commandPrefix)) commands += 1;
+    }
+    return commands >= _commandListLines;
   }
 
   /// 模型的思考过程（reasoning 块），UI 折叠展示。

@@ -609,19 +609,28 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
 /// 框架消息的文本解析：抽出结构标题，丢掉首行的 `---` 与尾部空行，剩余行按空行分段。
 /// 公开给页面层：`ChatPage` 用 [parse]/[key] 判断相邻框架消息是否同一类型、能否合并成一块。
 class Notice {
-  const Notice(this.title, this.lines);
+  const Notice(this.title, this.lines, {this.tag = ''});
 
-  /// 标题：首行是 `[xxx]` 就整行拿来当标题；否则取首行前 24 字做预览标题。
+  /// 标题：首行以 `[xxx]` 开头时是 `[xxx]` + 紧随其后的一小段文字；
+  /// 首行没有结构头时取前 24 字做预览标题。
   final String title;
 
-  /// 正文行：`[xxx]` 标题行不进正文；`---` 分隔线只做视觉标记。
+  /// 正文行：`[xxx]` 结构头不进正文；`[xxx] 尾巴` 只去掉 `[xxx]`、尾巴留在正文首行，
+  /// 避免标题与第一行预览重复。`---` 分隔线只做视觉标记；
   /// 没有结构头的首行只当标题预览，展开时正文仍保留它。
   final List<String> lines;
+
+  /// 结构标签（`[xxx]` 含方括号）；首行不是结构头时为空串。
+  /// 合并分组用它当类型：`[memory update]` 与 `[memory update] Memory lines…` 属同一类型。
+  final String tag;
 
   /// 无结构头时标题取的字符数。
   static const _titleChars = 24;
 
-  static final _bracketTitle = RegExp(r'^\[[^\]]+\]$');
+  /// 结构头之后标题补充的字数：够认人，又不挤爆卡片头。
+  static const _tagTailChars = 18;
+
+  static final _bracketHead = RegExp(r'^(\[[^\]]+\])\s*(.*)$');
   static final _rule = RegExp(r'^(-{3,}|\*{3,}|_{3,})$');
   static final _url = RegExp(r'^https?://\S+$');
   static final _space = RegExp(r'\s+');
@@ -630,7 +639,7 @@ class Notice {
   /// 页面层用它判断相邻两条框架消息是不是同一类型。
   static String key(String title) => title.toLowerCase().replaceAll(_space, '');
 
-  /// 结构化解析：首行 `[xxx]` 整行当标题，否则取首行前 24 字；其余行是正文。
+  /// 结构化解析：首行 `[xxx]`（可带尾巴）抽成标题，否则取首行前 24 字；其余行是正文。
   static Notice parse(String raw) {
     final source = raw.split('\n');
     var start = 0;
@@ -646,15 +655,33 @@ class Notice {
     if (start >= source.length) return const Notice('系统消息', []);
     final first = source[start].trim();
     final rest = _trimTrailing(source.sublist(start));
-    // `[memory update]` 这类首行是结构头：抽成标题并从正文去掉（长标题交给胶囊自身省略）。
-    if (_bracketTitle.hasMatch(first)) {
-      return Notice(first, _trimTrailing(rest.sublist(1)));
+    final head = _bracketHead.firstMatch(first);
+    if (head != null) {
+      final tag = head.group(1)!;
+      final tail = head.group(2)!.trim();
+      // `[memory update]`：整行就是结构头，标题即标签，正文从第二行起。
+      if (tail.isEmpty) return Notice(tag, _trimTrailing(rest.sublist(1)), tag: tag);
+      // `[memory update] Memory lines not shown…`：标题 = 标签 + 一小段尾巴，
+      // 正文首行只保留尾巴（去掉 `[tag]` 前缀），预览里不再重复标签。
+      return Notice(
+        '$tag ${_clipTail(tail)}',
+        _trimTrailing([tail, ...rest.sublist(1)]),
+        tag: tag,
+      );
     }
     return Notice(_clip(first), rest);
   }
 
   static String _clip(String text) =>
       text.length <= _titleChars ? text : '${text.substring(0, _titleChars)}…';
+
+  /// 标签后的尾巴按词截断（不留半个词）；尾巴本身很短时原样保留。
+  static String _clipTail(String text) {
+    if (text.length <= _tagTailChars) return text;
+    final cut = text.substring(0, _tagTailChars);
+    final space = cut.lastIndexOf(' ');
+    return '${(space >= 6 ? cut.substring(0, space) : cut).trimRight()}…';
+  }
 
   static List<String> _trimTrailing(List<String> lines) {
     var end = lines.length;

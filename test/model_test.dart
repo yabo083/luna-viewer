@@ -173,6 +173,19 @@ void main() {
       expect(make({}).isFramework, isFalse);
     });
 
+    test('指令帮助文本按框架消息处理', () {
+      ChatMessage make(String role, String text) => ChatMessage.fromJson({
+        'role': role,
+        'content': [
+          {'type': 'text', 'text': text},
+        ],
+      });
+      const help = 'chatluna ban 封禁用户\nchatluna bind 绑定主人\nchatluna undo 撤销修改';
+      expect(make('user', help).isFramework, isTrue);
+      expect(make('assistant', help).isFramework, isFalse);
+      expect(make('user', '我刚用 chatluna ban 试了一下').isFramework, isFalse);
+    });
+
     test('表情与 @ 有可读占位', () {
       final message = ChatMessage.fromJson({
         'role': 'user',

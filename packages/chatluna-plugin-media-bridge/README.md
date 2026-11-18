@@ -33,6 +33,23 @@ Authorization: Bearer <实例 token 或登录 session>
   `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
 - 只在内存里，重启实例清空；未带凭证 → 401（同上，`/api` 守卫）。
 
+## 消息推送（`GET /api/traffic/stream`）
+
+同一份环形缓冲的 Server-Sent Events 出口，App 会话页保持长连接即可实时看到入站消息
+（包括纯指令消息）：
+
+```
+curl -N -H "Authorization: Bearer <实例 token 或登录 session>" \
+  http://127.0.0.1:5028/api/traffic/stream
+```
+
+- 连接建立后先补最近 20 条（旧 → 新，客户端按序追加），字段与 `/api/traffic` 的 `items` 完全一致。
+- 之后每条新入站消息推一帧：`event: traffic`，`data` 是单条 JSON（无 `items` 包装）。
+- 每 15s 一行 `: ping` 注释保活；响应带 `x-accel-buffering: no`，代理不会缓冲首帧。
+- 客户端断开或 `close` 时服务端移除订阅者；未带凭证 → 401（同上，`/api` 守卫）。
+- 实现复用 `@chatluna/server`（实例 `node_modules` 里）的 `openStream`：头、flushHeaders、
+  心跳、close 清理都由它负责，本插件只维护订阅者集合。
+
 ## 安装
 
 1. 拷到实例：`/root/chatluna/external/chatluna-plugin-media-bridge/index.mjs`

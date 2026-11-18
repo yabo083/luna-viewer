@@ -10,8 +10,8 @@ import 'chat_chrome.dart';
 import 'message_view.dart';
 
 /// 实时流的唯一状态来源：UI 只读它，不再散落一堆 bool。
-/// - `idle`：没有生成，列表首格不占位；
-/// - `thinking`：在跑但还没有正文（reasoning / 工具阶段），胶囊带三点呼吸；
+/// - `idle`：没有生成，列表首格不占位；信息栏只留一盏「待机」静灯；
+/// - `thinking`：在跑但还没有正文（reasoning / 工具阶段），信息栏圆点呼吸、消息区胶囊带三点呼吸；
 /// - `replying`：正文 delta 已到，胶囊保持静态；
 /// - `failed`：SSE 断开，退回轮询。
 enum LiveState {
@@ -23,15 +23,18 @@ enum LiveState {
   /// 有生成在跑（思考或回复）：中止按钮与信息栏读它。
   bool get generating => this == LiveState.thinking || this == LiveState.replying;
 
-  /// 列表首格是否需要状态胶囊：待机不显示。
+  /// 列表首格是否需要状态胶囊：待机不占位（待机灯常驻在信息栏，不进消息列表）。
   bool get hasCapsule => this != LiveState.idle;
 
-  /// 胶囊文案；`idle` 没有胶囊。
-  String? get capsuleLabel => switch (this) {
-    LiveState.thinking => '思考中',
-    LiveState.replying => '回复中',
-    LiveState.failed => '轮询中',
-    LiveState.idle => null,
+  /// 胶囊文案：信息栏常驻状态灯与消息区占位共用，`idle` 也有（「待机」）。
+  String get capsuleLabel => statusLight.label;
+
+  /// 信息栏状态灯：待机灰点、思考中主色呼吸、回复中主色静止、轮询中 warning 静止。
+  StatusLight get statusLight => switch (this) {
+    LiveState.idle => StatusLight.idle,
+    LiveState.thinking => StatusLight.thinking,
+    LiveState.replying => StatusLight.replying,
+    LiveState.failed => StatusLight.polling,
   };
 }
 
@@ -400,13 +403,15 @@ class _ChatPageState extends State<ChatPage> {
     return rows;
   }
 
-  /// 合并键：框架消息且正文非空时，返回归一化后的标题；不同类型的框架消息键不同。
-  /// 正文为空的框架消息只剩一个标题头，没有可合并的正文，按独立行处理。
+  /// 合并键：框架消息且正文非空时返回类型键；不同类型的框架消息键不同。
+  /// 有结构标签就按标签归组（`[memory update]` 与 `[memory update] Memory lines…` 属同一类型），
+  /// 否则按归一化标题。正文为空的框架消息只剩一个标题头，按独立行处理。
   static String? _mergeKey(ChatMessage message) {
     if (!message.isFramework) return null;
     final body = message.bodyMarkdown;
     if (body.trim().isEmpty) return null;
-    return Notice.key(Notice.parse(body).title);
+    final notice = Notice.parse(body);
+    return Notice.key(notice.tag.isEmpty ? notice.title : notice.tag);
   }
 
   /// 从 [start] 起连续同键框架消息的结束下标（不含）。
@@ -653,9 +658,7 @@ class _ChatPageState extends State<ChatPage> {
         children: [
           ChatInfoBar(
             session: _summary,
-            running: generating,
-            liveOk: _live != LiveState.failed,
-            statusLabel: _live.capsuleLabel,
+            light: _live.statusLight,
             botName: widget.botName,
             avatarUrl: widget.avatarUrl,
             debugMetrics: _debugMetrics(),
@@ -738,8 +741,8 @@ class _RenderRow {
   final int srcEnd;
 }
 
-/// 实时状态胶囊：待机不出现；「思考中」挂三点呼吸，「回复中」「轮询中」保持静态。
-/// 动画随胶囊一起挂载/销毁——正文流入时不再有动画和长文本抢注意力。
+/// 实时状态胶囊：待机不出现（待机灯在信息栏）；「思考中」挂三点呼吸，
+/// 「回复中」「轮询中」保持静态。动画随胶囊一起挂载/销毁——正文流入时不再有动画和长文本抢注意力。
 class _LiveCapsule extends StatelessWidget {
   const _LiveCapsule({required this.state});
 
@@ -749,8 +752,9 @@ class _LiveCapsule extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    // 「待机」只属于信息栏的常驻灯，消息列表里不画这一行。
+    if (!state.hasCapsule) return const SizedBox.shrink();
     final label = state.capsuleLabel;
-    if (label == null) return const SizedBox.shrink();
     final thinking = state == LiveState.thinking;
     final failed = state == LiveState.failed;
     final accent = failed ? scheme.error : scheme.primary;
