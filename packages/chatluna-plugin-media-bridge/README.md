@@ -16,18 +16,19 @@ Authorization: Bearer <实例 token 或登录 session>
 
 ## 消息记录（`GET /api/traffic`）
 
-纯指令消息（如 `chatluna-菜单`）在 Koishi 的指令层就被消费，既不落会话日志也不加载 agent，
-客户端完全看不到。插件在 `ctx.on('message')`（指令匹配之前）抄一份入站消息到 500 条的
-内存环形缓冲，供 App 的「消息记录」页查看：
+纯指令消息（如 `chatluna-菜单`）在 Koishi 的指令层就被消费，既不落会话日志也不加载 agent；
+bot 借框架之口发的回复（`session.send`，指令回复就是这条路）同样只发到平台、不进 agent 日志。
+客户端两边都看不到，所以插件在事件层抄一份到 500 条的内存环形缓冲，供 App 的「消息记录」页查看：
 
 ```
 GET /api/traffic?limit=50&platform=qq&channelId=C3A7...
 Authorization: Bearer <实例 token 或登录 session>
 
-{"items":[{"id","time","platform","selfId","userId","channelId","guildId","content","conversationKey","routeId"}]}
+{"items":[{"id","dir","time","platform","selfId","userId","channelId","guildId","content","conversationKey","routeId"}]}
 ```
 
 - 新 → 旧；`limit` 默认 50（1–200），`platform` / `channelId` 空串表示不过滤。
+- `dir`：`in` 是收到的消息（`ctx.on('message')`），`out` 是 bot 自己发出的回复。
 - `conversationKey` 是 ChatLuna 的 `session.conversation.key`（群聊形如 `r-1a2b3c4d5e6f`，
   个人/泳道配置会带 `:user:` / `:lane:` 后缀），`routeId` 是同一路由的 id；会话标题里那种
   `A1338876…` 与 `channelId`/`guildId` 的 `C…` 不是同一命名空间，**客户端匹配会话要用
@@ -40,10 +41,31 @@ Authorization: Bearer <实例 token 或登录 session>
   `[文件]`/`[语音]`/`[视频]`，其它元素忽略），压成一行后截断 500 字。
 - 只在内存里，重启实例清空；未带凭证 → 401（同上，`/api` 守卫）。
 
+### 出站（`dir: "out"`）
+
+适配器的 `send` 事件（`ctx.on('send')`）在消息真正落到平台之后才发，带真实消息 id（`id` 就是它），
+但它传进来的 session 是新造的 `bot.session()`，**没有** `elements`（`@satorijs/adapter-qq` 的
+flush 里 `decodeMessage` 那一行还是注释掉的）。正文只能在 `before-send`（`MessageEncoder` 渲染前）
+那一刻拿到，所以：
+
+- `ctx.on('before-send')` 只把「这个频道最近要发什么」（正文、`conversationKey`）存成快照，2s 过期；
+- `ctx.on('send')` 才落一条 `dir: "out"` 的条目，正文取自快照，`id` 取平台消息 id
+  （平台不给 id 时退回 `out-<selfId>:<时间>:<序号>`，客户端靠 `id` 去重）。
+- 快照过期/缺失（例如有代码绕过 `MessageEncoder` 直接调 `bot.internal`）时**不写**条目：正文不可知，
+  写空正文只会污染「消息记录」。
+- 去重：同一条出站可能被多个 bot 实例/适配器各上报一次，一次回复也可能被拆成多段 flush；同一个
+  `channelId` + 同样的正文在 500ms 内只记一条（去重键不含 `selfId`）。
+- 出站条目的 `userId` 是 bot 自己（`selfId`）：`send` 的 session 不带 user。
+- `conversationKey` / `routeId` **沿用该频道最近一条入站消息的值**：`send` 的 session 是
+  `bot.session()` 新造的，`isDirect` 这类挂在 Session 原型上的访问器没被复制过去，私聊会被算成
+  「频道」路由（少了 `:user:`），和 App 看到的会话 id 对不上。回复总是发回它来的那个频道，所以
+  这样取才是同一个会话；该频道还没有入站记录（主动推送）时才退回 `before-send` 时算出的键。
+- 只记录，不回灌 `message` 事件，所以不会形成「自己发的消息被当成入站」的回环。
+
 ## 消息推送（`GET /api/traffic/stream`）
 
-同一份环形缓冲的 Server-Sent Events 出口，App 会话页保持长连接即可实时看到入站消息
-（包括纯指令消息）：
+同一份环形缓冲的 Server-Sent Events 出口，App 会话页保持长连接即可实时看到入站与出站消息
+（包括纯指令消息与 bot 的回复）：
 
 ```
 curl -N -H "Authorization: Bearer <实例 token 或登录 session>" \

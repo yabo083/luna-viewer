@@ -71,6 +71,7 @@ class SessionSummary {
     required this.running,
     required this.engine,
     this.model,
+    this.trafficOnly = false,
   });
 
   final String id;
@@ -80,6 +81,10 @@ class SessionSummary {
   final bool running;
   final String engine;
   final ModelRef? model;
+
+  /// 只由入站流量推导出来的会话：`/api/sessions` 里没有它（ChatLuna 还没加载），
+  /// 因此没有历史日志、没有模型、也不能中止/压缩 —— 详情页只有实时消息。
+  final bool trafficOnly;
 
   bool get writable => origin == 'web';
 
@@ -161,19 +166,21 @@ class ChatMessage {
     );
   }
 
-  /// 合成消息：不存在于会话日志、由页面侧旁路数据生成的一条（目前是 `/api/traffic` 的
-  /// 指令）。[form] 标明来源，一律按框架卡片渲染；`id` 由调用方保证唯一，去重靠它。
+  /// 合成消息：不存在于会话日志、由页面侧旁路数据生成的一条（`/api/traffic` 的指令与
+  /// 机器人已发出的回复）。[form] 标明来源；[framework] 为假时按普通消息渲染（bot 回复）。
+  /// `id` 由调用方保证唯一，去重靠它。
   factory ChatMessage.synthetic({
     required String id,
     required String form,
     required String text,
     String role = 'user',
+    bool framework = true,
   }) => ChatMessage(
     id: id,
     role: role,
     blocks: [ChatBlock('text', {'text': text})],
     form: form,
-    isFramework: true,
+    isFramework: framework,
   );
 
   /// 角色引擎把正文包在 `<message>…</message>` 里；图片是 `<img src="…">`；`<status/>` 是状态栏，不展示。

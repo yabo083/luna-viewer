@@ -25,14 +25,60 @@ Set<String> candidateIdsOf(String title) {
 
 final RegExp _candidatePattern = RegExp(r'[0-9A-Fa-f]{16,}|\d{7,}');
 
-/// 命中条目的两级判断：
-/// 1. 服务端给了会话键（新插件）：和会话 id 相等才算命中，别的会话一律不算；
-/// 2. 没有会话键（旧插件）：退回标题里的候选 id，频道 / 群 / 发言者任一相同（忽略大小写）即命中。
+/// 归一：去掉 `route:` 前缀与 `:user:` / `:lane:` 段。
+/// 服务端 `conversationKey` 是 `r-<hash>`，App 会话 id 是 `route:r-<hash>:user:<id>`：
+/// 两边归一后，同一个群 / 私聊 route 才相等。
+String normalizeConversationKey(String value) {
+  final trimmed = value.trim();
+  final key = trimmed.startsWith(_routePrefix) ? trimmed.substring(_routePrefix.length) : trimmed;
+  final cut = key.indexOf(_suffixMarker);
+  return cut > 0 ? key.substring(0, cut) : key;
+}
+
+const String _routePrefix = 'route:';
+final RegExp _suffixMarker = RegExp(r':(user|lane):');
+
+/// 一条流量记录所属会话的归一键：
+/// - 新插件给了会话键（`r-<hash>`）→ 归一后就是会话 id 的中段；
+/// - 旧插件没有会话键 → 只能分到频道粒度，用 `平台\u0000频道`（[TrafficEntry.conversationKey]）。
 ///
-/// `routeId` 不参与判断：它是 `route:r-<sha256 前 12 位>`，标题里没有推导它的原料。
+/// 列表页用 `route:$key` 合成「仅流量会话」的 id，详情页再归一回来过滤实时流：
+/// 这条规则是列表与详情两边唯一的一致性来源。
+String trafficConversationKey(TrafficEntry entry) {
+  final key = entry.serverKey?.trim() ?? '';
+  if (key.isNotEmpty) return normalizeConversationKey(key);
+  if (entry.platform.isEmpty && entry.channelId.isEmpty) return '';
+  return entry.conversationKey;
+}
+
+/// 指令形态：`chatluna …`（插件命令空间）或以 `/` 开头的斜杠命令。
+/// 普通消息同样会进旁路流，但它们在 `/events` 里已经有真实气泡，
+/// 不能再画一张标成「指令」的卡：只有被指令层吃掉的那些才需要旁路补出来。
+bool isCommandish(String text) {
+  final head = text.trimLeft();
+  return head.toLowerCase().startsWith('chatluna') || head.startsWith('/');
+}
+
+/// 命中条目的判断（任一命中即可）：
+/// 1. 服务端给了会话键：归一后与 [sessionId] 相等；
+/// 2. 没有会话键（旧插件）：条目的「平台 + 频道」分组键等于归一后的 [sessionId]
+///    —— 仅流量会话的 id 就是 `route:` + 这个分组键，详情页因此能收到它的实时流；
+/// 3. 标题里的候选 id：频道 / 群 / 发言者任一相同（忽略大小写）。
+///
+/// 后两级都要留：插件拿不到 `session.conversation` 时会把 `channelId` 填进会话键，
+/// 那种键永远对不上会话 id（`r-<hash>`），只有标题 id 能兜住。
+/// 反过来群会话里标题 id 是另一套命名空间，只有会话键能命中。
+///
+/// `routeId` 不参与判断：它是 `r-<sha256 前 12 位>`，标题里没有推导它的原料，且与 `conversationKey` 同值。
 bool matchesTraffic(Set<String> ids, TrafficEntry entry, String sessionId) {
+  final session = normalizeConversationKey(sessionId);
   final key = entry.serverKey;
-  if (key != null && key.isNotEmpty) return key.trim() == sessionId;
+  if (key != null && key.isNotEmpty) {
+    if (normalizeConversationKey(key) == session) return true;
+  } else if (entry.conversationKey == session) {
+    // 旧插件没有会话键：仅流量会话的 id 就是 `route:平台\u0000频道`，与条目的分组键直接相等。
+    return true;
+  }
   if (ids.isEmpty) return false;
   for (final value in <String?>[entry.channelId, entry.guildId, entry.userId]) {
     if (value == null || value.isEmpty) continue;
@@ -166,9 +212,15 @@ class TrafficStream {
     _closed = true;
     _retry?.cancel();
     _poll?.cancel();
-    _sse?.cancel();
+    final sub = _sse;
     _sse = null;
+    // 先取消订阅、让在途响应正常收尾；立刻 close 会让它以 ClientException 结束并被当成未处理错误。
+    unawaited(sub?.cancel().catchError((Object _) {}));
     _controller.close();
-    _api.close();
+    Future<void>.delayed(const Duration(milliseconds: 80), () {
+      try {
+        _api.close();
+      } catch (_) {}
+    });
   }
 }

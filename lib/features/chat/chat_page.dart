@@ -103,6 +103,18 @@ class _ChatPageState extends State<ChatPage> {
   /// 首个 snapshot 是否已到：权威帧之前，`session.running` 只是乐观值。
   bool _snapshotSeen = false;
 
+  /// 仅实时模式：服务端没有这个会话的日志（`/messages` 404，通常是 ChatLuna 还没加载它）。
+  /// 此时不显示错误页、不重试历史，页面内容全部来自旁路流量流。
+  bool _liveOnly = false;
+
+  /// 是否有「真实气泡」来源（历史日志 + `/events`）：有的话普通入站消息不必再补一张。
+  /// 必须从第一帧就按 summary 定：仅流量会话没有历史，而 SSE 首连的回放帧通常
+  /// **先于** 404 到达，那时若还按「有历史」过滤，14 条回放会被整批丢掉且不会再重放。
+  bool _hasHistory = false;
+
+  /// `/live` 只开一次；仅实时会话先不开，等历史真的取到再补上。
+  bool _liveStarted = false;
+
   LiveState _live = LiveState.idle;
   String? _error;
 
@@ -159,6 +171,9 @@ class _ChatPageState extends State<ChatPage> {
     // 列表页的 running 只做乐观值：首个 snapshot 到达后一律以服务端为准。
     // 还没见到正文，先按「思考中」显示（快照/正文一到立刻细分）。
     _live = widget.session.running ? LiveState.thinking : LiveState.idle;
+    // 仅流量会话的开局就按「没有历史」处理：它不在 `/api/sessions` 里，`/events` 不会来，
+    // 入站消息只能靠旁路流补（见 [_hasHistory]）。
+    _hasHistory = !widget.session.trafficOnly;
     _scroll.addListener(_onScroll);
     final initial = widget.initial;
     if (initial != null) {
@@ -173,9 +188,10 @@ class _ChatPageState extends State<ChatPage> {
       _load();
     }
     // 首帧先画出来再连实时流：SSE 握手与首个 snapshot 会和首屏排版抢时间。
+    // 仅流量会话没有 agent，`/live` 只会 404：等 `_load` 失败或成功后再决定要不要开。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _startLive();
+      if (!widget.session.trafficOnly) _startLive();
       _startTraffic();
     });
   }
@@ -200,12 +216,19 @@ class _ChatPageState extends State<ChatPage> {
   int _since() => DateTime.now().difference(_t0).inMilliseconds;
 
   Future<void> _load() async {
+    // 仅实时模式：会话不在服务端，历史永远 404。轮询/收尾回调都会走到这里，
+    // 一次都不该再打网络。
+    if (_liveOnly) return;
     // 已知 id：重取后多出来的才算「刚进日志」，用来撤掉被回显的旁路卡片。
     final known = {for (final message in _all) message.id};
     try {
       final transcript = await widget.repo.transcript(widget.session.id);
       if (!mounted) return;
       _netMs = _since();
+      // 历史拿到了：普通入站消息从这一刻起由日志/`events` 负责，旁路只补指令。
+      _hasHistory = true;
+      // 合成会话也可能已经被加载了（列表还没刷新）：历史一拿到就按正常页面跑。
+      _startLive();
       setState(() {
         final keepWindow = _all.isNotEmpty;
         _all = transcript.messages;
@@ -231,6 +254,20 @@ class _ChatPageState extends State<ChatPage> {
       });
     } on ApiFailure catch (e) {
       if (!mounted) return;
+      if (e.code == 'NOT_FOUND' || e.status == 404) {
+        // 会话还没被 ChatLuna 加载：不显示错误页，空历史 + 旁路实时流就是全部内容。
+        setState(() {
+          _liveOnly = true;
+          _hasHistory = false;
+          _loading = false;
+          _error = null;
+        });
+        // 首连的回放帧可能早于这次 404 到达，被「有历史就不补入站」的门禁丢掉：
+        // 重开一条旁路流让服务端再放一遍最近 20 条，这次全部放行。
+        // 已经渲染过的条目由 `_trafficSeen` 挡住，不会重复。
+        _restartTraffic();
+        return;
+      }
       setState(() {
         _loading = false;
         _error = '${e.code}：${e.message}';
@@ -266,6 +303,8 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _startLive() {
+    if (_liveStarted || _liveOnly || !mounted) return;
+    _liveStarted = true;
     // 8s 内既没有 snapshot 也没有任何事件：乐观的 running 收回去，空闲会话绝不播动画。
     _snapshotTimer?.cancel();
     _snapshotTimer = Timer(const Duration(seconds: 8), () {
@@ -421,7 +460,7 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  /// 旁路流：新插件的 `conversationKey` 就是会话 id，标题里没有 id 的会话也能命中，
+  /// 旁路流：服务端会话键（归一后）就是会话 id，标题里没有 id 的会话也能命中，
   /// 所以只要有 token 就订阅（只在页面打开期间，关闭即断开一条连接）。
   /// 详情页只拿到 `ApiClient.authHeaders`，从同一个头里取回 token 自建客户端。
   void _startTraffic() {
@@ -437,6 +476,17 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  /// 重开旁路流：只为一件事——让服务端再回放一遍最近 20 条。
+  /// 仅在某批回放被门禁丢掉后需要（见 `_load` 的 404 分支）；已经画过的条目由
+  /// `_trafficSeen` 挡住，重放不会产生重复。
+  void _restartTraffic() {
+    _trafficSub?.cancel();
+    _trafficSub = null;
+    _trafficStream?.dispose();
+    _trafficStream = null;
+    _startTraffic();
+  }
+
   String? get _bearer {
     final raw = widget.headers['authorization'] ?? widget.headers['Authorization'];
     if (raw == null) return null;
@@ -447,11 +497,18 @@ class _ChatPageState extends State<ChatPage> {
         : value;
   }
 
-  /// 服务端不做会话过滤：会话键优先，旧插件退回标题 id（见 [matchesTraffic]）。
+  /// 服务端不做会话过滤：会话键（归一后与会话 id 相等）或标题 id 命中才入列，
+  /// 任一命中即可（见 [matchesTraffic]）。
   void _onTraffic(TrafficEntry entry) {
     if (!mounted) return;
     if (!matchesTraffic(_trafficIds, entry, widget.session.id)) return;
-    final key = entry.dedupeKey;
+    // 正文为空（纯状态帧之类）没法画成一条消息。
+    if (entry.display.trim().isEmpty) return;
+    // 出站是 bot 自己发出的回复：会话日志可能还没落，直接补一条气泡。
+    // 入站只有指令形态才补框架卡；普通消息在 `/events` 里有真实气泡，不重画。
+    // 没有历史来源时（仅流量会话）普通入站消息也得补，否则页面什么都不显示。
+    if (!entry.outbound && _hasHistory && !isCommandish(entry.display)) return;
+    final key = '${entry.dir}\u0000${entry.dedupeKey}';
     // 服务端重连会重放最近 20 条：同一个 id 只画一次。
     if (!_trafficSeen.add(key)) return;
     if (_trafficSeen.length > _trafficSeenMax) _trafficSeen.remove(_trafficSeen.first);
@@ -472,13 +529,36 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  /// 旁路卡片：`role: user`（就是用户发的那条）+ `form: traffic`（走框架卡片渲染）。
-  /// 标题行是 `[指令] 正文`，`Notice.parse` 会把 `[指令]` 当结构标签吃掉，正文照常预览。
-  ChatMessage _trafficMessage(TrafficEntry entry) => ChatMessage.synthetic(
-    id: 'traffic-${entry.dedupeKey}',
-    form: 'traffic',
-    text: '[指令] ${entry.display}',
-  );
+  /// 旁路合成消息，按方向与形态分三种：
+  /// - `out`：bot 已发出的回复 → 普通 assistant 消息（`form: message`，不画框架卡）；
+  /// - `in` 指令 → 框架卡。首行放命令本身（框架卡片标题取首行），
+  ///   `[指令]` 只留在正文里当来源标记，标题因此就是命令而不是「[指令] cmd」；
+  /// - `in` 普通消息（只会出现在仅实时会话）→ 用户气泡：没有日志流时它是唯一的气泡来源。
+  ChatMessage _trafficMessage(TrafficEntry entry) {
+    if (entry.outbound) {
+      return ChatMessage.synthetic(
+        id: 'traffic-out-${entry.dedupeKey}',
+        form: 'message',
+        text: entry.display,
+        role: 'assistant',
+        framework: false,
+      );
+    }
+    if (isCommandish(entry.display)) {
+      return ChatMessage.synthetic(
+        id: 'traffic-in-${entry.dedupeKey}',
+        form: 'traffic',
+        text: '${entry.display}\n[指令]',
+      );
+    }
+    return ChatMessage.synthetic(
+      id: 'traffic-in-${entry.dedupeKey}',
+      form: 'message',
+      text: entry.display,
+      role: 'user',
+      framework: false,
+    );
+  }
 
   /// 回显去重（反方向）：真实消息在旁路卡片之后 3s 内落进日志，卡片让位给真实消息。
   /// 会改 `_traffic`，只在 `setState` 里调用。
@@ -556,21 +636,27 @@ class _ChatPageState extends State<ChatPage> {
     // 它们是页面侧合成消息、不进 `_all`，所以不参与上面的同标题合并，也不进 `/events` 的 id 去重。
     final traffic = [..._traffic]..sort((a, b) => a.entry.time.compareTo(b.entry.time));
     for (final item in traffic) {
+      // 普通入站消息在正常会话里由 `/events` 画真实气泡，只有仅实时会话才需要兜底。
+      if (!item.entry.outbound && !_liveOnly && !isCommandish(item.entry.display)) continue;
       // `srcEnd` 取 `_all.length + 1`：窗口换算里永远算可见（历史为空时也能命中）。
       rows.add(_RenderRow(_trafficMessage(item.entry), srcEnd: _all.length + 1));
     }
     return rows;
   }
 
-  /// 合并键：框架消息且正文非空时返回类型键；不同类型的框架消息键不同。
-  /// 有结构标签就按标签归组（`[memory update]` 与 `[memory update] Memory lines…` 属同一类型），
-  /// 否则按归一化标题。正文为空的框架消息只剩一个标题头，按独立行处理。
+  /// 合并键：只有**带结构标签**（`[memory update]` 这类）的框架消息才归组，其余一律返回 null。
+  /// 用标签当键：`[memory update]` 与 `[memory update] Memory lines…` 属同一类型。
+  /// 无标签的框架消息不能拿标题当前 24 字当键——`chatluna …` 这类短消息标题都等于首行开头，
+  /// 会把内容完全不同的两条误并成一张卡。
+  /// 旁路指令卡（`form: 'traffic'`，`[指令] …`）是逐条用户输入，同样不参与合并。
   static String? _mergeKey(ChatMessage message) {
     if (!message.isFramework) return null;
+    if (message.form == 'traffic') return null;
     final body = message.bodyMarkdown;
     if (body.trim().isEmpty) return null;
-    final notice = Notice.parse(body);
-    return Notice.key(notice.tag.isEmpty ? notice.title : notice.tag);
+    final tag = Notice.parse(body).tag;
+    if (tag.isEmpty) return null;
+    return Notice.key(tag);
   }
 
   /// 从 [start] 起连续同键框架消息的结束下标（不含）。
@@ -614,7 +700,9 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   /// SSE 断开后的兜底：每 1.2s 重取一次历史，最多 40 拍；已加载的消息一律不清空。
+  /// 仅实时会话没有历史可取，不轮询。
   void _startPolling() {
+    if (_liveOnly) return;
     _poll?.cancel();
     var ticks = 0;
     _poll = Timer.periodic(const Duration(milliseconds: 1200), (timer) async {
@@ -705,6 +793,7 @@ class _ChatPageState extends State<ChatPage> {
           running: widget.session.running,
           engine: widget.session.engine,
           model: _model,
+          trafficOnly: widget.session.trafficOnly,
         );
 
   Future<void> _pickModel() async {
@@ -770,6 +859,8 @@ class _ChatPageState extends State<ChatPage> {
     final firstVisible = rows.indexWhere((row) => row.srcEnd > _windowStart);
     final visible = firstVisible < 0 ? 0 : rows.length - firstVisible;
     final generating = _live.generating;
+    // 没有 agent 的会话（仅实时）：中止、压缩、分叉都无从谈起，菜单整个收起来。
+    final agentless = _liveOnly || widget.session.trafficOnly;
     // 状态胶囊只在 thinking/replying/failed 时占位：待机会话的列表里绝不出现动画行。
     final slot = _live.hasCapsule ? 1 : 0;
     return Scaffold(
@@ -779,23 +870,25 @@ class _ChatPageState extends State<ChatPage> {
           onTap: () => showSessionDetails(context, _summary),
         ),
         actions: [
-          IconButton(
-            onPressed: generating ? _cancel : null,
-            icon: const Icon(Icons.stop_circle_outlined),
-            tooltip: '中止当前生成',
-          ),
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              if (value == 'compact') _compact();
-              if (value == 'fork') _fork();
-              if (value == 'reload') _load();
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'compact', child: Text('压缩上下文')),
-              PopupMenuItem(value: 'fork', child: Text('分叉到新会话')),
-              PopupMenuItem(value: 'reload', child: Text('重新载入')),
-            ],
-          ),
+          if (!agentless)
+            IconButton(
+              onPressed: generating ? _cancel : null,
+              icon: const Icon(Icons.stop_circle_outlined),
+              tooltip: '中止当前生成',
+            ),
+          if (!agentless)
+            PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'compact') _compact();
+                if (value == 'fork') _fork();
+                if (value == 'reload') _load();
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 'compact', child: Text('压缩上下文')),
+                PopupMenuItem(value: 'fork', child: Text('分叉到新会话')),
+                PopupMenuItem(value: 'reload', child: Text('重新载入')),
+              ],
+            ),
         ],
       ),
       floatingActionButton: AnimatedScale(
@@ -823,7 +916,8 @@ class _ChatPageState extends State<ChatPage> {
             avatarUrl: widget.avatarUrl,
             debugMetrics: _debugMetrics(),
             showDeveloperInfo: widget.showDeveloperInfo,
-            onModelTap: _pickModel,
+            // 仅实时会话在服务端不存在，切模型只会 404：不给入口。
+            onModelTap: agentless ? null : _pickModel,
           ),
           Expanded(
             child: _loading
@@ -841,10 +935,14 @@ class _ChatPageState extends State<ChatPage> {
                   )
                 : _all.isEmpty && _traffic.isEmpty && _live == LiveState.idle
                 ? Center(
-                    child: Text(
-                      '这个会话还没有消息',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 32),
+                      child: Text(
+                        _liveOnly ? '该会话尚未加载历史，只显示实时消息' : '这个会话还没有消息',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
                       ),
                     ),
                   )

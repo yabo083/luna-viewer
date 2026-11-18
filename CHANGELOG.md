@@ -20,7 +20,7 @@
 - 实时状态四档：待机 / 思考中 / 回复中 / 轮询中；三点指示器只在思考中出现
 - 实时增量：`/live` 流式 + `/events` 落库消息，`Last-Event-ID` 续传、id 去重、退避重连
 - 消息操作：中止、压缩上下文、分叉会话、回到底部（带未读徽标）
-- 旁路流量：详情页订阅 `/api/traffic/stream`，指令层吃掉的消息（`chatluna xxx`）补成 `[指令] …` 卡片；`conversationKey` 对齐会话 id（旧插件退回标题 id），3 s 回显去重、贴底跟随/未读、退避重连、404 退化 3 s 轮询
+- 旁路流量：详情页订阅 `/api/traffic/stream`，`conversationKey` 归一后与会话 id 对齐（旧插件退回标题 id）；`dir: out` 补成 bot 回复气泡，`dir: in` 只把指令（`chatluna xxx` / `/xxx`）补成 `[指令] …` 卡片，普通入站消息交给 `/events`；3 s 回显去重、贴底跟随/未读、退避重连、404 退化 3 s 轮询
 - 每消息工具调用聚合为「工具调用 ×N」，展开可见参数与结果
 
 **配置**
@@ -29,4 +29,4 @@
 - 每日一次的 GitHub Releases 更新检查
 
 **配套**
-- `chatluna-plugin-media-bridge`：`/api/workspace`（工作区文件，Bearer、路径越界 400）、`/api/traffic`（入站消息环形缓冲，含未进入会话的指令）
+- `chatluna-plugin-media-bridge`：`/api/workspace`（工作区文件，Bearer、路径越界 400）、`/api/traffic`（入站 + 出站消息环形缓冲，`dir` 区分方向；含未进入会话的指令与 bot 借框架之口发出的回复）

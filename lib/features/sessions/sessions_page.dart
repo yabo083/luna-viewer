@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
@@ -6,6 +8,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/capability/sessions_repository.dart';
 import '../../core/capability/traffic_repository.dart';
+import '../../core/capability/traffic_stream.dart';
 import '../../core/model/models.dart';
 import '../../core/store/connection_store.dart';
 import '../../core/transport/api_client.dart';
@@ -39,6 +42,18 @@ class _SessionsPageState extends State<SessionsPage> {
   late final SessionsRepository _repo = SessionsRepository(_api);
   final List<SessionSummary> _items = [];
   final TextEditingController _search = TextEditingController();
+
+  /// 仅流量会话的原料：归一会话键 → 该会话最新的一条流量记录。
+  /// `/api/sessions` 里没有的会话靠它合成一行；已加载的会话永远优先。
+  final Map<String, TrafficEntry> _seeds = {};
+
+  /// 列表页自己也订阅一次旁路流：新会话的第一条消息不用等下拉刷新就能出现。
+  TrafficStream? _trafficStream;
+  StreamSubscription<TrafficEntry>? _trafficSub;
+
+  /// 种子表上限：服务端是内存环形缓冲，这里只留最近活跃的一批。
+  static const _seedLimit = 200;
+
   bool _searching = false;
   BotProfile? _bot;
   bool _loading = true;
@@ -50,6 +65,7 @@ class _SessionsPageState extends State<SessionsPage> {
   void initState() {
     super.initState();
     _refresh();
+    _startTrafficWatch();
     _checkUpdate();
     _loadBot();
     _loadUiPrefs();
@@ -100,6 +116,8 @@ class _SessionsPageState extends State<SessionsPage> {
 
   @override
   void dispose() {
+    _trafficSub?.cancel();
+    _trafficStream?.dispose();
     _search.dispose();
     _api.close();
     super.dispose();
@@ -111,13 +129,21 @@ class _SessionsPageState extends State<SessionsPage> {
       _error = null;
     });
     try {
-      final page = await _repo.list();
+      // 两条路并行：`/api/sessions` 给已加载会话，`/api/traffic` 给「有消息但还没加载」的会话。
+      // 后者自己吞错返回空表，所以先 await 前者：ApiFailure 原样抛给下面的分支。
+      final listing = _repo.list();
+      final snapshot = _trafficSnapshot();
+      final page = await listing;
+      final traffic = await snapshot;
       if (!mounted) return;
       setState(() {
         _items
           ..clear()
           ..addAll(page.items);
         _cursor = page.nextCursor;
+        _seeds
+          ..clear()
+          ..addAll(_groupSeeds(traffic));
       });
     } on ApiFailure catch (e) {
       if (e.isUnauthorized) {
@@ -132,6 +158,101 @@ class _SessionsPageState extends State<SessionsPage> {
     }
     // WS 取头像可能被网络抢先失败，刷新时补一次。
     if (_bot == null) _loadBot();
+  }
+
+  /// 一次拉 200 条旁路记录（服务端是内存环形缓冲，200 条覆盖最近的活跃会话）。
+  /// 端点不可用（旧实例）时返回空表：列表退化成纯 `/api/sessions`，不报错。
+  Future<List<TrafficEntry>> _trafficSnapshot() async {
+    try {
+      return await TrafficRepository(_api).list(limit: 200);
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 按归一会话键分组，每组只留最后一条（标题与时间都取它）。
+  static Map<String, TrafficEntry> _groupSeeds(List<TrafficEntry> entries) {
+    final seeds = <String, TrafficEntry>{};
+    for (final entry in entries) {
+      final key = trafficConversationKey(entry);
+      if (key.isEmpty) continue;
+      final prev = seeds[key];
+      if (prev == null || entry.time.isAfter(prev.time)) seeds[key] = entry;
+    }
+    return seeds;
+  }
+
+  /// 仅流量会话：`/api/sessions` 里没有、但有入站消息的会话。
+  /// 已经被某个已加载会话覆盖的种子直接丢掉——同一会话不能出现两行：
+  /// 归一键相同（新插件）或频道 id 出现在该会话标题里（旧插件）都算覆盖。
+  List<SessionSummary> get _derivedSessions {
+    final loaded = {for (final item in _items) normalizeConversationKey(item.id)};
+    final loadedIds = {
+      for (final item in _items) ...candidateIdsOf(item.title),
+    };
+    final derived = <SessionSummary>[];
+    for (final entry in _seeds.values) {
+      final key = trafficConversationKey(entry);
+      if (key.isEmpty || loaded.contains(key)) continue;
+      if (_coveredByTitle(loadedIds, entry)) continue;
+      derived.add(
+        SessionSummary(
+          // 用 `route:` 前缀：详情页原样归一回来，就能和流量条目对上同一把键。
+          id: 'route:$key',
+          title: entry.channelLabel,
+          createdAt: entry.time,
+          origin: 'satori',
+          engine: '',
+          running: false,
+          trafficOnly: true,
+        ),
+      );
+    }
+    derived.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return derived;
+  }
+
+  /// 频道 / 群号出现在某个已加载会话的标题里：那是同一个会话（旧插件没有会话键）。
+  static bool _coveredByTitle(Set<String> ids, TrafficEntry entry) {
+    if (ids.isEmpty) return false;
+    for (final value in <String?>[entry.channelId, entry.guildId]) {
+      if (value == null || value.isEmpty) continue;
+      if (ids.contains(value.toLowerCase())) return true;
+    }
+    return false;
+  }
+
+  /// 列表页也订阅旁路流：会话还没被 ChatLuna 加载时，第一条消息就能让这一行出现。
+  /// 平时它在，打开详情页会额外再开一条（列表不能因为跳转而停止更新）；
+  /// 断线退避与 404 退化都在 [TrafficStream] 内部，这里只收消息。
+  void _startTrafficWatch() {
+    final token = widget.connection.token;
+    if (token.isEmpty) return;
+    final stream = TrafficStream(widget.connection.base, token);
+    _trafficStream = stream;
+    _trafficSub = stream.entries.listen(_onTrafficEntry, onError: (Object _) {});
+  }
+
+  void _onTrafficEntry(TrafficEntry entry) {
+    if (!mounted) return;
+    final key = trafficConversationKey(entry);
+    if (key.isEmpty) return;
+    // 已加载的会话本来就在列表里：标题与顺序归服务端，不再种种子。
+    if (_items.any((item) => normalizeConversationKey(item.id) == key)) return;
+    if (_coveredByTitle({for (final item in _items) ...candidateIdsOf(item.title)}, entry)) {
+      return;
+    }
+    final prev = _seeds[key];
+    if (prev != null && !entry.time.isAfter(prev.time)) return;
+    setState(() {
+      _seeds[key] = entry;
+      if (_seeds.length > _seedLimit) {
+        final oldest = _seeds.entries.reduce(
+          (a, b) => a.value.time.isBefore(b.value.time) ? a : b,
+        );
+        _seeds.remove(oldest.key);
+      }
+    });
   }
 
   Future<void> _loadMore() async {
@@ -362,11 +483,16 @@ class _SessionsPageState extends State<SessionsPage> {
 
   Future<void> _open(SessionSummary session) async {
     // 先把历史取回来再推路由：详情页第一帧就有内容，不会出现「空白/残影」再加载的过程。
+    // 仅流量会话不在服务端，取历史只会拿到 404：交给详情页自己判「仅实时」模式。
     Transcript? initial;
-    try {
-      initial = await _repo.transcript(session.id);
-    } on ApiFailure catch (e) {
-      _toast('${e.code}：${e.message}');
+    if (!session.trafficOnly) {
+      try {
+        initial = await _repo.transcript(session.id);
+      } on ApiFailure catch (e) {
+        // 404 说明会话已不在服务端（还没加载 / 已卸载）：详情页会退化成仅实时模式，
+        // 这里不该弹一条错误。
+        if (e.code != 'NOT_FOUND' && e.status != 404) _toast('${e.code}：${e.message}');
+      }
     }
     if (!mounted) return;
     await Navigator.of(context).push(
@@ -388,6 +514,10 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   Future<void> _actions(SessionSummary session) async {
+    if (session.trafficOnly) {
+      _toast('该会话尚未被 ChatLuna 加载，只能查看实时消息。');
+      return;
+    }
     if (!session.writable) {
       _toast('平台会话（${session.origin}）由聊天软件管理，这里只能查看。');
       return;
@@ -543,9 +673,13 @@ class _SessionsPageState extends State<SessionsPage> {
     );
   }
 
+  /// 列表页看到的全集：已加载会话在前（服务端顺序），仅流量会话按最后消息时间倒序接在后面。
+  List<SessionSummary> get _visible => [..._items, ..._derivedSessions];
+
   Widget _content() {
-    if (_loading && _items.isEmpty) return const Center(child: CircularProgressIndicator());
-    if (_items.isEmpty) {
+    final sessions = _visible;
+    if (_loading && sessions.isEmpty) return const Center(child: CircularProgressIndicator());
+    if (sessions.isEmpty) {
       if (_error != null) {
         return _StatusView(
           icon: Icons.cloud_off_outlined,
@@ -572,7 +706,7 @@ class _SessionsPageState extends State<SessionsPage> {
     }
     final query = _search.text.trim();
     if (query.isNotEmpty) {
-      final matches = _items.where((item) => _matches(item, query)).toList();
+      final matches = sessions.where((item) => _matches(item, query)).toList();
       if (matches.isEmpty) {
         return _StatusView(
           icon: Icons.search_off,
@@ -606,9 +740,12 @@ class _SessionsPageState extends State<SessionsPage> {
     );
   }
 
+  /// 分组顺序：运行中 → 其他已加载（服务端时间序）→ 仅流量会话（最后消息时间倒序）。
+  /// 全集本身已经是这个顺序，这里只按 `running` 切两段，不再重排。
   List<Widget> _rows() {
-    final active = _items.where((item) => item.running).toList();
-    final rest = _items.where((item) => !item.running).toList();
+    final sessions = _visible;
+    final active = sessions.where((item) => item.running).toList();
+    final rest = sessions.where((item) => !item.running).toList();
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
     return [
       if (active.isNotEmpty) ...[
@@ -721,6 +858,8 @@ class _SessionTile extends StatelessWidget {
       session.origin,
       if (session.engine.isNotEmpty) session.engine,
       if (session.model != null) session.model!.toString(),
+      // 仅流量会话：服务端还没加载它，只有实时消息可看。
+      if (session.trafficOnly) '未加载',
     ].join(' · ');
     return Stack(
       children: [

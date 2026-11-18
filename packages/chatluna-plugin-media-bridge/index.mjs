@@ -3,10 +3,11 @@
 // GET /api/workspace?path=<相对路径> 暴露给客户端（移动端渲染消息里的图片）。
 // 只读；路径必须落在工作区内。后续版本会在这里加：上传、临时签名、缩略图。
 //
-// 另外提供 GET /api/traffic 与 GET /api/traffic/stream：入站消息的旁路记录。纯指令消息
-// （如 `chatluna-菜单`）在 Koishi 的指令层就被消费掉了，既不落会话日志也不加载 agent，
-// 客户端完全看不到；这里在事件层抄一份环形缓冲，让 App 的「消息记录」页能看见它们，
-// 并通过 SSE 实时推送。
+// 另外提供 GET /api/traffic 与 GET /api/traffic/stream：入站 + 出站消息的旁路记录。
+// 纯指令消息（如 `chatluna-菜单`）在 Koishi 的指令层就被消费掉了，既不落会话日志也不加载
+// agent；bot 借框架之口发出的回复（`session.send`）同样只进平台、不进 agent 日志。客户端
+// 两边都看不到，所以这里在事件层抄一份环形缓冲（`dir` 区分方向），让 App 的「消息记录」页
+// 能看见它们，并通过 SSE 实时推送。
 import { readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize, resolve, sep } from 'node:path'
 import { openStream } from '@chatluna/server'
@@ -35,6 +36,13 @@ const TRAFFIC_CAPACITY = 500
 const TRAFFIC_MAX_CONTENT = 500
 // 新连接先补最近 20 条，够 App 开局把「刚发的指令」补上；更早的走 /api/traffic 翻。
 const TRAFFIC_STREAM_HISTORY = 20
+
+// 出站：`before-send` 到适配器真正 `send` 之间只隔一次渲染/一次 HTTP，2s 足够覆盖排队与重试；
+// 超过这个窗口的快照不再属于本次 send，宁可略过也不写错正文。
+const OUTBOUND_SLOT_TTL = 2000
+// 同一条出站消息可能被多个 bot 实例/适配器各上报一次（一次回复也可能被拆成多段 flush），
+// 所以「同一个频道 + 同样的正文」在 500ms 内只记一条。
+const OUTBOUND_DEDUPE_MS = 500
 
 // `session.content` 是元素序列化后的原始标记（`<img .../>`、`<at id=.../>`），
 // 直接给人看没有意义；按元素类型翻译成可读片段。
@@ -78,6 +86,15 @@ function describeElements(elements) {
   return text
 }
 
+function clipContent(text) {
+  return text.length > TRAFFIC_MAX_CONTENT ? text.slice(0, TRAFFIC_MAX_CONTENT) : text
+}
+
+// 元素拿不到时（老适配器）退回 content；两条路都压成一行。
+function normalizeContent(elements, fallback) {
+  return (describeElements(elements) || textOf(fallback)).replace(/\s+/g, ' ').trim()
+}
+
 // 标题里的 id（`A1338876…`）是 ChatLuna 会话 id，traffic 里的 `channelId`/`guildId` 是适配器
 // 的 `C…`，两者不同命名空间，靠标题 id 匹配群会话必然失败。`conversationKey` / `routeId`
 // 才是同一套标识，客户端用它们精确匹配。
@@ -91,19 +108,17 @@ function conversationKeyOf(session) {
   return textOf(session.channelId) || null
 }
 
-function trafficEntry(session) {
-  // 元素拿不到时（老适配器）退回 content；两条路都压成一行再截断。
-  const raw = describeElements(session.elements) || textOf(session.content)
-  const content = raw.replace(/\s+/g, ' ').trim()
+function trafficEntry(session, dir = 'in') {
   const entry = {
     id: textOf(session.messageId ?? session.id),
+    dir,
     time: Number(session.timestamp) || Date.now(),
     platform: textOf(session.platform),
     selfId: textOf(session.selfId),
     userId: textOf(session.userId),
     channelId: textOf(session.channelId),
     guildId: session.guildId ? textOf(session.guildId) : null,
-    content: content.length > TRAFFIC_MAX_CONTENT ? content.slice(0, TRAFFIC_MAX_CONTENT) : content,
+    content: clipContent(normalizeContent(session.elements, session.content)),
     conversationKey: conversationKeyOf(session)
   }
   // `routeId` 由 @chatluna/satori 惰性提供；没有这个字段的运行环境不写键，保持条目形状兼容。
@@ -125,12 +140,92 @@ export function apply(ctx) {
     subscribers.clear()
   })
 
-  ctx.on('message', (session) => {
-    const entry = trafficEntry(session)
+  const pushTraffic = (entry) => {
     traffic.push(entry)
     if (traffic.length > TRAFFIC_CAPACITY) traffic.splice(0, traffic.length - TRAFFIC_CAPACITY)
     // 推送失败（背压/已断开）不影响缓冲：客户端重连时靠历史帧补齐。
     for (const stream of subscribers) stream.send({ event: 'traffic', data: entry })
+  }
+
+  ctx.on('message', (session) => pushTraffic(trafficEntry(session, 'in')))
+
+  // 出站分两步，因为两个事件各缺一半信息：
+  // - `before-send`（MessageEncoder 渲染前）拿得到正文（`session.elements`）与 `session.conversation`；
+  // - `send`（适配器真正落库之后）带得到平台消息 id，但适配器传进来的是新造的 `bot.session()`，
+  //   没有 elements（QQ 适配器 flush 里 decodeMessage 那一行仍是注释掉的）。
+  // 于是 `before-send` 只记「这个频道最近要发什么」，`send` 才落一条 `dir: 'out'` 的条目。
+  const outboundSlots = new Map()
+  const outboundSeen = new Map()
+  let outboundSeq = 0
+
+  const pruneOutbound = () => {
+    const now = Date.now()
+    if (outboundSlots.size > 128) {
+      for (const [key, slot] of outboundSlots) {
+        if (now - slot.time > OUTBOUND_SLOT_TTL) outboundSlots.delete(key)
+      }
+    }
+    if (outboundSeen.size > 64) {
+      for (const [key, at] of outboundSeen) {
+        if (now - at > OUTBOUND_DEDUPE_MS) outboundSeen.delete(key)
+      }
+    }
+  }
+
+  ctx.on('before-send', (session) => {
+    outboundSlots.set(textOf(session.channelId), {
+      content: normalizeContent(session.elements, session.content),
+      conversationKey: conversationKeyOf(session),
+      time: Date.now()
+    })
+    pruneOutbound()
+  })
+
+  // `send` 的 session 是 `bot.session()` 新造的：`isDirect` 这类挂在 Session 原型上的访问器
+  // 没被复制过去，私聊就会被算成「频道」路由（少了 `:user:`），与会话说到底不是同一个键。
+  // 回复总是发回它来的那个频道，所以优先沿用这个频道最近一条入站消息的会话键/路由。
+  const recentInboundOf = (platform, channelId) => {
+    for (let index = traffic.length - 1; index >= 0; index--) {
+      const item = traffic[index]
+      if (item.dir !== 'in') continue
+      if (item.platform !== platform || item.channelId !== channelId) continue
+      return item
+    }
+    return undefined
+  }
+
+  ctx.on('send', (session) => {
+    const channelId = textOf(session.channelId)
+    const now = Date.now()
+    const slot = outboundSlots.get(channelId)
+    // 快照过期/不存在说明这条 send 不是本进程刚排队的那一次（例如别处直接调 bot.internal），
+    // 正文不可知；写一条空正文只会污染「消息记录」。
+    if (!slot || now - slot.time > OUTBOUND_SLOT_TTL || !slot.content) return
+    // 去重键不含 selfId：同一条出站可能被多个 bot 实例/适配器各上报一次。
+    const key = channelId + '\u0000' + slot.content
+    const seenAt = outboundSeen.get(key)
+    if (seenAt !== undefined && now - seenAt <= OUTBOUND_DEDUPE_MS) return
+    outboundSeen.set(key, now)
+    pruneOutbound()
+
+    const entry = trafficEntry(session, 'out')
+    entry.content = clipContent(slot.content)
+    const inbound = recentInboundOf(entry.platform, entry.channelId)
+    if (inbound?.conversationKey) {
+      entry.conversationKey = inbound.conversationKey
+      if (inbound.routeId) entry.routeId = inbound.routeId
+      else delete entry.routeId
+    } else {
+      entry.conversationKey = slot.conversationKey
+    }
+    // 出站消息的作者是 bot 自己：`send` 的 session 是新造的，没有 user。
+    if (!entry.userId) entry.userId = entry.selfId
+    // 平台回了消息 id 就用它；否则退回本地键——客户端按 id 去重（SSE 历史重放 + 轮询会
+    // 重复拿到同一批），空 id 会让同一条消息反复出现。`trafficEntry` 里的 `session.id`
+    // 是进程内自增的 session 序号，不是平台消息 id，不能当条目 id。
+    const messageId = textOf(session.messageId)
+    entry.id = messageId || `out-${entry.selfId}:${now}:${++outboundSeq}`
+    pushTraffic(entry)
   })
 
   const serve = async (relative, res) => {
@@ -193,7 +288,7 @@ export function apply(ctx) {
     res.body = JSON.stringify({ items })
   })
 
-  // SSE：先补最多 20 条历史（旧 → 新，客户端可顺序追加），之后每条入站消息一帧。
+  // SSE：先补最多 20 条历史（旧 → 新，客户端可顺序追加），之后每条入站/出站消息一帧。
   // openStream 负责 text/event-stream 头、flushHeaders、15s `: ping` 心跳与断开清理。
   ctx.server.get('/api/traffic/stream', async (req, res) => {
     const stream = openStream(ctx, res)

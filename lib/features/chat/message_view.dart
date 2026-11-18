@@ -635,8 +635,8 @@ class Notice {
   static final _url = RegExp(r'^https?://\S+$');
   static final _space = RegExp(r'\s+');
 
-  /// 合并分组键：标题忽略大小写与空白差异，`[Memory Update]` 与 `[memory update]` 同组。
-  /// 页面层用它判断相邻两条框架消息是不是同一类型。
+  /// 归一化合并键：忽略大小写与空白差异，`[Memory Update]` 与 `[memory update]` 同组。
+  /// 页面层用它把结构标签（或标题）变成比较用的键；只有带标签的框架消息才参与合并。
   static String key(String title) => title.toLowerCase().replaceAll(_space, '');
 
   /// 结构化解析：首行 `[xxx]`（可带尾巴）抽成标题，否则取首行前 24 字；其余行是正文。

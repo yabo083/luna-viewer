@@ -18,6 +18,7 @@ class TrafficEntry {
     required this.guildId,
     required this.content,
     this.serverKey,
+    this.dir = 'in',
   });
 
   final String id;
@@ -29,10 +30,16 @@ class TrafficEntry {
   final String? guildId;
   final String content;
 
-  /// 服务端的会话键（JSON `conversationKey`，即 `session.conversation?.key`）。
-  /// 新插件才有：它就是会话 id（`route:r-…`，私聊还带 `:user:<id>`），
-  /// 群/私聊都能直接对上，标题里没有 id 的会话也靠它命中。旧实例为 null。
+  /// 服务端的会话键（JSON `conversationKey`，即 `session.conversation?.key`，形如 `r-<hash>`）。
+  /// 新插件才有：去掉 `route:` / `:user:` 后与会话 id 相等，群/私聊都能直接对上。
+  /// 插件拿不到 `session.conversation` 时会退回 `channelId`，客户端再退回标题 id 匹配；旧实例为 null。
   final String? serverKey;
+
+  /// 方向：`out` 是 bot 自己发出的一条回复，`in` 是收到的消息。
+  /// 旧条目没有这个字段，一律按 `in` 处理。
+  final String dir;
+
+  bool get outbound => dir == 'out';
 
   static TrafficEntry? fromJson(Object? json) {
     if (json is! Map) return null;
@@ -50,6 +57,7 @@ class TrafficEntry {
       guildId: json['guildId'] == null ? null : _text(json['guildId']),
       content: _text(json['content']),
       serverKey: json['conversationKey'] == null ? null : _text(json['conversationKey']),
+      dir: _text(json['dir']) == 'out' ? 'out' : 'in',
     );
   }
 

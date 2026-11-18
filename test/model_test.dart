@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chatluna_mobile/core/model/models.dart';
+import 'package:chatluna_mobile/core/capability/traffic_repository.dart';
+import 'package:chatluna_mobile/core/capability/traffic_stream.dart';
 import 'package:chatluna_mobile/core/update/update_checker.dart';
 import 'package:chatluna_mobile/core/store/connection_store.dart';
 
@@ -257,6 +259,37 @@ void main() {
 
     test('未知事件忽略', () {
       expect(LiveEvent.fromSse('pong', null), isNull);
+    });
+  });
+
+  group('traffic matching', () {
+    test('会话 id 与服务器键按归一后比较', () {
+      expect(normalizeConversationKey('route:r-abc123:user:664B'), 'r-abc123');
+      expect(normalizeConversationKey('r-abc123:lane:1'), 'r-abc123');
+      expect(normalizeConversationKey('route:r-abc123'), 'r-abc123');
+    });
+
+    test('serverKey 优先，缺省退回频道键', () {
+      TrafficEntry make(String? serverKey) => TrafficEntry(
+        id: 'm1',
+        time: DateTime(2026, 11, 18),
+        platform: 'qq',
+        selfId: 'self',
+        userId: 'user',
+        channelId: 'C',
+        guildId: null,
+        content: 'chatluna 菜单',
+        serverKey: serverKey,
+      );
+      expect(trafficConversationKey(make('route:r-x')), 'r-x');
+      expect(trafficConversationKey(make(null)), 'qq\u0000C');
+    });
+
+    test('指令判定只看 chatluna 前缀或斜杠', () {
+      expect(isCommandish('chatluna 菜单'), isTrue);
+      expect(isCommandish('  ChatLuna help'), isTrue);
+      expect(isCommandish('/reset'), isTrue);
+      expect(isCommandish('你好 chatluna'), isFalse);
     });
   });
 
