@@ -301,6 +301,12 @@ class PlatformMessage {
   /// 插件没给这项时是空列表，正文照旧。
   final List<PlatformMedia> media;
 
+  /// 这一轮回复的起止（**本地推算**，只有本页观测到的那条 out 气泡会写）：
+  /// 气泡脚注显示 `HH:mm · 1m04s`。服务端没有这两个字段，重开页面就不再有脚注——
+  /// 它是本机看到的时间，不是服务端事实，所以也不参与去重与排序。
+  DateTime? turnStartedAt;
+  DateTime? turnEndedAt;
+
   /// 渲染模型：`out` 与 `in` 都用它，详情页按 `outbound` 决定左右与配色。
   /// 平台消息逐条都是发言，没有框架/指令形态，因此关掉指令启发式。
   late final ChatMessage view = ChatMessage(
@@ -945,16 +951,29 @@ class LiveEvent {
 
 enum LiveEventKind { snapshot, delta, tool, reasoning, settled, lagged }
 
-/// `/api/sessions/:id/events` 的一个增量帧：落库的新消息，或增量窗口失效。
+/// `/api/sessions/:id/events` 的一个增量帧：落库的新消息、mark，或增量窗口失效。
 class SessionEvent {
-  const SessionEvent.message(this.message, this.id) : truncated = false;
+  const SessionEvent.message(this.message, this.id)
+    : truncated = false,
+      name = null,
+      data = null,
+      time = null;
 
   const SessionEvent.truncated()
     : message = null,
       id = null,
-      truncated = true;
+      truncated = true,
+      name = null,
+      data = null,
+      time = null;
 
-  /// 新落库的消息；`truncated` 时为空。
+  /// 日志里的 mark（`kind:"mark"`）：不是消息，而是「这一轮做了什么」的打点。
+  /// 计时只读 `name` 与 `data`（`agent/input-enqueued` / `engine/activity` / `chat/delivered` …）。
+  const SessionEvent.mark(this.name, this.data, {this.id, this.time})
+    : message = null,
+      truncated = false;
+
+  /// 新落库的消息；mark 与 `truncated` 时为空。
   final ChatMessage? message;
 
   /// SSE 帧的 `id`（形如 `<sessionId>:<n>`），重连时作为 `Last-Event-ID` 续传。
@@ -962,4 +981,13 @@ class SessionEvent {
 
   /// 服务端的增量窗口已失效：本地增量不可信，调用方应重取 `/messages`。
   final bool truncated;
+
+  /// mark 名（`prompt` / `engine/activity` / `chat/delivered` …）；消息帧为空。
+  final String? name;
+
+  /// mark 的 `data` 原样；消息帧为空。
+  final Map<String, Object?>? data;
+
+  /// 这条 entry 的落库时间（服务端 `time`）；没给时为空。
+  final DateTime? time;
 }

@@ -30,6 +30,7 @@ class MessageView extends StatelessWidget {
     this.avatarUrl,
     this.senderName,
     this.time,
+    this.footnote,
     this.showHeader = true,
   });
 
@@ -57,6 +58,10 @@ class MessageView extends StatelessWidget {
 
   /// 消息时间：气泡右下角显示 `HH:mm`；null 隐藏，不影响布局。
   final DateTime? time;
+
+  /// 气泡脚注（小号 muted，跟在时间后面）：本页观测到的这一轮生成耗时 `1m04s`。
+  /// 服务端没有这个字段，只有本机看到的那条 out 气泡会有。
+  final String? footnote;
 
   /// 同一发送者 5 分钟内的连续消息里只有第一条为 true：头像与名字只出现一次。
   final bool showHeader;
@@ -170,13 +175,16 @@ class MessageView extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           ...content,
-          if (time case final at?)
+          if (time != null || footnote != null)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Align(
                 alignment: Alignment.centerRight,
                 child: Text(
-                  _hourMinute(at),
+                  [
+                    if (time != null) _hourMinute(time!),
+                    ?footnote,
+                  ].join(' · '),
                   style: theme.textTheme.labelSmall?.copyWith(
                     fontSize: 10,
                     height: 1.2,

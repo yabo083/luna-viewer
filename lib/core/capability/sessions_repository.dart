@@ -73,6 +73,14 @@ class SessionsRepository {
   Future<void> cancel(String id) =>
       api.postJson('/api/sessions/${Uri.encodeComponent(id)}/cancel', const {});
 
+  /// 插话：把一条用户消息直接交给 agent（不经过平台适配器）。
+  /// 中止后用「重新发送」重开一轮走这里——服务端按下一轮输入处理。
+  Future<void> steer(String id, String text) => api.postJson(
+    '/api/sessions/${Uri.encodeComponent(id)}/steer',
+    {'text': text},
+    idempotencyKey: api.newIdempotencyKey(),
+  );
+
   Future<CompactResult?> compact(String id, {int? keep}) async {
     final json = await api.postJson(
       '/api/sessions/${Uri.encodeComponent(id)}/compact',
@@ -106,8 +114,8 @@ class SessionsRepository {
     }
   }
 
-  /// 会话日志流：`message` 是新落库的消息（含别人发的），`cut`/mark 是日志结构变化，忽略；
-  /// `truncated` 表示增量窗口失效，调用方需重取全量。
+  /// 会话日志流：`message` 是新落库的消息（含别人发的），mark 是这一轮做了什么（计时用），
+  /// `cut` 忽略；`truncated` 表示增量窗口失效，调用方需重取全量。
   /// [since] 是上次最后收到的 `id`，重连时作为 `Last-Event-ID` 续传。
   Stream<SessionEvent> events(String id, {String? since}) async* {
     await for (final sse in api.sse(
@@ -119,25 +127,40 @@ class SessionsRepository {
     }
   }
 
+  /// 帧形状（实测）：`{n,time,kind,seq,type}` + 载荷；消息在 `message`，mark 在 `name`/`data`。
+  /// 服务端给帧 `id`，没有就用 `sessionId:n` 复现同一种形式，供 `Last-Event-ID` 续传。
   static SessionEvent? _sessionEvent(String sessionId, SseEvent sse) {
+    final frame = sse.data;
+    final n = frame?['n'];
+    final id = sse.id ?? (n is num ? '$sessionId:${n.toInt()}' : null);
     switch (sse.event) {
-      case 'message':
-        final entry = sse.data?['data'];
-        if (entry is! Map) return null;
-        final n = sse.data?['n'];
-        // 帧 id 由服务端给；没有就用 sessionId:n 复现同一种形式。
-        final lastId = sse.id ?? (n is num ? '$sessionId:${n.toInt()}' : null);
-        final message = ChatMessage.fromJson(
-          entry.cast<String, Object?>(),
-          fallbackId: lastId,
-        );
-        if (message.id.isEmpty) return null;
-        return SessionEvent.message(message, lastId);
       case 'truncated':
         return const SessionEvent.truncated();
+      case 'message':
+        // `message` 是当前形状；`data` 是早期服务端的包装，保留兼容。
+        final entry = frame?['message'] ?? frame?['data'];
+        if (entry is! Map) return null;
+        final message = ChatMessage.fromJson(
+          entry.cast<String, Object?>(),
+          fallbackId: id,
+        );
+        if (message.id.isEmpty) return null;
+        return SessionEvent.message(message, id);
       default:
-        // `cut` / mark 等：日志被裁剪或打点，不是消息。
-        return null;
+        // `kind:"mark"`：帧名就是 mark 名（`prompt` / `engine/activity` / …），`cut` 不是 mark。
+        if (frame == null || frame['kind'] != 'mark') return null;
+        final name = frame['name'];
+        if (name is! String || name.isEmpty) return null;
+        final data = frame['data'];
+        return SessionEvent.mark(
+          name,
+          data is Map ? data.cast<String, Object?>() : const <String, Object?>{},
+          id: id,
+          time: _frameTime(frame['time']),
+        );
     }
   }
+
+  static DateTime? _frameTime(Object? raw) =>
+      raw is num ? DateTime.fromMillisecondsSinceEpoch(raw.toInt()) : null;
 }

@@ -1,12 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/model/models.dart';
 import '../../core/transport/state_socket.dart';
 import 'assistant_avatar.dart';
+import 'turn_clock.dart';
 
 /// 会话名的紧凑解析结果：可读短名 + 用于区分的 id 尾号。
 ///
@@ -133,25 +133,12 @@ enum StatusLight {
   /// 回复中：主色静态圆点，不抢正文的注意力。
   replying('回复中'),
 
-  /// 轮询中（SSE 断开）：warning 色静态圆点。
+  /// 轮询中：`/live` 掉线，3s 轮询接管；错误色静态点。
   polling('轮询中');
 
   const StatusLight(this.label);
 
   final String label;
-}
-
-/// 本轮生成耗时：`3.2s`（不足一分钟）/ `1m04s` / `1h04m`。
-/// 调用方只在有本轮计时时渲染（见 [ChatInfoBar.elapsed]）。
-String formatElapsed(Duration elapsed) {
-  final ms = elapsed.isNegative ? 0 : elapsed.inMilliseconds;
-  if (ms < 60000) return '${(ms / 1000).toStringAsFixed(1)}s';
-  final seconds = ms ~/ 1000;
-  if (seconds < 3600) {
-    return '${seconds ~/ 60}m${(seconds % 60).toString().padLeft(2, '0')}s';
-  }
-  final minutes = seconds ~/ 60;
-  return '${minutes ~/ 60}h${(minutes % 60).toString().padLeft(2, '0')}m';
 }
 
 /// 会话信息栏：一行可横向滚动的轻量 pills，不再用整条灰底色块。
@@ -160,7 +147,6 @@ class ChatInfoBar extends StatelessWidget {
     super.key,
     required this.session,
     required this.light,
-    this.elapsed,
     this.botName,
     this.avatarUrl,
     this.debugMetrics = const [],
@@ -173,9 +159,6 @@ class ChatInfoBar extends StatelessWidget {
   /// 常驻状态灯：待机也留一盏静灯，用户随时能确认会话没有卡住。
   final StatusLight light;
 
-  /// 本轮生成耗时（状态灯右侧的等宽小字）：`null` 不占位。
-  /// 自己监听刷新，页面不随每秒的 tick 重建。
-  final ValueListenable<Duration?>? elapsed;
   final String? botName;
   final String? avatarUrl;
   final List<String> debugMetrics;
@@ -218,7 +201,7 @@ class ChatInfoBar extends StatelessWidget {
               icon: Icons.memory_outlined,
               onTap: onModelTap,
             ),
-          _StatusSlot(light: light, elapsed: elapsed),
+          _StatusPill(light: light),
           if (showDeveloperInfo)
             for (final metric in debugMetrics) _InfoPill(label: metric),
         ],
@@ -439,53 +422,77 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
-/// 状态灯 + 本轮计时：计时出现/消失时整格（连同 6dp 间距）一起进出，
-/// 待机时信息栏不留一个空档。刷新范围只有这一枚胶囊加一个小字。
-class _StatusSlot extends StatelessWidget {
-  const _StatusSlot({required this.light, this.elapsed});
-
-  final StatusLight light;
-  final ValueListenable<Duration?>? elapsed;
-
-  @override
-  Widget build(BuildContext context) {
-    final listenable = elapsed;
-    if (listenable == null) return _StatusPill(light: light);
-    return ValueListenableBuilder<Duration?>(
-      valueListenable: listenable,
-      builder: (context, value, _) => Row(
-        mainAxisSize: MainAxisSize.min,
-        spacing: _PillSurface.gap,
-        children: [
-          _StatusPill(light: light),
-          if (value != null) _ElapsedText(value: value),
-        ],
-      ),
-    );
-  }
+/// 阶段明细：本轮总耗时 + 最近完成的几段。阶段可以并行（draw 与 reply 同时跑），
+/// 所以各自耗时之和可以超过整轮——这里只解释「刚才在干什么」。
+Future<void> showTurnPhases(BuildContext context, TurnClockView view) {
+  return showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    builder: (context) => _TurnPhasesSheet(view: view),
+  );
 }
 
-/// 本轮耗时小字：等宽数字，秒数跳动时整行不抖。
-class _ElapsedText extends StatelessWidget {
-  const _ElapsedText({required this.value});
+class _TurnPhasesSheet extends StatelessWidget {
+  const _TurnPhasesSheet({required this.view});
 
-  final Duration value;
+  final TurnClockView view;
 
   @override
   Widget build(BuildContext context) {
-    final text = formatElapsed(value);
-    return Semantics(
-      label: '本轮已用时 $text',
-      excludeSemantics: true,
-      child: Text(
-        text,
-        maxLines: 1,
-        style: _pillLabelStyle(
-          context,
-          Theme.of(context).colorScheme.onSurfaceVariant,
-        ).copyWith(
-          fontFeatures: const [FontFeature.tabularFigures()],
-          letterSpacing: 0.4,
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final mono = theme.textTheme.bodyMedium?.copyWith(
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '本轮 ${formatElapsed(view.total)}',
+                    style: theme.textTheme.titleMedium,
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  icon: const Icon(Icons.close),
+                  tooltip: '关闭',
+                ),
+              ],
+            ),
+            Text(
+              view.phase == null ? '已完成' : '当前 ${view.phase}',
+              style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 6),
+            if (view.recent.isEmpty)
+              Text(
+                '还没有完成的阶段',
+                style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+              )
+            else
+              for (final phase in view.recent)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Row(
+                    children: [
+                      Expanded(child: Text(phase.name, style: mono)),
+                      Text(formatElapsed(phase.elapsed), style: mono),
+                    ],
+                  ),
+                ),
+            const SizedBox(height: 8),
+            Text(
+              '阶段可能并行：各自耗时之和可以超过整轮。',
+              style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
         ),
       ),
     );
