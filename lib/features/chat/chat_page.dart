@@ -760,26 +760,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
     final message = event.message;
     if (message == null) return;
-    // tool-result 落库 = 那次工具调用真的结束了：按 `toolCallId`/`toolName` 关掉对应阶段，
-    // 不能关「最近打开的那个」——工具跑的同时可能已经重新开了「思考」。
-    // 工具之后模型还要再想一步，所以除 reply 外都接着开「思考」。
-    for (final block in message.blocks) {
-      if (block.type != 'tool-result') continue;
-      final callId = block.data['toolCallId'];
-      final rawName = block.data['toolName'];
-      String? target;
-      if (callId is String && callId.isNotEmpty) {
-        target = _openToolCalls.remove(callId);
-      }
-      if (target == null && rawName is String && rawName.isNotEmpty) {
-        target = normalizeTurnPhase(rawName);
-      }
-      if (target == null && _openToolNames.isNotEmpty) {
-        target = _openToolNames.removeAt(0);
-      }
-      final closed = _clock.finishTool(target);
-      if (closed != null && closed != replyPhase) _clock.phase(thinkingPhase);
-    }
+    // `tool-result` 落库只说明模型拿到了返回值；异步工具（draw）的产物还在路上。
+    // 阶段不在这里关：等模型下一步真的开始（reasoning / prompt / text）再关，
+    // 这样 draw 的耗时覆盖到「图片生成完、模型接着说话」为止。
     if (!message.isFramework) return;
     final text = message.bodyMarkdown.trim();
     if (text.isEmpty) return;
@@ -992,7 +975,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _followIfAtBottom();
               case LiveEventKind.delta:
                 _snapshotTimer?.cancel();
-                // 正文到了：思考阶段收尾，reply 阶段开表（两者都在同一轮里）。
+                // 正文到了：模型已经回到说话，任何在跑的工具到此为止。
+                _closeOpenTools();
                 _clock.endPhase(thinkingPhase);
                 _clock.phase(replyPhase);
                 _setLive(LiveState.replying);
@@ -1007,16 +991,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
               case LiveEventKind.reasoning:
                 // 只有思考、没有正文：停在「思考中」；正文一到就转「回复中」。
                 _snapshotTimer?.cancel();
+                _closeOpenTools();
                 _clock.phase(thinkingPhase);
                 if (_streaming.isEmpty) _setLive(LiveState.thinking);
               case LiveEventKind.tool:
                 _snapshotTimer?.cancel();
                 // 模型开始吐工具参数：这次调用的阶段从这里开表，思考让位。
-                // 计时在 `tool-result` 落库那一帧收尾（见 [_startEvents]）。
+                // 收表点不是 `tool-result`，而是模型下一步真的开始（见 [_closeOpenTools]）。
                 _clock.endPhase(thinkingPhase);
                 final tool = event.toolName;
                 final name = (tool == null || tool.isEmpty) ? 'tool' : tool;
-                _clock.phase(name);
+                _clock.phase(name, tool: true);
                 final callId = event.toolCallId;
                 if (callId != null && callId.isNotEmpty) {
                   _openToolCalls[callId] = normalizeTurnPhase(name);
@@ -1151,7 +1136,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       final raw = data['tool'] ?? data['toolName'] ?? data['name'];
       if (toolish) {
         _clock.start(lead: lead);
-        _clock.phase(raw is String && raw.isNotEmpty ? raw : 'tool');
+        _clock.phase(
+          raw is String && raw.isNotEmpty ? raw : 'tool',
+          tool: true,
+        );
       } else {
         _clock.phaseFinished();
       }
@@ -1159,16 +1147,19 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
     switch (name) {
       case 'prompt':
-        // 每个 step 开始都会打一条：没有工具帧时这就是「思考」的开始。
+        // 每个 step 开始都会打一条：新的 step = 上一步的工具真的走完了。
         _clock.start(lead: lead);
+        _closeOpenTools();
         _clock.phase(thinkingPhase);
       case 'engine/activity':
         if (data['type'] != 'stage') return;
         switch (data['label']) {
           case 'prepare' || 'generate':
             _clock.start(lead: lead);
+            _closeOpenTools();
             _clock.phase(thinkingPhase);
           case 'deliver':
+            _closeOpenTools();
             _clock.phase(replyPhase);
           case 'settle':
             // 引擎这一轮收尾 = running=false 的最早证据；投递那条由 `chat/delivered` 补。
@@ -1181,11 +1172,26 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         // 输入被 agent 收下 / 请求已装配：这一轮真的开跑了（也是中止冻结的解锁点）。
         // 开表后立刻挂「思考」：`engine/activity prepare` 可能先于解锁到达、被冻结点掉。
         _clock.start(lead: lead, force: true);
+        _closeOpenTools();
         _clock.phase(thinkingPhase);
     }
   }
 
   // ---------------------------------------------------------------- 骨架气泡
+
+  /// 模型回到「下一步」：所有在跑的工具到此收表。
+  /// 工具自己的 `tool-result` 只是把返回值交给模型，异步工具（draw）的产物还在路上——
+  /// 真正的生命周期终点是下一个 step 开始（`prompt` / reasoning / 正文）。
+  void _closeOpenTools() {
+    for (final name in _openToolCalls.values.toList(growable: false)) {
+      _clock.finishTool(name);
+    }
+    for (final name in _openToolNames.toList(growable: false)) {
+      _clock.finishTool(name);
+    }
+    _openToolCalls.clear();
+    _openToolNames.clear();
+  }
 
   /// 计时通知：只在「开轮 / 收表」两个转折上动列表，tick 本身不触发页面重建。
   void _onClockTick() {

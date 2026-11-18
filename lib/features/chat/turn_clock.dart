@@ -239,6 +239,9 @@ class TurnPhaseLog {
   /// 折叠态显示的阶段：最近进入/续期的那个。
   String? get current => _active.isEmpty ? null : _active.keys.last;
 
+  /// 此刻在跑的全部阶段名（进入顺序）。
+  Iterable<String> get activeNames => _active.keys;
+
   bool get isEmpty => _active.isEmpty;
 
   Duration? startOf(String name) => _active[name];
@@ -356,6 +359,9 @@ class TurnClock {
   final Duration Function() _now;
   final TurnPhaseLog _phases = TurnPhaseLog();
 
+  /// 本轮里哪些阶段是工具：`settled` 只收掉模型侧的阶段，工具仍在跑（异步产物还没回来）。
+  final Set<String> _toolPhases = <String>{};
+
   Duration? _start;
   Duration? _stopAt;
   Duration? _deliveredAt;
@@ -398,17 +404,20 @@ class TurnClock {
     _end = null;
     _previous = false;
     _phases.clear();
+    _toolPhases.clear();
     _publish();
     _startTick();
   }
 
   /// 某个阶段有活动：开始计时，或把已经停下的表重新打开（有新帧 = 这一轮还在跑，
   /// 上一轮的冻结读数就此让位）。
-  void phase(String name) {
+  void phase(String name, {bool tool = false}) {
     if (_frozen) return;
     if (!running) start();
     _stopAt = null;
-    _phases.enter(_now(), normalizeTurnPhase(name));
+    final normalized = normalizeTurnPhase(name);
+    if (tool) _toolPhases.add(normalized);
+    _phases.enter(_now(), normalized);
     _publish();
   }
 
@@ -446,7 +455,12 @@ class TurnClock {
   /// 投递与后续 step 还可能在跑。
   void attemptSettled() {
     if (_end != null) return;
-    _phases.leaveAll(_now());
+    // 一次 attempt 结束 = 模型这一步说完了；工具（draw 等）可能还在跑，
+    // 它的生命周期终点是下一个 step 开始，不能在这里被收掉。
+    final now = _now();
+    for (final name in _phases.activeNames.toList(growable: false)) {
+      if (!_toolPhases.contains(name)) _phases.leave(now, name);
+    }
     _publish();
   }
 

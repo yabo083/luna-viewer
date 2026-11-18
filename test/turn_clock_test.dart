@@ -438,6 +438,25 @@ void main() {
       expect(turn.view.value!.recent.single.elapsed, const Duration(seconds: 10));
     });
 
+    test('attemptSettled 收掉思考但保留工具', () {
+      var clock = Duration.zero;
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start();
+      clock = const Duration(seconds: 2);
+      turn.phase(thinkingPhase);
+      clock = const Duration(seconds: 3);
+      turn.phase('draw', tool: true);
+      clock = const Duration(seconds: 5);
+      turn.attemptSettled();
+
+      final view = turn.view.value!;
+      expect(view.active.map((p) => p.name), ['draw']);
+      expect(view.active.single.elapsed, const Duration(seconds: 2));
+      expect(view.finished, isFalse);
+    });
+
     test('标签里工具优先于「思考」', () {
       const view = TurnClockView(
         total: Duration(seconds: 24),
