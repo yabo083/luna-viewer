@@ -11,6 +11,7 @@ import '../../core/transport/api_client.dart';
 import '../../core/transport/state_socket.dart';
 import '../../core/update/update_checker.dart';
 import '../chat/assistant_avatar.dart';
+import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
 
 class SessionsPage extends StatefulWidget {
@@ -535,7 +536,7 @@ class _SessionTile extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        session.title,
+                        parseSessionTitle(session.title).compact,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.titleSmall?.copyWith(

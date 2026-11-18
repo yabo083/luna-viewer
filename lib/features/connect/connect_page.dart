@@ -149,14 +149,14 @@ class _ConnectPageState extends State<ConnectPage> {
                 children: [
                   Row(
                     children: [
-                      Container(
-                        width: 44,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
-                          color: scheme.primary.withValues(alpha: 0.12),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: Image.asset(
+                          'assets/brand_icon.png',
+                          width: 44,
+                          height: 44,
+                          filterQuality: FilterQuality.medium,
                         ),
-                        child: Icon(Icons.bolt_rounded, color: scheme.primary),
                       ),
                       const SizedBox(width: 12),
                       Column(
