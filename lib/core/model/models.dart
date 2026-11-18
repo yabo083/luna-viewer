@@ -114,6 +114,7 @@ class PlatformConversation {
     required this.title,
     required this.count,
     required this.last,
+    this.avatar,
   });
 
   /// 插件侧会话键：已加载会话的 id 归一化后与它相等（见 `normalizeConversationKey`）。
@@ -122,6 +123,9 @@ class PlatformConversation {
   final String selfId;
   final String channelId;
   final String? guildId;
+
+  /// 会话头像（插件后续会带真实群名/昵称时一起给）；缺失时列表退回 bot 头像或占位。
+  final String? avatar;
 
   /// 插件判定的会话形态（`group` / `private`），原样透传，只用于展示。
   final String kind;
@@ -146,6 +150,7 @@ class PlatformConversation {
     title: title,
     count: count ?? this.count,
     last: last ?? this.last,
+    avatar: avatar,
   );
 
   static PlatformConversation? fromJson(Object? json) {
@@ -162,6 +167,7 @@ class PlatformConversation {
       title: _platformText(json['title']).trim(),
       count: (json['count'] as num?)?.toInt() ?? 0,
       last: PlatformMessage.fromJson(json['last']),
+      avatar: _optionalText(json['avatar']),
     );
   }
 }
@@ -174,6 +180,8 @@ class PlatformMessage {
     required this.outbound,
     required this.userId,
     required this.content,
+    this.userName,
+    this.avatar,
   });
 
   final String id;
@@ -184,7 +192,13 @@ class PlatformMessage {
   final String userId;
   final String content;
 
-  /// 渲染模型：出站是助手气泡（markdown + 头像）。入站不走这里——详情页把它画成纯文本气泡。
+  /// 发送者展示名（插件后续提供）；缺失时气泡只显示头像与正文。
+  final String? userName;
+
+  /// 发送者头像（插件后续提供）；缺失时用首字母圆头像。
+  final String? avatar;
+
+  /// 渲染模型：`out` 与 `in` 都用它，详情页按 `outbound` 决定左右与配色。
   /// 平台消息逐条都是发言，没有框架/指令形态，因此关掉指令启发式。
   late final ChatMessage view = ChatMessage(
     id: id,
@@ -209,6 +223,8 @@ class PlatformMessage {
       outbound: _platformText(json['dir']) == 'out',
       userId: _platformText(json['userId']),
       content: content,
+      userName: _optionalText(json['userName'] ?? json['user'] ?? json['nick']),
+      avatar: _optionalText(json['avatar']),
     );
   }
 }
@@ -225,6 +241,13 @@ final RegExp _platformSpaces = RegExp(r'\s+');
 
 String _platformText(Object? value) => value is String ? value : '';
 
+/// 可选展示字段：缺失/空串统一成 null，UI 才能用「有没有值」决定降级。
+String? _optionalText(Object? value) {
+  if (value is! String) return null;
+  final trimmed = value.trim();
+  return trimmed.isEmpty ? null : trimmed;
+}
+
 /// 平台时间戳：毫秒（13 位）/ 秒（10 位）数字或 ISO 串都接受。
 DateTime _platformTime(Object? raw) {
   if (raw is num) {
@@ -236,6 +259,13 @@ DateTime _platformTime(Object? raw) {
   final epoch = int.tryParse(text);
   if (epoch != null) return _platformTime(epoch);
   return DateTime.tryParse(text) ?? DateTime.fromMillisecondsSinceEpoch(0);
+}
+
+/// 可选时间：缺失或解析成 0 时返回 null，调用方据此降级（不画时间、按顺序兜底）。
+DateTime? _optionalTime(Object? raw) {
+  if (raw == null) return null;
+  final time = _platformTime(raw);
+  return time.millisecondsSinceEpoch <= 0 ? null : time;
 }
 
 class ChatBlock {
@@ -255,11 +285,15 @@ class ChatMessage {
     this.form = '',
     bool isFramework = false,
     this.detectCommands = true,
+    this.time,
   }) : _declaredFramework = isFramework;
 
   final String id;
   final String role;
   final List<ChatBlock> blocks;
+
+  /// 落库时间（服务端给了才非空）：框架块按它插入时间线并与平台消息对齐。
+  final DateTime? time;
 
   /// 服务端标记的消息形态：`notice` 是引擎/插件注入的内部消息（wake、turn 装配），不是用户发言。
   final String form;
@@ -300,6 +334,9 @@ class ChatMessage {
       blocks: blocks,
       form: form,
       isFramework: (form.isNotEmpty && form != 'message') || sourceKind == 'plugin',
+      time: _optionalTime(
+        json['time'] ?? json['at'] ?? json['timestamp'] ?? json['createdAt'],
+      ),
     );
   }
 

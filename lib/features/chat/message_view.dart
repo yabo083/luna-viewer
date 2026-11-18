@@ -8,8 +8,11 @@ import 'package:markdown_widget/markdown_widget.dart';
 import '../../core/model/models.dart';
 import 'assistant_avatar.dart';
 
-/// 一条消息的渲染：助手走「无气泡 + markdown + 思考折叠 + 工具计数」，
-/// 用户走右侧浅色气泡。图片按 markdown `![]()` 出现，统一圆角并可点开全屏。
+/// 一条消息的渲染（bot 视角）：`dir=out` 是机器人自己的发言 → **右侧主色气泡**；
+/// `dir=in` 是其他人 → **左侧中性气泡**。两侧都走 markdown 与富媒体（图片缩略 + 全屏）。
+/// 框架消息不参与左右布局，仍是居中的单卡片。
+///
+/// 头像槽左右各留一份：`showHeader` 为 false 时留空占位，连续消息因此保持缩进对齐。
 class MessageView extends StatelessWidget {
   const MessageView({
     super.key,
@@ -19,6 +22,9 @@ class MessageView extends StatelessWidget {
     required this.noticeOpen,
     this.noticeCount = 1,
     this.avatarUrl,
+    this.senderName,
+    this.time,
+    this.showHeader = true,
   });
 
   final ChatMessage message;
@@ -33,11 +39,27 @@ class MessageView extends StatelessWidget {
 
   /// 这一条虚拟消息里合并了几条框架消息（相邻同标题的合并块）；>1 时标题后缀显示 `· N 条`。
   final int noticeCount;
+
+  /// 发送者头像：bot 用自己的，其他人用平台消息带的；缺失时画首字母圆头像。
   final String? avatarUrl;
+
+  /// 发送者展示名：`out` 传 bot 名，`in` 传平台给的 `userName`；null 表示不知道，不画名字行。
+  final String? senderName;
+
+  /// 消息时间：气泡右下角显示 `HH:mm`；null 隐藏，不影响布局。
+  final DateTime? time;
+
+  /// 同一发送者 5 分钟内的连续消息里只有第一条为 true：头像与名字只出现一次。
+  final bool showHeader;
+
+  static const double _avatarSize = 28;
+  static const double _avatarGap = 8;
+  static const double _maxWidthRatio = 0.86;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     final body = message.bodyMarkdown;
     final reasoning = message.reasoningText;
     if (body.isEmpty && reasoning.isEmpty && message.toolCalls.isEmpty) {
@@ -56,74 +78,190 @@ class MessageView extends StatelessWidget {
       );
     }
 
-    final content = Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (reasoning.isNotEmpty)
-          _Foldable(
-            key: ValueKey('reasoning-${message.id}'),
-            icon: Icons.psychology_outlined,
-            title: '思考过程',
-            child: SelectableText(
-              reasoning,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                height: 1.5,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ),
-        if (body.isNotEmpty)
-          // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
-          message.hasMarkup
-              ? _Markdown(data: body, base: base, headers: headers)
-              : SelectableText(body, style: theme.textTheme.bodyMedium?.copyWith(height: 1.55)),
-        if (message.toolCalls.isNotEmpty)
-          _Foldable(
-            key: ValueKey('tools-${message.id}'),
-            icon: Icons.build_outlined,
-            title: '工具调用 ×${message.toolCalls.length}',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                for (final call in message.toolCalls) _ToolCallTile(call: call),
-              ],
-            ),
-          ),
-      ],
-    );
+    // bot 自己的发言在右（主色底），其他人发言在左（中性底）。
+    final outbound = !message.isUser;
+    final foreground = outbound ? scheme.onPrimary : scheme.onSurface;
+    final mutedForeground = outbound
+        ? scheme.onPrimary.withValues(alpha: 0.72)
+        : scheme.onSurfaceVariant.withValues(alpha: 0.75);
 
-    if (message.isUser) {
-      return Align(
-        alignment: Alignment.centerRight,
-        child: Container(
-          constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.86),
-          margin: const EdgeInsets.symmetric(vertical: 6),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          decoration: BoxDecoration(
-            color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
-            borderRadius: BorderRadius.circular(16),
+    final content = <Widget>[
+      if (reasoning.isNotEmpty)
+        _Foldable(
+          key: ValueKey('reasoning-${message.id}'),
+          icon: Icons.psychology_outlined,
+          title: '思考过程',
+          child: SelectableText(
+            reasoning,
+            style: theme.textTheme.bodySmall?.copyWith(height: 1.5, color: mutedForeground),
           ),
-          child: message.hasMarkup
-              ? _Markdown(data: body, base: base, headers: headers)
-              : SelectableText(
-                  body,
-                  style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
-                ),
         ),
-      );
-    }
+      if (body.isNotEmpty)
+        // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
+        message.hasMarkup
+            ? _Markdown(data: body, base: base, headers: headers, foreground: foreground)
+            : SelectableText(
+                body,
+                style: theme.textTheme.bodyMedium?.copyWith(height: 1.5, color: foreground),
+              ),
+      if (message.toolCalls.isNotEmpty)
+        _Foldable(
+          key: ValueKey('tools-${message.id}'),
+          icon: Icons.build_outlined,
+          title: '工具调用 ×${message.toolCalls.length}',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final call in message.toolCalls) _ToolCallTile(call: call),
+            ],
+          ),
+        ),
+    ];
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
+    final bubble = Container(
+      constraints: BoxConstraints(
+        maxWidth: MediaQuery.sizeOf(context).width * _maxWidthRatio - (_avatarSize + _avatarGap),
+      ),
+      margin: EdgeInsets.only(top: showHeader ? 2 : 0),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 7),
+      decoration: BoxDecoration(
+        color: outbound ? scheme.primary : scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(outbound ? 16 : 4),
+          topRight: Radius.circular(outbound ? 4 : 16),
+          bottomLeft: const Radius.circular(16),
+          bottomRight: const Radius.circular(16),
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          AssistantAvatar(size: 28, imageUrl: avatarUrl),
-          const SizedBox(width: 10),
-          Expanded(child: content),
+          ...content,
+          if (time case final at?)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Text(
+                  _hourMinute(at),
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    fontSize: 10,
+                    height: 1.2,
+                    color: mutedForeground,
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
+
+    final name = senderName?.trim();
+    final header = showHeader && name != null && name.isNotEmpty
+        ? Padding(
+            padding: EdgeInsets.only(bottom: 3, left: outbound ? 0 : 3, right: outbound ? 3 : 0),
+            child: Text(
+              name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelSmall?.copyWith(
+                fontSize: 11,
+                height: 1.2,
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          )
+        : null;
+
+    final avatar = showHeader
+        ? SizedBox.square(
+            dimension: _avatarSize,
+            child: outbound
+                ? AssistantAvatar(size: _avatarSize, imageUrl: avatarUrl)
+                : _HumanAvatar(size: _avatarSize, name: name, imageUrl: avatarUrl),
+          )
+        : const SizedBox(width: _avatarSize, height: _avatarSize);
+
+    final aligned = Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: outbound ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+      children: [?header, bubble],
+    );
+
+    return Padding(
+      // 分组之间 16，同一发送者的连续消息之间 8。
+      padding: EdgeInsets.only(top: showHeader ? 16 : 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: outbound ? MainAxisAlignment.end : MainAxisAlignment.start,
+        children: outbound
+            ? [
+                Flexible(child: aligned),
+                const SizedBox(width: _avatarGap),
+                avatar,
+              ]
+            : [
+                avatar,
+                const SizedBox(width: _avatarGap),
+                Flexible(child: aligned),
+              ],
+      ),
+    );
+  }
+}
+
+String _hourMinute(DateTime time) =>
+    '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
+
+/// 人类发送者的头像：有真实头像就加载，失败或缺失时用名字首字母的圆头像。
+class _HumanAvatar extends StatelessWidget {
+  const _HumanAvatar({required this.size, this.name, this.imageUrl});
+
+  final double size;
+  final String? name;
+  final String? imageUrl;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final url = imageUrl;
+    final initial = _initialOf(name);
+    final fallback = Container(
+      width: size,
+      height: size,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(shape: BoxShape.circle, color: scheme.secondaryContainer),
+      child: initial.isEmpty
+          ? Icon(Icons.person_outline, size: size * 0.55, color: scheme.onSecondaryContainer)
+          : Text(
+              initial,
+              style: TextStyle(
+                fontSize: size * 0.42,
+                height: 1,
+                fontWeight: FontWeight.w600,
+                color: scheme.onSecondaryContainer,
+              ),
+            ),
+    );
+    if (url == null || url.trim().isEmpty) return fallback;
+    return SizedBox.square(
+      dimension: size,
+      child: ClipOval(
+        child: Image.network(
+          url,
+          fit: BoxFit.cover,
+          errorBuilder: (_, _, _) => fallback,
+        ),
+      ),
+    );
+  }
+
+  /// 名字首字：去掉首尾空白，按 rune 取，避免把一个代理对切成两半。
+  static String _initialOf(String? name) {
+    final trimmed = name?.trim() ?? '';
+    if (trimmed.isEmpty) return '';
+    return String.fromCharCode(trimmed.runes.first).toUpperCase();
   }
 }
 
@@ -132,17 +270,23 @@ class _Markdown extends StatelessWidget {
     required this.data,
     required this.base,
     required this.headers,
+    this.foreground,
   });
 
   final String data;
   final Uri base;
   final Map<String, String> headers;
 
+  /// 气泡前景色：主色底上文字要跟着气泡走，不能再用主题的正文色。
+  final Color? foreground;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final textStyle = (theme.textTheme.bodyMedium?.copyWith(height: 1.55)) ??
-        const TextStyle(fontSize: 15, height: 1.55);
+    final scheme = theme.colorScheme;
+    final color = foreground;
+    final textStyle = (theme.textTheme.bodyMedium?.copyWith(height: 1.55, color: color)) ??
+        TextStyle(fontSize: 15, height: 1.55, color: color);
     return MarkdownWidget(
       data: data,
       shrinkWrap: true,
@@ -155,14 +299,24 @@ class _Markdown extends StatelessWidget {
           ),
           PreConfig(
             textStyle:
-                theme.textTheme.bodySmall?.copyWith(fontFamily: 'monospace', height: 1.45) ??
-                const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.45),
+                theme.textTheme.bodySmall?.copyWith(
+                  fontFamily: 'monospace',
+                  height: 1.45,
+                  color: color,
+                ) ??
+                TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.45, color: color),
             decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerHighest,
+              color: color?.withValues(alpha: 0.12) ?? scheme.surfaceContainerHighest,
               borderRadius: BorderRadius.circular(10),
             ),
           ),
-          LinkConfig(style: TextStyle(color: theme.colorScheme.primary)),
+          LinkConfig(
+            style: TextStyle(
+              color: color ?? scheme.primary,
+              decoration: TextDecoration.underline,
+              decorationColor: color ?? scheme.primary,
+            ),
+          ),
         ],
       ),
     );
@@ -426,6 +580,30 @@ class _ChatImageState extends State<_ChatImage> {
       ),
     );
   }
+}
+
+/// 框架消息卡片：详情页把日志里的 wake / memory / 工具摘要插回时间线时用它。
+/// 与 [MessageView] 内部的框架分支是同一张卡，这里只负责暴露出去。
+class FrameworkNoticeCard extends StatelessWidget {
+  const FrameworkNoticeCard({
+    super.key,
+    required this.foldKey,
+    required this.text,
+    required this.open,
+    this.count = 1,
+  });
+
+  /// 折叠状态的键：消息 id。
+  final String foldKey;
+  final String text;
+
+  /// 页面级 `Map<String, bool>`：折叠键 → 是否展开；缺省即折叠。
+  final Map<String, bool> open;
+  final int count;
+
+  @override
+  Widget build(BuildContext context) =>
+      _FrameworkNotice(foldKey: foldKey, text: text, open: open, count: count);
 }
 
 /// 框架/系统消息（`form != message` 或 `source.kind == plugin`）：不属于对话左右任一方。

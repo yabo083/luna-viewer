@@ -64,7 +64,9 @@ class ChatPage extends StatefulWidget {
   final Uri base;
   final Map<String, String> headers;
 
-  /// 插件侧会话键（归一化后）；实时帧按它过滤。
+  /// 插件侧会话键（原样透传，带 `route:` 前缀也能用）。
+  /// 请求 `/api/platform/messages` 必须用它——插件按自己存的原键查表；
+  /// 与实时帧比较时才归一化，两者不要混用。
   final String conversationKey;
 
   /// 展示名：插件给的会话名，或已加载会话的标题。
@@ -97,8 +99,27 @@ class _ChatPageState extends State<ChatPage> {
   /// 已入列的消息 id：分页、实时帧、重载三条路都靠它去重。
   final Set<String> _ids = {};
 
-  /// 框架消息折叠状态表：平台消息没有框架块，恒空；只为满足 `MessageView` 的签名。
+  /// 框架消息（wake/memory/工具摘要等）：只对已加载会话从 `/api/sessions/:id/messages`
+  /// 与 `/events` 取。平台消息里没有这些，所以单独一条时间线，渲染成居中单卡片。
+  List<_FrameworkEntry> _framework = const [];
+  final Set<String> _frameworkIds = {};
+
+  /// 框架块上限：长开页面只留最近的，避免无限增长。
+  static const int _frameworkCap = 400;
+
+  /// 与平台消息对齐的时间窗：同一段正文在这个窗口内算同一条。
+  static const Duration _dedupeWindow = Duration(seconds: 3);
+
+  StreamSubscription<SessionEvent>? _eventsSub;
+  bool _eventsStarted = false;
+  bool _frameworkStarted = false;
+
+  /// 框架消息折叠状态表：折叠键 → 是否展开。
   final Map<String, bool> _noticeOpen = {};
+
+  /// 时间线项的 Widget 缓存：同一条消息在后续 setState 里复用同一个实例，
+  /// `ListView` 因此跳过整棵 markdown 重建（滚动之外的主要开销）。
+  final Map<String, Widget> _itemCache = {};
 
   bool _loading = true;
   bool _loadingMore = false;
@@ -135,6 +156,9 @@ class _ChatPageState extends State<ChatPage> {
   int? _netMs;
   int? _liveMs;
 
+  /// 首帧真正上屏的耗时（debug 头部显示）：点击到可见反馈的一部分。
+  int? _paintMs;
+
   @override
   void initState() {
     super.initState();
@@ -147,8 +171,14 @@ class _ChatPageState extends State<ChatPage> {
     // 首帧先画出来再连实时流：SSE 握手与首个 snapshot 会和首屏排版抢时间。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      // 首帧上屏时间：点击 → 可见反馈的本地耗时，debug 头部显示。
+      _paintMs ??= _since();
       // 未加载的会话没有 agent：`/live` 只会 404，不连。
-      if (widget.session != null) _startLive();
+      if (widget.session != null) {
+        _startLive();
+        // 增量事件同样放到首帧之后：它只补充中间块，不能拖慢首屏。
+        _startEvents();
+      }
       _startStream();
     });
   }
@@ -160,6 +190,7 @@ class _ChatPageState extends State<ChatPage> {
     _streamingText.dispose();
     _unseen.dispose();
     _liveSub?.cancel();
+    _eventsSub?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
     _snapshotTimer?.cancel();
@@ -197,6 +228,9 @@ class _ChatPageState extends State<ChatPage> {
         _loading = false;
         _error = '加载失败：$e';
       });
+    } finally {
+      // 首页结果出来后再补框架块：这样日志里的平台消息能给框架条目当时间锚点。
+      unawaited(_loadFramework());
     }
   }
 
@@ -215,6 +249,115 @@ class _ChatPageState extends State<ChatPage> {
       ..clear()
       ..addAll(pageIds)
       ..addAll(newer.map((message) => message.id));
+  }
+
+  // -------------------------------------------------------------- 框架消息
+
+  /// 已加载会话才有日志：额外拉一次 `/api/sessions/:id/messages`，只收框架消息
+  /// （wake / memory / 工具摘要等），渲染成居中单卡片插回时间线。
+  /// 未加载的会话没有日志可拉，直接不显示框架块。
+  Future<void> _loadFramework({bool force = false}) async {
+    final session = widget.session;
+    if (session == null) return;
+    if (_frameworkStarted && !force) return;
+    _frameworkStarted = true;
+    try {
+      final transcript = await widget.repo.transcript(session.id);
+      if (!mounted) return;
+      final entries = <_FrameworkEntry>[];
+      // 日志里平台消息也在：它给后面的框架块当时间锚点（服务端没给时戳时仍能落在正确位置）。
+      DateTime? anchor;
+      for (final message in transcript.messages) {
+        final text = message.bodyMarkdown.trim();
+        if (text.isEmpty) continue;
+        if (!message.isFramework) {
+          anchor = _platformTimeOf(text) ?? anchor;
+          continue;
+        }
+        entries.add(
+          _FrameworkEntry(
+            id: message.id.isNotEmpty ? message.id : 'framework-${_squeeze(text).hashCode}',
+            text: text,
+            time: message.time ?? anchor,
+          ),
+        );
+      }
+      setState(() {
+        // 保留日志返回之前就通过 `/events` 进来的条目：同一 id 以日志为准。
+        final ids = {for (final entry in entries) entry.id};
+        final tail = [
+          for (final entry in _framework)
+            if (!ids.contains(entry.id)) entry,
+        ];
+        _framework = [...entries, ...tail];
+        _frameworkIds
+          ..clear()
+          ..addAll(entries.map((entry) => entry.id))
+          ..addAll(tail.map((entry) => entry.id));
+      });
+    } on ApiFailure {
+      // 框架块只是补充：拿不到就只显示平台消息，不弹错。
+    }
+  }
+
+  /// `/events` 增量：只收框架类 entry。平台 `stream` 才是消息本体，两者互不影响。
+  void _startEvents() {
+    final session = widget.session;
+    if (_eventsStarted || session == null) return;
+    _eventsStarted = true;
+    _eventsSub = widget.repo.events(session.id).listen(
+      (event) {
+        if (!mounted) return;
+        // 增量窗口失效：框架块的本地增量不可信，重取一次日志。
+        if (event.truncated) {
+          unawaited(_loadFramework(force: true));
+          return;
+        }
+        final message = event.message;
+        if (message == null || !message.isFramework) return;
+        final text = message.bodyMarkdown.trim();
+        if (text.isEmpty) return;
+        final id = message.id.isNotEmpty ? message.id : 'framework-${_squeeze(text).hashCode}';
+        if (!_frameworkIds.add(id)) return;
+        final time = message.time ?? DateTime.now();
+        // 指令类消息同时是平台发言（`chatluna …`）：已出现在气泡里的不再画第二遍。
+        if (_duplicateOfPlatform(text, time)) return;
+        setState(() {
+          final next = [..._framework, _FrameworkEntry(id: id, text: text, time: time)];
+          _framework = next.length > _frameworkCap
+              ? next.sublist(next.length - _frameworkCap)
+              : next;
+        });
+      },
+      onError: (Object _) {},
+      cancelOnError: true,
+    );
+  }
+
+  /// 去重键：正文压掉所有空白（换行/缩进不影响「同一条」判定）。
+  static String _squeeze(String text) => text.replaceAll(RegExp(r'\s+'), '');
+
+  /// 平台消息的正文 → 时间；框架块在服务端没给时戳时用它当锚点。
+  DateTime? _platformTimeOf(String text) {
+    final key = _squeeze(text);
+    if (key.isEmpty) return null;
+    for (final message in _messages) {
+      if (_squeeze(message.content) == key) return message.time;
+    }
+    return null;
+  }
+
+  /// 框架正文与平台消息「压空白后同文 + 时间相差 3s 内」= 同一条，不重复显示。
+  bool _duplicateOfPlatform(String text, DateTime? at) {
+    final key = _squeeze(text);
+    if (key.isEmpty) return true;
+    for (final message in _messages) {
+      if (_squeeze(message.content) != key) continue;
+      // 没有时间戳就没法对齐：正文相同按重复处理，宁少不重。
+      if (at == null) return true;
+      if (message.time.difference(at).abs() <= _dedupeWindow) return true;
+    }
+    return false;
   }
 
   /// 更早一页：游标是最早一条的时间，服务端返回它之前的一页。
@@ -263,7 +406,10 @@ class _ChatPageState extends State<ChatPage> {
 
   void _onPlatformEvent(PlatformEvent event) {
     if (!mounted) return;
-    if (normalizeConversationKey(event.key) != widget.conversationKey) return;
+    // 两边都归一：插件帧可能是 `route:r-x:user:y`，构造参数可能是原键。
+    if (normalizeConversationKey(event.key) != normalizeConversationKey(widget.conversationKey)) {
+      return;
+    }
     final message = event.message;
     // 分页/重载/重连回放都会送到同一条：id 是唯一去重键。
     if (!_ids.add(message.id)) return;
@@ -548,16 +694,137 @@ class _ChatPageState extends State<ChatPage> {
     if (!kDebugMode) return const [];
     return [
       if (_netMs != null) 'net ${_netMs}ms',
+      if (_paintMs != null) 'paint ${_paintMs}ms',
       if (_liveMs != null) 'live ${_liveMs}ms',
       'msg ${_messages.length}',
+      if (_framework.isNotEmpty) 'fw ${_framework.length}',
     ];
+  }
+
+  /// 分组窗口：同一发送者 5 分钟内的连续消息共用一次头像与名字。
+  static const Duration _groupWindow = Duration(minutes: 5);
+
+  /// 时间线：平台消息 + 框架块，按时间插好日期分隔条，并算出每条是否显示头像/名字。
+  /// 分组键 = 发送者（`bot` / `user:<id>`）+ 5 分钟窗口；跨天、跨发送者都重新起组。
+  List<_TimelineItem> _timeline() {
+    final messages = _messages;
+    if (messages.isEmpty && _framework.isEmpty) return const [];
+
+    // 平台正文索引：框架块与它们对齐去重（正文压空白 + 3s 窗口）。
+    final index = <String, List<DateTime>>{};
+    for (final message in messages) {
+      final key = _squeeze(message.content);
+      if (key.isEmpty) continue;
+      (index[key] ??= []).add(message.time);
+    }
+    final notices = <_FrameworkEntry>[
+      for (final entry in _framework)
+        if (!_isDuplicate(index, entry)) entry,
+    ];
+
+    final items = <_TimelineItem>[];
+    DateTime? day;
+    var lastSender = '';
+    DateTime? lastTime;
+
+    // 日期分隔条：跨天时顺带把分组状态清掉，后一条重新显示头像与名字。
+    void separatorFor(DateTime? at) {
+      if (at == null) return;
+      final date = DateTime(at.year, at.month, at.day);
+      if (day != null && _sameDay(day!, date)) return;
+      day = date;
+      lastSender = '';
+      lastTime = null;
+      items.add(_DayItem(date));
+    }
+
+    var next = 0;
+    for (final message in messages) {
+      // 落在这一条之前的框架块先插进去。
+      while (next < notices.length) {
+        final entry = notices[next];
+        final at = entry.time;
+        if (at == null || !at.isBefore(message.time)) break;
+        separatorFor(at);
+        items.add(_NoticeItem(entry));
+        // 框架块打断分组：后面的人重新显示头像与名字。
+        lastSender = '';
+        lastTime = null;
+        next += 1;
+      }
+      separatorFor(message.time);
+      final sender = message.outbound
+          ? 'bot'
+          : 'user:${message.userId.isNotEmpty ? message.userId : (message.userName ?? '')}';
+      final previous = lastTime;
+      final showHeader = sender != lastSender ||
+          previous == null ||
+          message.time.difference(previous).abs() > _groupWindow;
+      items.add(_MessageItem(message, showHeader: showHeader));
+      lastSender = sender;
+      lastTime = message.time;
+    }
+    // 剩下的框架块：没有时戳的排在日志尾部，按取回顺序。
+    for (; next < notices.length; next++) {
+      final entry = notices[next];
+      separatorFor(entry.time);
+      items.add(_NoticeItem(entry));
+      lastSender = '';
+      lastTime = null;
+    }
+    return items;
+  }
+
+  static bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  /// 时间线上的一项 → Widget。缓存键包含渲染所需的全部可变输入（id / 是否显示头部），
+  /// 因此同一个实例可以安全复用；状态（折叠、图片解码）都在子 widget 自己的 State 里。
+  Widget _itemWidget(_TimelineItem item) {
+    final (cacheKey, build) = switch (item) {
+      _DayItem(:final day) => (
+        'd:${day.toIso8601String()}',
+        () => _DayDivider(day: day),
+      ),
+      _NoticeItem(:final entry) => (
+        'n:${entry.id}',
+        () => FrameworkNoticeCard(foldKey: entry.id, text: entry.text, open: _noticeOpen),
+      ),
+      _MessageItem(:final message, :final showHeader) => (
+        'm:${message.id}:$showHeader',
+        () => MessageView(
+          key: ValueKey(message.id),
+          message: message.view,
+          base: widget.base,
+          headers: widget.headers,
+          noticeOpen: _noticeOpen,
+          avatarUrl: message.outbound ? widget.avatarUrl : message.avatar,
+          senderName: message.outbound ? widget.botName : message.userName,
+          time: message.time,
+          showHeader: showHeader,
+        ),
+      ),
+    };
+    return _itemCache[cacheKey] ??= build();
+  }
+
+  static bool _isDuplicate(Map<String, List<DateTime>> index, _FrameworkEntry entry) {
+    final times = index[_squeeze(entry.text)];
+    if (times == null) return false;
+    final at = entry.time;
+    // 没有时间戳就没法对齐：正文相同按重复处理，宁少不重。
+    if (at == null) return true;
+    for (final time in times) {
+      if (time.difference(at).abs() <= _dedupeWindow) return true;
+    }
+    return false;
   }
 
   /// 列表首格：状态胶囊 + 流式正文。只有这一格监听 delta，整页不随 token 重建。
   Widget _liveSlot(ThemeData theme) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 8),
+    padding: const EdgeInsets.only(top: 16),
     child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.end,
       children: [
         _LiveCapsule(state: _live),
         if (_live.generating)
@@ -565,11 +832,30 @@ class _ChatPageState extends State<ChatPage> {
             valueListenable: _streamingText,
             builder: (context, text, _) => text.isEmpty
                 ? const SizedBox.shrink()
-                : Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: SelectableText(
-                      text,
-                      style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
+                : Align(
+                    alignment: Alignment.centerRight,
+                    child: Container(
+                      margin: const EdgeInsets.only(top: 6),
+                      constraints: BoxConstraints(
+                        maxWidth: MediaQuery.sizeOf(context).width * 0.86 - 36,
+                      ),
+                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.primary,
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(16),
+                          topRight: Radius.circular(4),
+                          bottomLeft: Radius.circular(16),
+                          bottomRight: Radius.circular(16),
+                        ),
+                      ),
+                      child: SelectableText(
+                        text,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          height: 1.5,
+                          color: theme.colorScheme.onPrimary,
+                        ),
+                      ),
                     ),
                   ),
           ),
@@ -581,6 +867,7 @@ class _ChatPageState extends State<ChatPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final messages = _messages;
+    final items = _timeline();
     final slot = _live.hasCapsule ? 1 : 0;
     return Scaffold(
       appBar: AppBar(
@@ -600,7 +887,10 @@ class _ChatPageState extends State<ChatPage> {
               onSelected: (value) {
                 if (value == 'compact') _compact();
                 if (value == 'fork') _fork();
-                if (value == 'reload') _load();
+                if (value == 'reload') {
+                  _load();
+                  unawaited(_loadFramework(force: true));
+                }
               },
               itemBuilder: (_) => const [
                 PopupMenuItem(value: 'compact', child: Text('压缩上下文')),
@@ -654,7 +944,7 @@ class _ChatPageState extends State<ChatPage> {
                       ],
                     ),
                   )
-                : messages.isEmpty && _live == LiveState.idle
+                : items.isEmpty && _live == LiveState.idle
                 ? Center(
                     child: Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -671,30 +961,20 @@ class _ChatPageState extends State<ChatPage> {
                     controller: _scroll,
                     reverse: true,
                     padding: EdgeInsets.fromLTRB(
-                      16,
                       12,
-                      16,
+                      12,
+                      12,
                       24 + MediaQuery.paddingOf(context).bottom,
                     ),
                     cacheExtent: 600,
-                    itemCount: messages.length + slot,
+                    itemCount: items.length + slot,
                     itemBuilder: (context, index) {
-                      var cursor = index;
                       if (slot == 1) {
-                        if (cursor == 0) return _liveSlot(theme);
-                        cursor -= 1;
+                        if (index == 0) return _liveSlot(theme);
+                        index -= 1;
                       }
                       // 反向列表：index 0 是最新，取数据尾部。
-                      final message = messages[messages.length - 1 - cursor];
-                      // 入站是用户发言：右侧纯文本气泡，不解析 markdown。
-                      if (!message.outbound) return _UserBubble(text: message.content);
-                      return MessageView(
-                        message: message.view,
-                        base: widget.base,
-                        headers: widget.headers,
-                        noticeOpen: _noticeOpen,
-                        avatarUrl: widget.avatarUrl,
-                      );
+                      return _itemWidget(items[items.length - 1 - index]);
                     },
                   ),
           ),
@@ -704,29 +984,77 @@ class _ChatPageState extends State<ChatPage> {
   }
 }
 
-/// 入站消息：右侧纯文本气泡。平台消息不做 markdown 解析——用户说的是什么就显示什么，
-/// 与 `MessageView` 的用户气泡同款尺寸与底色，出站才走富文本渲染。
-class _UserBubble extends StatelessWidget {
-  const _UserBubble({required this.text});
+/// 时间线上的一项。日期分隔条没有时间（它本身就是「哪一天」）。
+sealed class _TimelineItem {
+  const _TimelineItem();
+}
 
+class _DayItem extends _TimelineItem {
+  const _DayItem(this.day);
+
+  final DateTime day;
+}
+
+class _NoticeItem extends _TimelineItem {
+  const _NoticeItem(this.entry);
+
+  final _FrameworkEntry entry;
+}
+
+class _MessageItem extends _TimelineItem {
+  const _MessageItem(this.message, {required this.showHeader});
+
+  final PlatformMessage message;
+
+  /// 同一发送者 5 分钟内的连续消息里只有第一条为 true。
+  final bool showHeader;
+}
+
+/// 一条框架消息：正文、折叠键与对齐用的时间（可能为空）。
+class _FrameworkEntry {
+  const _FrameworkEntry({required this.id, required this.text, this.time});
+
+  final String id;
   final String text;
+  final DateTime? time;
+}
+
+/// 日期分隔条：今天 / 昨天 / `YYYY-MM-DD`，弱化居中。
+class _DayDivider extends StatelessWidget {
+  const _DayDivider({required this.day});
+
+  final DateTime day;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Align(
-      alignment: Alignment.centerRight,
-      child: Container(
-        constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.86),
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: SelectableText(
-          text,
-          style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
+    final scheme = theme.colorScheme;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final diff = today.difference(day).inDays;
+    final label = switch (diff) {
+      0 => '今天',
+      1 => '昨天',
+      _ => '${day.year}-${day.month.toString().padLeft(2, '0')}-'
+          '${day.day.toString().padLeft(2, '0')}',
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.65),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              fontSize: 11,
+              height: 1.2,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
         ),
       ),
     );

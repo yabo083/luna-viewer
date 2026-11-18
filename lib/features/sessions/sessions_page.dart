@@ -18,6 +18,10 @@ import '../chat/assistant_avatar.dart';
 import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
 
+/// 活跃窗口：最后一条消息在 72 小时内的会话留在主列表，更早的收进「归档」。
+/// 时间基准是设备当前时间，由列表每次重建时重新计算（收到新消息就自动回到主列表）。
+const Duration activeWindow = Duration(days: 3);
+
 class SessionsPage extends StatefulWidget {
   const SessionsPage({
     super.key,
@@ -53,8 +57,16 @@ class _SessionsPageState extends State<SessionsPage> {
   PlatformStream? _stream;
   StreamSubscription<PlatformEvent>? _streamSub;
   bool _syncing = false;
+  DateTime? _syncedAt;
+  Timer? _syncTimer;
 
   final TextEditingController _search = TextEditingController();
+
+  /// 归档子视图：主列表只放 72 小时内的会话，更早的点进这里看。
+  bool _archiveOpen = false;
+
+  /// 实时帧合并标志：一帧内的多帧只触发一次重建（重连回放会连发很多条）。
+  bool _beatScheduled = false;
 
   bool _searching = false;
   BotProfile? _bot;
@@ -117,6 +129,7 @@ class _SessionsPageState extends State<SessionsPage> {
 
   @override
   void dispose() {
+    _syncTimer?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
     _search.dispose();
@@ -152,6 +165,8 @@ class _SessionsPageState extends State<SessionsPage> {
           ..clear()
           ..addAll(conversations);
       });
+      // 全量对齐之后算一次「刚同步过」，避免紧接着的流帧再补一遍会话表。
+      _syncedAt = DateTime.now();
     } on ApiFailure catch (e) {
       if (e.isUnauthorized) {
         await widget.onDisconnect();
@@ -168,8 +183,20 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   /// 只重取会话表（详情页返回、或流里冒出未知会话时）：不动已加载会话、不动滚动位置。
+  /// 2 秒内只补一次：回放阶段可能连续冒出多个未知会话，逐帧重取会拖慢整个列表；
+  /// 窗口内的请求排队到窗口末尾执行，新会话的第一条消息不会丢。
   Future<void> _syncConversations() async {
     if (_syncing) return;
+    final now = DateTime.now();
+    final last = _syncedAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 2)) {
+      _syncTimer ??= Timer(const Duration(seconds: 2), () {
+        _syncTimer = null;
+        _syncConversations();
+      });
+      return;
+    }
+    _syncedAt = now;
     _syncing = true;
     try {
       final conversations = await _platform.conversations();
@@ -212,24 +239,37 @@ class _SessionsPageState extends State<SessionsPage> {
     final message = event.message;
     // 重连会回放各会话最近 5 条：比手上的最后一条更早就不改这一行。
     if (last != null && !message.time.isAfter(last.time)) return;
-    setState(() {
-      _conversations[index] = current.copyWith(count: current.count + 1, last: message);
+    _conversations[index] = current.copyWith(count: current.count + 1, last: message);
+    // 同一帧内到多帧只重建一次：回放阶段连续 setState 会把手指下的点击也拖慢。
+    if (_beatScheduled) return;
+    _beatScheduled = true;
+    scheduleMicrotask(() {
+      _beatScheduled = false;
+      if (mounted) setState(() {});
     });
   }
 
   Future<void> _loadMore() async {
     if (_cursor == null || _loading || _loadingMore) return;
+    final requested = _cursor;
     _loadingMore = true;
     try {
-      final page = await _repo.list(cursor: _cursor);
+      final page = await _repo.list(cursor: requested);
       if (!mounted) return;
+      final known = {for (final session in _loaded) session.id};
+      final fresh = [
+        for (final session in page.items)
+          if (!known.contains(session.id)) session,
+      ];
       setState(() {
-        final known = {for (final session in _loaded) session.id};
-        _loaded.addAll(page.items.where((session) => !known.contains(session.id)));
+        _loaded.addAll(fresh);
         _cursor = page.nextCursor;
       });
-    } on ApiFailure catch (e) {
-      _toast('${e.code}：${e.message}');
+      // 游标没前进又没有新行：服务端不会再给东西了，停手——否则每次重建都会空转一次请求。
+      if (fresh.isEmpty && _cursor == requested) _cursor = null;
+    } on ApiFailure {
+      // 静默停手：这是后台补齐，不该在列表上反复弹错（也避免每次重建都重试）。
+      _cursor = null;
     } finally {
       _loadingMore = false;
     }
@@ -436,6 +476,9 @@ class _SessionsPageState extends State<SessionsPage> {
 
   Future<void> _open(_SessionRow row) async {
     if (!mounted) return;
+    // 立即反馈：手感 + 同步推路由。任何网络请求都放到详情页首帧之后，
+    // 点击与可见响应之间不留空白等待。
+    unawaited(HapticFeedback.selectionClick());
     await Navigator.of(context).push(
       // 三键导航栏没有系统边缘手势；用 Cupertino 路由把「左缘右滑返回」做进 App。
       CupertinoPageRoute<void>(
@@ -444,6 +487,7 @@ class _SessionsPageState extends State<SessionsPage> {
           platform: _platform,
           base: widget.connection.base,
           headers: _api.authHeaders,
+          // 原样传插件的会话键：`/api/platform/messages` 按它查表，归一化只用于流过滤。
           conversationKey: row.key,
           title: row.title,
           origin: row.conversation?.platform ?? row.session?.origin ?? '',
@@ -454,8 +498,9 @@ class _SessionsPageState extends State<SessionsPage> {
         ),
       ),
     );
+    if (!mounted) return;
     // 详情页自己订阅了实时流；回来只补一次会话表元数据（计数/最后一条），不整页刷新。
-    await _syncConversations();
+    unawaited(_syncConversations());
   }
 
   Future<void> _actions(_SessionRow row) async {
@@ -524,27 +569,38 @@ class _SessionsPageState extends State<SessionsPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: _archiveOpen
+            ? IconButton(
+                onPressed: _closeArchive,
+                icon: const Icon(Icons.arrow_back),
+                tooltip: '返回会话',
+              )
+            : null,
         // 标题槽在「会话」与搜索框之间横切切换。AppBar 高度只由 toolbarHeight 决定，
         // 两种标题内容都压在 40dp 以内，所以进出搜索不会改变 AppBar 尺寸。
-        title: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 180),
-          switchInCurve: Curves.easeOutCubic,
-          switchOutCurve: Curves.easeInCubic,
-          layoutBuilder: (current, previous) => Stack(
-            alignment: Alignment.centerLeft,
-            children: [...previous, ?current],
-          ),
-          transitionBuilder: (child, animation) => FadeTransition(
-            opacity: animation,
-            child: SizeTransition(
-              sizeFactor: animation,
-              axis: Axis.horizontal,
-              axisAlignment: -1,
-              child: child,
-            ),
-          ),
-          child: _searching ? _searchField() : const Text('会话', key: ValueKey('title')),
-        ),
+        title: _archiveOpen
+            ? const Text('归档')
+            : AnimatedSwitcher(
+                duration: const Duration(milliseconds: 180),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                layoutBuilder: (current, previous) => Stack(
+                  alignment: Alignment.centerLeft,
+                  children: [...previous, ?current],
+                ),
+                transitionBuilder: (child, animation) => FadeTransition(
+                  opacity: animation,
+                  child: SizeTransition(
+                    sizeFactor: animation,
+                    axis: Axis.horizontal,
+                    axisAlignment: -1,
+                    child: child,
+                  ),
+                ),
+                child: _searching
+                    ? _searchField()
+                    : const Text('会话', key: ValueKey('title')),
+              ),
         actions: _appBarActions(),
       ),
       // 列表直接交给 body：搜索态不再插入额外一行，切换前后位置完全一致。
@@ -553,6 +609,12 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   List<Widget> _appBarActions() {
+    // 归档是只读的历史视图：没有搜索，只能刷新或返回。
+    if (_archiveOpen) {
+      return [
+        IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: '刷新'),
+      ];
+    }
     if (_searching) {
       return [
         IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: '刷新'),
@@ -630,12 +692,13 @@ class _SessionsPageState extends State<SessionsPage> {
     }
     final rows = <_SessionRow>[];
     for (final conversation in _conversations) {
-      final key = normalizeConversationKey(conversation.key);
+      final key = conversation.key.trim();
       if (key.isEmpty) continue;
-      final session = loadedByKey.remove(key);
+      final session = loadedByKey.remove(normalizeConversationKey(key));
       final last = conversation.last;
       rows.add(
         _SessionRow(
+          // 原键给 `/api/platform/messages` 用；归一只用于和已加载会话、实时帧比较。
           key: key,
           title: conversation.title.isEmpty ? key : conversation.title,
           subtitle: last?.preview,
@@ -666,9 +729,28 @@ class _SessionsPageState extends State<SessionsPage> {
     return rows;
   }
 
+  /// 一次遍历把行分成「活跃」与「归档」：运行中或最后一条消息在 [activeWindow] 内算活跃。
+  /// 时间基准是设备当前时间，每次重建重新算——收到新消息就自动回到主列表。
+  (List<_SessionRow>, List<_SessionRow>) _split() {
+    final now = DateTime.now();
+    final active = <_SessionRow>[];
+    final archived = <_SessionRow>[];
+    for (final row in _rows) {
+      if (row.running || now.difference(row.time) <= activeWindow) {
+        active.add(row);
+      } else {
+        archived.add(row);
+      }
+    }
+    return (active, archived);
+  }
+
   Widget _content() {
-    final rows = _rows;
-    if (_loading && rows.isEmpty) return const Center(child: CircularProgressIndicator());
+    if (_archiveOpen) return _archiveContent();
+    final (rows, archived) = _split();
+    if (_loading && rows.isEmpty && archived.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
     if (rows.isEmpty) {
       if (_error != null) {
         return _StatusView(
@@ -680,6 +762,19 @@ class _SessionsPageState extends State<SessionsPage> {
             onPressed: () => _refresh(),
             icon: const Icon(Icons.refresh, size: 18),
             label: const Text('重试'),
+          ),
+        );
+      }
+      // 主列表没有活跃会话，但归档里还有：给出明确的归档入口，而不是「暂无会话」。
+      if (archived.isNotEmpty) {
+        return _StatusView(
+          icon: Icons.inbox_outlined,
+          title: '最近 ${activeWindow.inDays} 天没有活跃会话',
+          message: '更早的 ${archived.length} 个会话已收进归档',
+          action: OutlinedButton.icon(
+            onPressed: _openArchive,
+            icon: const Icon(Icons.inventory_2_outlined, size: 18),
+            label: Text('查看归档 · ${archived.length}'),
           ),
         );
       }
@@ -700,7 +795,7 @@ class _SessionsPageState extends State<SessionsPage> {
       return _StatusView(
         icon: Icons.search_off,
         title: '没有匹配的会话',
-        message: '换个关键词，或清空搜索查看全部会话',
+        message: '换个关键词，或清空搜索查看全部活跃会话',
         action: OutlinedButton.icon(
           onPressed: _clearSearch,
           icon: const Icon(Icons.backspace_outlined, size: 18),
@@ -709,7 +804,7 @@ class _SessionsPageState extends State<SessionsPage> {
       );
     }
     // 已加载会话是分页取的：列表走到末尾就补下一页，搜索要覆盖全部会话。
-    WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    if (_cursor != null) WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
     // 全集已经按「运行中 → 时间」排好，这里只切两段。
     final active = [
       for (final row in shown)
@@ -735,14 +830,59 @@ class _SessionsPageState extends State<SessionsPage> {
           ),
           for (final row in rest) _tile(row),
         ],
+        // 归档入口固定在列表底部：弱化一行，与「运行中/其他」的分组头区分开。
+        if (archived.isNotEmpty) _ArchiveEntry(count: archived.length, onTap: _openArchive),
         SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
       ],
     );
   }
 
+  /// 归档子视图：列表样式完全复用会话行，只少了搜索与分组。
+  Widget _archiveContent() {
+    final (_, rows) = _split();
+    if (rows.isEmpty) {
+      return _StatusView(
+        icon: Icons.inventory_2_outlined,
+        title: '归档是空的',
+        message: '超过 ${activeWindow.inDays} 天没有新消息的会话会出现在这里',
+        action: OutlinedButton.icon(
+          onPressed: _closeArchive,
+          icon: const Icon(Icons.arrow_back, size: 18),
+          label: const Text('返回会话'),
+        ),
+      );
+    }
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+      children: [
+        _SectionHeader(label: '归档会话', count: rows.length, topPadding: 8),
+        for (final row in rows) _tile(row),
+        SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
+      ],
+    );
+  }
+
+  void _openArchive() {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _archiveOpen = true;
+      _searching = false;
+      _search.clear();
+    });
+  }
+
+  void _closeArchive() {
+    if (!_archiveOpen) return;
+    setState(() => _archiveOpen = false);
+  }
+
   Widget _tile(_SessionRow row) => _SessionTile(
+    // 固定 key：实时帧引起的重排只移动元素，不会把手指下的 InkWell 重建掉。
+    key: ValueKey(row.key),
     row: row,
-    avatarUrl: _bot?.avatar,
+    // 插件给了会话头像就优先用它；否则退回 bot 头像（再没有就是占位图标）。
+    avatarUrl: row.conversation?.avatar ?? _bot?.avatar,
     onTap: () => _open(row),
     onLongPress: () => _actions(row),
   );
@@ -771,7 +911,8 @@ class _SessionRow {
     this.session,
   });
 
-  /// 归一后的会话键：打开详情页、订阅实时流都用它。
+  /// 插件侧的原始会话键：打开详情页时原样传给 `/api/platform/messages`（插件按它查表）。
+  /// 与已加载会话、实时帧比较时再走 `normalizeConversationKey`，不要在这里先归一。
   final String key;
 
   /// 展示名：插件给的 title；已加载但插件里没有的会话用 App 侧的紧凑名。
@@ -855,10 +996,57 @@ class _SectionHeader extends StatelessWidget {
   }
 }
 
+/// 列表底部的归档入口：弱化的一行，和「运行中/其他」的分组头刻意做得不像。
+class _ArchiveEntry extends StatelessWidget {
+  const _ArchiveEntry({required this.count, required this.onTap});
+
+  final int count;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 8, 4, 0),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+          child: Row(
+            children: [
+              Icon(
+                Icons.inventory_2_outlined,
+                size: 18,
+                color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '归档 · $count',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurfaceVariant.withValues(alpha: 0.9),
+                ),
+              ),
+              const Spacer(),
+              Icon(
+                Icons.chevron_right,
+                size: 18,
+                color: scheme.onSurfaceVariant.withValues(alpha: 0.6),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 会话行：运行中的左侧留 2px 色条，标题最多两行，副标题是最后一条消息。
 /// 右侧是最后消息时间与插件的消息计数。
 class _SessionTile extends StatelessWidget {
   const _SessionTile({
+    super.key,
     required this.row,
     required this.avatarUrl,
     required this.onTap,

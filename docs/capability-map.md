@@ -42,9 +42,11 @@
 
 | 事 | 调用 | 说明 |
 |---|---|---|
-| 会话列表 | `GET /api/platform/conversations` | `{items:[{key,platform,selfId,channelId,guildId,kind,title,count,last}]}`，按最后消息倒序 |
-| 消息分页 | `GET /api/platform/messages?key=&limit=&before=` | 时间升序，`before` 取更早一页，`hasMore` 判定 |
-| 实时流 | `GET /api/platform/stream`（SSE） | 帧 `{key,message:{id,time,dir,userId,content}}`，连上先回放每会话最近 5 条 |
+| 会话列表 | `GET /api/platform/conversations` | `{items:[{key,platform,selfId,channelId,guildId,kind,title,avatar?,count,last}]}`，按最后消息倒序 |
+| 消息分页 | `GET /api/platform/messages?key=&limit=&before=` | 时间升序，`before` 取更早一页，`hasMore` 判定；`key` 用会话列表里的原键 |
+| 实时流 | `GET /api/platform/stream`（SSE） | 帧 `{key,message:{id,time,dir,userId,userName?,avatar?,content}}`，连上先回放每会话最近 5 条 |
+
+`title` / `avatar` / `userName` / `avatar` 都是可选字段（插件后续补真实群名与发送者身份）：缺失时 App 全部降级——标题退回会话键，头像退回 bot 头像或首字母，名字行不画。
 
 App 的会话与消息都以此为准；`/api/sessions*` 只提供已加载会话的状态与操作（模型、压缩、分叉、中止）。
 
