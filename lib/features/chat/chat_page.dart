@@ -207,6 +207,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 不能回头改写上一轮那条——否则会算出 0.0s 这种假读数。
   final List<String> _roundOutboundIds = <String>[];
 
+  /// 骨架当前对应的轮次号（[TurnClockView.round]）：换轮才清空本轮的外发标记。
+  int _skeletonRound = -1;
+
   /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
   /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
   Timer? _probeDelay;
@@ -1151,8 +1154,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     if (active != _turnActive) setState(() => _turnActive = active);
     if (view == null) return;
     if (!view.finished) {
-      // 新的一轮（读数从 0 起）：上一轮的外发标记不能带进来。
-      if (view.total < const Duration(milliseconds: 400)) {
+      // 新的一轮：用轮次序号判断，不能靠「读数还很小」（会漏判/误判）。
+      if (view.round != _skeletonRound) {
+        _skeletonRound = view.round;
         _outboundInRound = false;
         _roundOutboundIds.clear();
       }

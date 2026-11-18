@@ -174,6 +174,7 @@ String phaseGroupLabel(PhaseGroup group) => group.count > 1
 class TurnClockView {
   const TurnClockView({
     required this.total,
+    this.round = 0,
     this.phase,
     this.phaseElapsed,
     this.active = const [],
@@ -184,6 +185,10 @@ class TurnClockView {
 
   /// 整轮已耗时；[finished] 之后是冻结的最终值。
   final Duration total;
+
+  /// 轮次序号：每开一次新表加一。页面用它判断「这是新的一轮」，
+  /// 而不是靠「读数还很小」这种会漏判的启发式。
+  final int round;
 
   /// 此刻仍在跑的全部阶段（按进入顺序）。折叠态取前两条。
   final List<TurnPhaseRecord> active;
@@ -339,6 +344,7 @@ class TurnClock {
   Duration? _end;
   bool _previous = false;
   bool _frozen = false;
+  int _round = 0;
   Timer? _tick;
   Timer? _holdTimer;
 
@@ -367,6 +373,7 @@ class TurnClock {
     }
     _holdTimer?.cancel();
     _holdTimer = null;
+    _round++;
     _start = candidate;
     _stopAt = null;
     _deliveredAt = null;
@@ -515,6 +522,7 @@ class TurnClock {
     final phaseStart = current == null ? null : _phases.startOf(current);
     view.value = TurnClockView(
       total: now < start ? Duration.zero : now - start,
+      round: _round,
       phase: current,
       phaseElapsed: phaseStart == null ? null : now - phaseStart,
       active: _end == null ? _phases.activeAt(now) : const [],

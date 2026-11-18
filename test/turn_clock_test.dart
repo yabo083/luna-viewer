@@ -397,5 +397,27 @@ void main() {
       );
       expect(turnLineLabel(three), '24.0s · draw 12.0s · reply 1.0s +1');
     });
+
+    test('轮次序号只在真正新开一轮时递增', () {
+      var clock = const Duration(seconds: 1);
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start(lead: const Duration(seconds: 3)); // 回填 3s：首帧读数已经 >400ms
+      final first = turn.view.value!.round;
+      expect(turn.view.value!.total, const Duration(seconds: 3));
+
+      turn.phase('draw'); // 同一轮里的后续信号
+      expect(turn.view.value!.round, first);
+
+      clock = const Duration(seconds: 8);
+      turn.stopped();
+      turn.delivered();
+      expect(turn.view.value!.finished, isTrue);
+
+      clock = const Duration(seconds: 12);
+      turn.start();
+      expect(turn.view.value!.round, first + 1);
+    });
   });
 }
