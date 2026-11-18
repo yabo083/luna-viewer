@@ -40,6 +40,7 @@ class _SessionsPageState extends State<SessionsPage> {
   bool _loading = true;
   String? _error;
   String? _cursor;
+  bool _showDevInfo = false;
 
   @override
   void initState() {
@@ -47,6 +48,21 @@ class _SessionsPageState extends State<SessionsPage> {
     _refresh();
     _checkUpdate();
     _loadBot();
+    _loadUiPrefs();
+  }
+
+  Future<void> _loadUiPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final value = prefs.getBool('ui.showDevInfo') ?? false;
+    if (value != _showDevInfo) setState(() => _showDevInfo = value);
+  }
+
+  Future<void> _setShowDevInfo(bool value, StateSetter setSheetState) async {
+    setSheetState(() => _showDevInfo = value);
+    if (mounted) setState(() => _showDevInfo = value);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('ui.showDevInfo', value);
   }
 
   Future<void> _loadBot() async {
@@ -171,52 +187,62 @@ class _SessionsPageState extends State<SessionsPage> {
 
   Widget _settingsSheet(BuildContext context, ThemeMode mode) {
     final scheme = Theme.of(context).colorScheme;
-    return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.only(bottom: 12),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const _SheetSectionLabel('外观'),
-            ListTile(
-              leading: const Icon(Icons.brightness_6_outlined),
-              title: const Text('主题'),
-              subtitle: Text(switch (mode) {
-                ThemeMode.light => '浅色',
-                ThemeMode.dark => '深色',
-                ThemeMode.system => '跟随系统',
-              }),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.pop(context, 'theme'),
-            ),
-            const _SheetSectionLabel('更新'),
-            ListTile(
-              leading: const Icon(Icons.system_update_alt),
-              title: const Text('检查更新'),
-              subtitle: Text('当前 $appVersion'),
-              onTap: () => Navigator.pop(context, 'update'),
-            ),
-            const _SheetSectionLabel('关于'),
-            ListTile(
-              leading: const Icon(Icons.copy_all_outlined),
-              title: const Text('复制诊断信息'),
-              subtitle: const Text('版本 / 地址 / 机器人'),
-              onTap: () => Navigator.pop(context, 'diag'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.info_outline),
-              title: const Text('关于 ChatLuna'),
-              onTap: () => Navigator.pop(context, 'about'),
-            ),
-            const _SheetSectionLabel('危险区'),
-            ListTile(
-              leading: Icon(Icons.link_off, color: scheme.error),
-              title: Text('断开连接', style: TextStyle(color: scheme.error)),
-              subtitle: const Text('清除本机保存的 token'),
-              onTap: () => Navigator.pop(context, 'disconnect'),
-            ),
-          ],
+    return StatefulBuilder(
+      builder: (context, setSheetState) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const _SheetSectionLabel('外观'),
+              ListTile(
+                leading: const Icon(Icons.brightness_6_outlined),
+                title: const Text('主题'),
+                subtitle: Text(switch (mode) {
+                  ThemeMode.light => '浅色',
+                  ThemeMode.dark => '深色',
+                  ThemeMode.system => '跟随系统',
+                }),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.pop(context, 'theme'),
+              ),
+              const _SheetSectionLabel('更新'),
+              ListTile(
+                leading: const Icon(Icons.system_update_alt),
+                title: const Text('检查更新'),
+                subtitle: Text('当前 $appVersion'),
+                onTap: () => Navigator.pop(context, 'update'),
+              ),
+              const _SheetSectionLabel('关于'),
+              ListTile(
+                leading: const Icon(Icons.copy_all_outlined),
+                title: const Text('复制诊断信息'),
+                subtitle: const Text('版本 / 地址 / 机器人'),
+                onTap: () => Navigator.pop(context, 'diag'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.info_outline),
+                title: const Text('关于 ChatLuna'),
+                onTap: () => Navigator.pop(context, 'about'),
+              ),
+              const _SheetSectionLabel('开发者'),
+              SwitchListTile(
+                secondary: const Icon(Icons.terminal_outlined),
+                title: const Text('显示平台/引擎/性能信息'),
+                subtitle: const Text('会话头部追加平台、引擎与 debug 计时'),
+                value: _showDevInfo,
+                onChanged: (value) => _setShowDevInfo(value, setSheetState),
+              ),
+              const _SheetSectionLabel('危险区'),
+              ListTile(
+                leading: Icon(Icons.link_off, color: scheme.error),
+                title: Text('断开连接', style: TextStyle(color: scheme.error)),
+                subtitle: const Text('清除本机保存的 token'),
+                onTap: () => Navigator.pop(context, 'disconnect'),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -291,6 +317,7 @@ class _SessionsPageState extends State<SessionsPage> {
           botName: _bot?.name,
           initial: initial,
           session: session,
+          showDeveloperInfo: _showDevInfo,
         ),
       ),
     );

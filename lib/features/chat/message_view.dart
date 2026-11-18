@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:markdown_widget/markdown_widget.dart';
 
@@ -82,10 +85,12 @@ class MessageView extends StatelessWidget {
             color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
             borderRadius: BorderRadius.circular(16),
           ),
-          child: SelectableText(
-            body,
-            style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
-          ),
+          child: message.hasMarkup
+              ? _Markdown(data: body, base: base, headers: headers)
+              : SelectableText(
+                  body,
+                  style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
+                ),
         ),
       );
     }
@@ -149,6 +154,8 @@ class _Markdown extends StatelessWidget {
     if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
       return Uri.parse(url);
     }
+    // storage 附件（`file` 块的 reference）由实例直接提供，不需要 Bearer。
+    if (url.startsWith('/files/')) return base.resolve(url.substring(1));
     final name = url.startsWith('/') ? url.substring(1) : url;
     // 相对路径是 agent 工作区（data/chatluna/agents-work）里的文件，由 companion 插件以 Bearer 提供。
     return base.replace(path: '/api/workspace', queryParameters: {'path': name});
@@ -162,74 +169,123 @@ class _ChatImage extends StatelessWidget {
   final Uri Function(String) resolve;
   final Map<String, String> headers;
 
+  /// `data:image/...;base64,` 走内存解码；`Image.network` 不支持 data scheme。
+  static Uint8List? _inlineBytes(String source) {
+    if (!source.startsWith('data:')) return null;
+    final marker = RegExp(r'^data:image/[^;,]+;base64,', caseSensitive: false).firstMatch(source);
+    if (marker == null) return null;
+    try {
+      return base64Decode(source.substring(marker.end));
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// `base64://<payload>` 没有 mime，按图片内容解码即可（mime 不参与 Flutter 解码）。
+  static String _normalizeSource(String source) {
+    if (!source.startsWith('base64:')) return source;
+    final marker = RegExp(r'^base64:(?://)?').firstMatch(source);
+    if (marker == null) return source;
+    return 'data:image/png;base64,${source.substring(marker.end)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final uri = resolve(url);
+    final source = _normalizeSource(url);
+    final uri = resolve(source);
+    final bytes = _inlineBytes(source);
+    // 声明了 data URI 却解不出来：直接给占位，别让 Image.network 抛 unsupported scheme。
+    final broken = source.startsWith('data:') && bytes == null;
+
+    Widget placeholder() => Container(
+      width: 200,
+      height: 120,
+      color: theme.colorScheme.surfaceContainerHighest,
+      alignment: Alignment.center,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.broken_image_outlined, color: theme.colorScheme.onSurfaceVariant),
+          const SizedBox(height: 4),
+          Text('图片不可用', style: theme.textTheme.labelSmall),
+        ],
+      ),
+    );
+
+    final Widget preview;
+    if (broken) {
+      preview = placeholder();
+    } else if (bytes != null) {
+      preview = Image.memory(
+        bytes,
+        cacheWidth: 560,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stack) => placeholder(),
+      );
+    } else {
+      preview = Image.network(
+        uri.toString(),
+        headers: headers,
+        cacheWidth: 560,
+        fit: BoxFit.cover,
+        loadingBuilder: (context, child, progress) => progress == null
+            ? child
+            : Container(
+                width: 200,
+                height: 140,
+                color: theme.colorScheme.surfaceContainerHighest,
+                child: const Center(
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              ),
+        errorBuilder: (context, error, stack) => placeholder(),
+      );
+    }
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: GestureDetector(
-        onTap: () => showDialog<void>(
-          context: context,
-          builder: (_) => Dialog.fullscreen(
-            backgroundColor: Colors.black,
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: InteractiveViewer(
-                    child: Image.network(uri.toString(), fit: BoxFit.contain, headers: headers),
+        onTap: broken
+            ? null
+            : () => showDialog<void>(
+                context: context,
+                builder: (_) => Dialog.fullscreen(
+                  backgroundColor: Colors.black,
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: InteractiveViewer(
+                          child: bytes != null
+                              ? Image.memory(bytes, fit: BoxFit.contain)
+                              : Image.network(
+                                  uri.toString(),
+                                  fit: BoxFit.contain,
+                                  headers: headers,
+                                ),
+                        ),
+                      ),
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: IconButton.filledTonal(
+                          onPressed: () => Navigator.pop(context),
+                          icon: const Icon(Icons.close),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                Positioned(
-                  top: 8,
-                  right: 8,
-                  child: IconButton.filledTonal(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
+              ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 280, maxHeight: 360),
-            child: Image.network(
-              uri.toString(),
-              headers: headers,
-              cacheWidth: 560,
-              fit: BoxFit.cover,
-              loadingBuilder: (context, child, progress) => progress == null
-                  ? child
-                  : Container(
-                      width: 200,
-                      height: 140,
-                      color: theme.colorScheme.surfaceContainerHighest,
-                      child: const Center(
-                        child: SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                      ),
-                    ),
-              errorBuilder: (context, error, stack) => Container(
-                width: 200,
-                height: 120,
-                color: theme.colorScheme.surfaceContainerHighest,
-                alignment: Alignment.center,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.broken_image_outlined, color: theme.colorScheme.onSurfaceVariant),
-                    const SizedBox(height: 4),
-                    Text('图片不可用', style: theme.textTheme.labelSmall),
-                  ],
-                ),
-              ),
-            ),
+            child: preview,
           ),
         ),
       ),

@@ -46,6 +46,29 @@ class SessionsRepository {
     return Transcript(messages, (json['length'] as num?)?.toInt() ?? messages.length, breaks);
   }
 
+  /// 实例当前可用的聊天模型，按 provider 分组（`GET /api/models`）。
+  Future<Map<String, List<ModelOption>>> models() async {
+    final json = await api.getJson('/api/models');
+    if (json is! Map) throw ApiFailure('INTERNAL', '模型列表返回体异常');
+    final grouped = <String, List<ModelOption>>{};
+    for (final item in (json['providers'] as List?) ?? const []) {
+      if (item is! Map) continue;
+      final provider = item['provider'];
+      if (provider is! String || provider.isEmpty) continue;
+      final options = <ModelOption>[];
+      for (final raw in (item['models'] as List?) ?? const []) {
+        final option = ModelOption.fromJson(raw);
+        if (option != null) options.add(option);
+      }
+      grouped[provider] = options;
+    }
+    return grouped;
+  }
+
+  /// 切换会话模型；服务端立即解析成 `provider:model` 并回写会话。
+  Future<void> setModel(String id, ModelRef model) =>
+      api.postJson('/api/sessions/${Uri.encodeComponent(id)}/model', model.toJson());
+
   /// 中止当前生成；对任何已加载的会话有效。
   Future<void> cancel(String id) =>
       api.postJson('/api/sessions/${Uri.encodeComponent(id)}/cancel', const {});

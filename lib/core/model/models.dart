@@ -40,6 +40,28 @@ class ModelRef {
   String toString() => '$provider:$model';
 }
 
+/// `/api/models` 里某个 provider 下的一个可选模型。
+class ModelOption {
+  const ModelOption(this.id, {this.name});
+
+  final String id;
+  final String? name;
+
+  /// 展示名：有 `name` 用 `name`，否则退回模型 id。
+  String get label {
+    final trimmed = name?.trim();
+    return trimmed == null || trimmed.isEmpty ? id : trimmed;
+  }
+
+  static ModelOption? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final id = json['id'];
+    if (id is! String || id.isEmpty) return null;
+    final name = json['name'];
+    return ModelOption(id, name: name is String ? name : null);
+  }
+}
+
 class SessionSummary {
   const SessionSummary({
     required this.id,
@@ -131,7 +153,7 @@ class ChatMessage {
   late final String bodyMarkdown = _bodyMarkdown();
 
   String _bodyMarkdown() {
-    var raw = _collectText();
+    var raw = _collectMarkdown();
     // 多数回合的答复是通过 `reply` 工具发出的，assistant 自身没有 text 块。
     if (raw.trim().isEmpty) raw = _replyContent();
     if (raw.trim().isEmpty) return '';
@@ -231,26 +253,115 @@ class ChatMessage {
     return '';
   }
 
-  String _collectText() {
+  /// 图片块（satori `img`/`image`、平台归一化后的 `file`）按出现顺序转成 `![](src)`；
+  /// `face`/`at`/`quote` 给可读占位。`src` 支持 `http(s)`、`data:`、`base64://` 与工作区相对路径。
+  String _collectMarkdown() {
     final buffer = StringBuffer();
+
+    void appendImage(String raw, {String? mediaType}) {
+      final src = _normalizeImageSrc(raw, mediaType: mediaType);
+      if (src.isEmpty) return;
+      buffer.write('\n![]($src)\n');
+    }
+
     void walk(List<ChatBlock> list) {
       for (final block in list) {
         if (block.type == 'text') {
-          buffer.write(block.text ?? '');
+          final text = block.text ?? _attrText(block.data);
+          if (text != null) buffer.write(text);
         } else if (block.type == 'envelope') {
           final nested = block.data['content'];
-          if (nested is List) {
-            walk([
-              for (final item in nested)
-                if (item is Map) ChatBlock((item['type'] as String?) ?? 'unknown', item.cast<String, Object?>()),
-            ]);
+          if (nested is String) {
+            buffer.write(nested);
+          } else if (nested is List) {
+            walk(_blocksOf(nested));
           }
+        } else if (block.type == 'img' ||
+            block.type == 'image' ||
+            block.type == 'mface' ||
+            block.type == 'sticker') {
+          final src = _stringAttr(block.data, 'src') ?? _stringAttr(block.data, 'url');
+          if (src != null) appendImage(src, mediaType: _stringAttr(block.data, 'type'));
+        } else if (block.type == 'file') {
+          final mediaType = block.data['mediaType'];
+          if (mediaType is! String || !mediaType.startsWith('image/')) continue;
+          final src = _fileImageSrc(block.data, mediaType);
+          if (src != null) appendImage(src, mediaType: mediaType);
+        } else if (block.type == 'face' || block.type == 'emoji') {
+          buffer.write('[表情]');
+        } else if (block.type == 'at') {
+          final name = _stringAttr(block.data, 'name') ?? _stringAttr(block.data, 'id');
+          if (name != null) buffer.write('@$name ');
+        } else if (block.type == 'quote') {
+          buffer.write('[引用]');
         }
       }
     }
 
     walk(blocks);
     return buffer.toString();
+  }
+
+  static List<ChatBlock> _blocksOf(List<dynamic> raw) => [
+    for (final item in raw)
+      if (item is Map) ChatBlock((item['type'] as String?) ?? 'unknown', item.cast<String, Object?>()),
+  ];
+
+  /// 文本块的标准字段是 `text`；satori 元素的文本在 `attrs.content`。
+  static String? _attrText(Map<String, Object?> data) {
+    final attrs = data['attrs'];
+    if (attrs is Map) {
+      final content = attrs['content'];
+      if (content is String) return content;
+    }
+    final content = data['content'];
+    return content is String ? content : null;
+  }
+
+  /// 先看 satori 的 `attrs`，再看块自身的同名字段。
+  static String? _stringAttr(Map<String, Object?> data, String key) {
+    final attrs = data['attrs'];
+    if (attrs is Map) {
+      final value = attrs[key];
+      if (value is String && value.isNotEmpty) return value;
+    }
+    final value = data[key];
+    return value is String && value.isNotEmpty ? value : null;
+  }
+
+  /// 平台图片在日志里是 `file` 块：`{mediaType, data:{type:'url'|'data'|'reference'}}`。
+  static String? _fileImageSrc(Map<String, Object?> data, String mediaType) {
+    final file = data['data'];
+    if (file is! Map) return _stringAttr(data, 'url');
+    final kind = file['type'];
+    if (kind == 'url') {
+      final url = file['url'];
+      return url is String && url.isNotEmpty ? url : null;
+    }
+    if (kind == 'data') {
+      final payload = file['data'];
+      if (payload is! String || payload.isEmpty) return null;
+      return payload.startsWith('data:') ? payload : 'data:$mediaType;base64,$payload';
+    }
+    if (kind == 'reference') {
+      final reference = file['reference'];
+      if (reference is! String || reference.isEmpty) return null;
+      final name = reference.startsWith('storage://')
+          ? reference.substring('storage://'.length)
+          : reference;
+      return '/files/${Uri.encodeComponent(name)}';
+    }
+    return null;
+  }
+
+  /// `base64://<payload>` 没有 mime，用元素声明的类型兜底为 `data:` URI。
+  static String _normalizeImageSrc(String raw, {String? mediaType}) {
+    final src = raw.trim();
+    final marker = RegExp(r'^base64:(?://)?').firstMatch(src);
+    if (marker == null) return src;
+    final payload = src.substring(marker.end);
+    final mime = mediaType != null && mediaType.startsWith('image/') ? mediaType : 'image/png';
+    return 'data:$mime;base64,$payload';
   }
 }
 

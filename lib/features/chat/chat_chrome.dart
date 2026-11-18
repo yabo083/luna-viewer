@@ -129,6 +129,8 @@ class ChatInfoBar extends StatelessWidget {
     this.botName,
     this.avatarUrl,
     this.debugMetrics = const [],
+    this.showDeveloperInfo = false,
+    this.onModelTap,
   });
 
   final SessionSummary session;
@@ -137,6 +139,10 @@ class ChatInfoBar extends StatelessWidget {
   final String? botName;
   final String? avatarUrl;
   final List<String> debugMetrics;
+
+  /// 开发者信息（平台 / 引擎 / 轮询状态 / 计时）默认隐藏，由设置里的开关打开。
+  final bool showDeveloperInfo;
+  final VoidCallback? onModelTap;
 
   @override
   Widget build(BuildContext context) {
@@ -153,30 +159,40 @@ class ChatInfoBar extends StatelessWidget {
               label: name,
               leading: AssistantAvatar(size: 16, imageUrl: avatarUrl),
             ),
-          if (session.origin.isNotEmpty) _InfoPill(label: session.origin),
-          if (session.engine.isNotEmpty) _InfoPill(label: session.engine),
+          if (showDeveloperInfo) ...[
+            if (session.origin.isNotEmpty) _InfoPill(label: session.origin),
+            if (session.engine.isNotEmpty) _InfoPill(label: session.engine),
+          ],
           if (model != null)
             _InfoPill(
-              label: _shortModel(model),
-              onTap: () => showSessionDetails(context, session),
+              label: shortModelLabel(model),
+              onTap: onModelTap ?? () => showSessionDetails(context, session),
+            )
+          else if (onModelTap != null)
+            _InfoPill(
+              label: '模型',
+              icon: Icons.memory_outlined,
+              onTap: onModelTap,
             ),
           if (running) const _RunningPill(),
-          if (!liveOk)
-            const _InfoPill(
-              label: '轮询中',
-              icon: Icons.cloud_off_outlined,
-              tone: _PillTone.warning,
-            ),
-          for (final metric in debugMetrics)
-            _InfoPill(label: metric, tone: _PillTone.muted),
+          if (showDeveloperInfo) ...[
+            if (!liveOk)
+              const _InfoPill(
+                label: '轮询中',
+                icon: Icons.cloud_off_outlined,
+                tone: _PillTone.warning,
+              ),
+            for (final metric in debugMetrics)
+              _InfoPill(label: metric, tone: _PillTone.muted),
+          ],
         ],
       ),
     );
   }
 }
 
-/// 模型只显示最后一段（`provider/model`、`provider:model` 都取尾段），点开看全名。
-String _shortModel(ModelRef ref) {
+/// 模型只显示最后一段（`provider/model`、`provider:model` 都取尾段）。
+String shortModelLabel(ModelRef ref) {
   final name = ref.model.trim();
   var cut = name.lastIndexOf('/');
   final colon = name.lastIndexOf(':');

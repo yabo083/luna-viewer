@@ -119,6 +119,54 @@ void main() {
       expect(message.toolCalls.single.prettyInput, contains('ls'));
     });
 
+    test('envelope 里的图片块转成 markdown，并保留先后顺序', () {
+      final message = ChatMessage.fromJson({
+        'role': 'user',
+        'content': [
+          {
+            'type': 'envelope',
+            'content': [
+              {'type': 'text', 'text': '看这张'},
+              {
+                'type': 'img',
+                'attrs': {'src': 'base64://iVBORw0KGgo='},
+              },
+            ],
+          },
+        ],
+      });
+      expect(message.bodyMarkdown, contains('看这张'));
+      expect(message.bodyMarkdown, contains('![](data:image/png;base64,iVBORw0KGgo=)'));
+      expect(message.hasMarkup, isTrue, reason: '纯图消息也必须走 markdown 分支');
+    });
+
+    test('file 块里的图片引用转成 /files 路径', () {
+      final message = ChatMessage.fromJson({
+        'role': 'user',
+        'content': [
+          {
+            'type': 'file',
+            'mediaType': 'image/png',
+            'data': {'type': 'reference', 'reference': 'abc123'},
+          },
+        ],
+      });
+      expect(message.bodyMarkdown, contains('/files/abc123'));
+    });
+
+    test('表情与 @ 有可读占位', () {
+      final message = ChatMessage.fromJson({
+        'role': 'user',
+        'content': [
+          {'type': 'face', 'attrs': {'name': '微笑'}},
+          {'type': 'at', 'attrs': {'name': '安吉拉'}},
+          {'type': 'text', 'text': '好'},
+        ],
+      });
+      expect(message.bodyMarkdown, contains('[表情]'));
+      expect(message.bodyMarkdown, contains('@安吉拉'));
+    });
+
     test('reasoning 与工具调用分别统计', () {
       final message = ChatMessage.fromJson({
         'role': 'assistant',
