@@ -74,6 +74,10 @@ class _ChatPageState extends State<ChatPage> {
   int _windowStart = 0;
   static const _initialWindow = 12;
 
+  /// 框架消息折叠状态：消息 id → 是否展开（缺省折叠）。
+  /// 放页面级：`ListView.builder` 滚出视口就销毁元素，状态放 widget 里会丢。
+  final Map<String, bool> _noticeOpen = {};
+
   /// 流式正文：SSE `text` delta 只进 buffer（reasoning/tool 不进），最多每 90ms 刷进 notifier；
   /// 列表里的流式气泡单独监听，不随每个 delta 重建整页。buffer 为空即「还没有正文」。
   final StringBuffer _streaming = StringBuffer();
@@ -108,6 +112,15 @@ class _ChatPageState extends State<ChatPage> {
   int? _paintMs;
   int? _liveMs;
 
+  /// 首屏自适应扩窗：一屏都没坐满时反向列表没有可滚动距离，手势翻不出历史。
+  /// 首次布局后自动往前补页，最多连扩 [_autoFillSteps] 次（长会话不在首帧一次拉满）。
+  static const _autoFillSteps = 6;
+
+  /// 列表至少要有这么多可滚动距离才算「能滚」，否则算没坐满一屏。
+  static const _minScrollExtent = 120.0;
+  bool _autoFillDone = false;
+  int _autoFillCount = 0;
+
   @override
   void initState() {
     super.initState();
@@ -124,6 +137,7 @@ class _ChatPageState extends State<ChatPage> {
       _loading = false;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) setState(() => _paintMs = _since());
+        _autoFillViewport();
       });
     } else {
       _load();
@@ -161,6 +175,8 @@ class _ChatPageState extends State<ChatPage> {
         _all = transcript.messages;
         if (!keepWindow) {
           _windowStart = _all.length > _initialWindow ? _all.length - _initialWindow : 0;
+          _autoFillDone = false;
+          _autoFillCount = 0;
         } else {
           // 重取后历史可能变短（cut / truncated），窗口光标不能越过末尾。
           _windowStart = math.min(_windowStart, math.max(0, _all.length - 1));
@@ -170,6 +186,7 @@ class _ChatPageState extends State<ChatPage> {
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) setState(() => _paintMs = _since());
+        _autoFillViewport();
       });
     } on ApiFailure catch (e) {
       if (!mounted) return;
@@ -184,6 +201,27 @@ class _ChatPageState extends State<ChatPage> {
         _error = '加载失败：$e';
       });
     }
+  }
+
+  /// 首屏没坐满一屏时（反向列表 `maxScrollExtent` 太小），手势无处可滚，历史翻不出来：
+  /// 布局后自动往前补一页，扩完在新一帧再检查，最多连扩 [_autoFillSteps] 次。
+  /// 能滚了（`maxScrollExtent >= _minScrollExtent`）、窗口已到顶、或用户已经手动滚动过就停。
+  /// 反向列表 offset 0 就是最新一条，往前补页不会把视野带走，无需额外回滚。
+  void _autoFillViewport() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _autoFillDone) return;
+      // 列表还没挂上（加载中、空会话）：等 `_load` 完成后会再来一次，不在这里空转。
+      if (!_scroll.hasClients) return;
+      if (_scroll.position.maxScrollExtent >= _minScrollExtent ||
+          _windowStart == 0 ||
+          _autoFillCount >= _autoFillSteps) {
+        _autoFillDone = true;
+        return;
+      }
+      _autoFillCount += 1;
+      setState(() => _windowStart = math.max(0, _windowStart - _initialWindow));
+      _autoFillViewport();
+    });
   }
 
   void _startLive() {
@@ -340,6 +378,65 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  /// 渲染列表：相邻且同标题的框架消息合并成一条虚拟消息（`id = 'a|b|c'`），
+  /// 其余消息原样一行一条。合并只发生在渲染层，`_all` 本身不动；
+  /// `/events` 追加后由下一次 build 重算，最后一条同标题的新消息自然并进同一块。
+  List<_RenderRow> _renderRows() {
+    final rows = <_RenderRow>[];
+    var i = 0;
+    while (i < _all.length) {
+      final message = _all[i];
+      final key = _mergeKey(message);
+      final end = key == null ? i + 1 : _mergeEnd(i, key);
+      if (end == i + 1) {
+        rows.add(_RenderRow(message, srcEnd: end));
+      } else {
+        rows.add(
+          _RenderRow(_mergeNotice(_all.sublist(i, end)), noticeCount: end - i, srcEnd: end),
+        );
+      }
+      i = end;
+    }
+    return rows;
+  }
+
+  /// 合并键：框架消息且正文非空时，返回归一化后的标题；不同类型的框架消息键不同。
+  /// 正文为空的框架消息只剩一个标题头，没有可合并的正文，按独立行处理。
+  static String? _mergeKey(ChatMessage message) {
+    if (!message.isFramework) return null;
+    final body = message.bodyMarkdown;
+    if (body.trim().isEmpty) return null;
+    return Notice.key(Notice.parse(body).title);
+  }
+
+  /// 从 [start] 起连续同键框架消息的结束下标（不含）。
+  int _mergeEnd(int start, String key) {
+    var end = start + 1;
+    while (end < _all.length && _mergeKey(_all[end]) == key) {
+      end += 1;
+    }
+    return end;
+  }
+
+  /// 合并块：`id` 用 `first|second|…` 当折叠状态的键，正文用单个空行拼接；
+  /// 第一条保留原文（结构头交给 `Notice.parse` 渲染成标题），其余去掉各自的结构标题行，
+  /// 避免展开后同一行 `[memory update]` 反复出现。
+  ChatMessage _mergeNotice(List<ChatMessage> group) {
+    final parts = <String>[
+      group.first.bodyMarkdown.trim(),
+      for (final message in group.skip(1))
+        Notice.parse(message.bodyMarkdown).lines.join('\n').trim(),
+    ];
+    final text = parts.where((part) => part.isNotEmpty).join('\n\n');
+    return ChatMessage(
+      id: [for (final message in group) message.id].join('|'),
+      role: 'assistant',
+      blocks: [ChatBlock('text', {'text': text})],
+      form: 'notice',
+      isFramework: true,
+    );
+  }
+
   void _scheduleStreamFlush() {
     _flushTimer ??= Timer(_streamFlushInterval, () {
       _flushTimer = null;
@@ -369,6 +466,8 @@ class _ChatPageState extends State<ChatPage> {
   void _onScroll() {
     if (!_scroll.hasClients) return;
     final position = _scroll.position;
+    // 位置一旦离开 0，说明用户（或尾部跟随）已经把列表滚开：首屏自动补页就此停手。
+    if (position.pixels != 0) _autoFillDone = true;
     final away = position.pixels > 400;
     if (away != _awayFromBottom) setState(() => _awayFromBottom = away);
     if (_windowStart == 0) return;
@@ -500,7 +599,11 @@ class _ChatPageState extends State<ChatPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final visible = _all.length - _windowStart;
+    // 渲染行：相邻同标题的框架消息已合并成块。`_windowStart` 仍是 `_all` 里的下标，
+    // 换算到块：窗口起点落在某个块内部就整块显示（该块最早已可见）。
+    final rows = _renderRows();
+    final firstVisible = rows.indexWhere((row) => row.srcEnd > _windowStart);
+    final visible = firstVisible < 0 ? 0 : rows.length - firstVisible;
     final generating = _live.generating;
     // 状态胶囊只在 thinking/replying/failed 时占位：待机会话的列表里绝不出现动画行。
     final slot = _live.hasCapsule ? 1 : 0;
@@ -592,7 +695,7 @@ class _ChatPageState extends State<ChatPage> {
                       24 + MediaQuery.paddingOf(context).bottom,
                     ),
                     cacheExtent: 200,
-                    itemCount: visible + slot + (_windowStart > 0 ? 1 : 0),
+                    itemCount: visible + slot + (firstVisible > 0 ? 1 : 0),
                     itemBuilder: (context, index) {
                       var cursor = index;
                       if (slot == 1) {
@@ -600,11 +703,13 @@ class _ChatPageState extends State<ChatPage> {
                         cursor -= 1;
                       }
                       if (cursor < visible) {
-                        final message = _all[_all.length - 1 - cursor];
+                        final row = rows[rows.length - 1 - cursor];
                         return MessageView(
-                          message: message,
+                          message: row.message,
+                          noticeCount: row.noticeCount,
                           base: widget.base,
                           headers: widget.headers,
+                          noticeOpen: _noticeOpen,
                           avatarUrl: widget.avatarUrl,
                         );
                       }
@@ -617,6 +722,20 @@ class _ChatPageState extends State<ChatPage> {
       ),
     );
   }
+}
+
+/// 渲染行：一行对应列表里的一个 `MessageView`。框架块可能是多条相邻同标题消息合并成的
+/// 一条虚拟消息（`noticeCount` 是条数），[srcEnd] 是它在 `_all` 里的结束下标，窗口换算用。
+class _RenderRow {
+  const _RenderRow(this.message, {required this.srcEnd, this.noticeCount = 1});
+
+  final ChatMessage message;
+
+  /// 合并进这一块的框架消息条数；1 表示没有合并。
+  final int noticeCount;
+
+  /// 这一行最后一条消息在 `_all` 里的下标 + 1。
+  final int srcEnd;
 }
 
 /// 实时状态胶囊：待机不出现；「思考中」挂三点呼吸，「回复中」「轮询中」保持静态。

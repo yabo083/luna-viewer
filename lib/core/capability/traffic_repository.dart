@@ -61,6 +61,10 @@ class TrafficEntry {
     return '$base · $tail';
   }
 
+  /// 会话分组键：同一个平台、同一个频道才算同一个会话。
+  /// `channelId` 在不同平台之间会撞车（数值 id 居多），所以平台必须进键里。
+  String get conversationKey => '$platform\u0000$channelId';
+
   /// 复制用的整条文本：身份全带上，便于拿去排查路由/频道。
   String get copyText {
     return '${time.year}-${_two(time.month)}-${_two(time.day)} '

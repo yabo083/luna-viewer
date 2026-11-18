@@ -16,6 +16,8 @@ class MessageView extends StatelessWidget {
     required this.message,
     required this.base,
     required this.headers,
+    required this.noticeOpen,
+    this.noticeCount = 1,
     this.avatarUrl,
   });
 
@@ -24,6 +26,13 @@ class MessageView extends StatelessWidget {
 
   /// 工作区图片需要 Bearer 才能取，`Image.network` 直连时复用同一份头。
   final Map<String, String> headers;
+
+  /// 页面级框架消息折叠状态：消息 id → 是否展开。
+  /// 放在页面里，列表滚动重建（`ListView.builder` 销毁离屏元素）后仍然保留。
+  final Map<String, bool> noticeOpen;
+
+  /// 这一条虚拟消息里合并了几条框架消息（相邻同标题的合并块）；>1 时标题后缀显示 `· N 条`。
+  final int noticeCount;
   final String? avatarUrl;
 
   @override
@@ -37,7 +46,14 @@ class MessageView extends StatelessWidget {
 
     // 框架消息不参与左右布局：先短路，省掉整棵 markdown 构建。
     if (message.isFramework) {
-      return _FrameworkNotice(text: body);
+      // 极端情况下服务端没给 id：用正文摘要当键，至少同一条消息的展开状态是稳定的。
+      final foldKey = message.id.isNotEmpty ? message.id : 'framework-${body.hashCode}';
+      return _FrameworkNotice(
+        foldKey: foldKey,
+        text: body,
+        open: noticeOpen,
+        count: noticeCount,
+      );
     }
 
     final content = Column(
@@ -413,195 +429,232 @@ class _ChatImageState extends State<_ChatImage> {
 }
 
 /// 框架/系统消息（`form != message` 或 `source.kind == plugin`）：不属于对话左右任一方。
-/// 标题是居中胶囊（`[xxx]` 或首行 + 行数/字符数），正文在下方卡片里左对齐：
-/// 按空行分段、裸 JSON/URL 等宽、超过 12 行折叠。旧的 `form: notice` 也走这一条路径。
+/// 整块是**一张卡片**：卡片内顶部一行头（图标 + 标题 + `· N 条 · N 行` + 右侧箭头）始终可见、
+/// 整行可点；正文在同一张卡片里左对齐，按空行分段、裸 JSON/URL 等宽、默认折叠成 2 行预览。
+/// 相邻同标题的多条框架消息由页面层合并成一条虚拟消息，此时 [count] > 1、后缀多一段 `· N 条`。
+/// 展开状态按消息 id 存在页面级 map 里，列表滚动重建也不会丢。旧的 `form: notice` 也走这一条路径。
 class _FrameworkNotice extends StatefulWidget {
-  const _FrameworkNotice({required this.text});
+  const _FrameworkNotice({
+    required this.foldKey,
+    required this.text,
+    required this.open,
+    this.count = 1,
+  });
 
+  /// 折叠状态的键：消息 id（合并块是 `${first.id}|${second.id}|…`）。
+  final String foldKey;
   final String text;
+
+  /// 合并进这一块的框架消息条数；>1 时标题后缀多一段 `· N 条`。
+  final int count;
+
+  /// 页面级 `Map<String, bool>`：折叠键 → 是否展开；缺省即折叠。
+  final Map<String, bool> open;
 
   @override
   State<_FrameworkNotice> createState() => _FrameworkNoticeState();
 }
 
 class _FrameworkNoticeState extends State<_FrameworkNotice> {
-  static const _previewLines = 12;
+  /// 折叠态只露 2 行预览；展开态最多排 200 行，更长的正文只提示剩余行数。
+  static const _previewLines = 2;
+  static const _maxOpenLines = 200;
 
-  bool _open = false;
+  bool get _open => widget.open[widget.foldKey] ?? false;
+
+  void _toggle() => setState(() => widget.open[widget.foldKey] = !_open);
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final notice = _Notice.parse(widget.text);
-    final foldable = notice.lines.length > _previewLines;
-    final shown = foldable && !_open
-        ? notice.lines.sublist(0, _previewLines)
+    final notice = Notice.parse(widget.text);
+    final open = _open;
+    final openLines = notice.lines.length > _maxOpenLines
+        ? notice.lines.sublist(0, _maxOpenLines)
         : notice.lines;
-    final hidden = notice.lines.length - shown.length;
-    final paragraphs = _Notice.paragraphs(shown);
+    final hidden = notice.lines.length - openLines.length;
+    final paragraphs = Notice.paragraphs(openLines);
     final titleStyle = theme.textTheme.labelSmall?.copyWith(
       color: scheme.onSurfaceVariant,
       height: 1.35,
     );
+    final metaStyle = titleStyle?.copyWith(
+      fontSize: 10,
+      color: scheme.onSurfaceVariant.withValues(alpha: 0.65),
+    );
+    // 后缀：合并块先报条数（`· 2 条`），再报正文行数（`· 6 行`）。
+    final meta = [
+      if (widget.count > 1) '· ${widget.count} 条',
+      notice.meta,
+    ].where((part) => part.isNotEmpty).join(' ');
+    final preview = Notice.preview(notice.lines, _previewLines);
+    final bodyStyle = _bodyStyle(theme);
     return Align(
       alignment: Alignment.center,
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.86),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // 只有标题行居中；正文卡片保持左对齐的阅读起点。
-            Center(
-              child: InkWell(
-                borderRadius: BorderRadius.circular(20),
-                onTap: foldable ? () => setState(() => _open = !_open) : null,
-                child: Container(
-                  margin: const EdgeInsets.symmetric(vertical: 4),
-                  padding: const EdgeInsets.fromLTRB(10, 5, 8, 5),
-                  decoration: BoxDecoration(
-                    color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.subdirectory_arrow_right,
-                        size: 14,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: Text(
-                          notice.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: titleStyle,
-                        ),
-                      ),
-                      if (notice.meta.isNotEmpty) ...[
-                        const SizedBox(width: 5),
-                        Text(
-                          notice.meta,
-                          style: titleStyle?.copyWith(
-                            fontSize: 10,
-                            color: scheme.onSurfaceVariant.withValues(alpha: 0.65),
-                          ),
-                        ),
-                      ],
-                      if (foldable) ...[
-                        const SizedBox(width: 2),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          // 整块只有这一层卡片容器：头与正文共用同一张卡，不再有「居中胶囊 + 正文卡片」两层。
+          child: Material(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+            borderRadius: BorderRadius.circular(12),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // 卡片内的左对齐头：整行可点切换展开；只有这一行自带内边距。
+                InkWell(
+                  onTap: _toggle,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
+                    child: Row(
+                      children: [
                         Icon(
-                          _open ? Icons.expand_less : Icons.expand_more,
+                          Icons.subdirectory_arrow_right,
                           size: 14,
                           color: scheme.onSurfaceVariant,
                         ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            notice.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: titleStyle,
+                          ),
+                        ),
+                        if (meta.isNotEmpty) ...[
+                          const SizedBox(width: 6),
+                          Text(meta, style: metaStyle),
+                        ],
+                        const SizedBox(width: 4),
+                        Icon(
+                          open ? Icons.expand_less : Icons.expand_more,
+                          size: 16,
+                          color: scheme.onSurfaceVariant,
+                        ),
                       ],
-                    ],
+                    ),
                   ),
                 ),
-              ),
-            ),
-            if (paragraphs.isNotEmpty)
-              Container(
-                margin: const EdgeInsets.only(top: 2, bottom: 4),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    for (var i = 0; i < paragraphs.length; i++)
-                      Padding(
-                        // 段间距 8；最后一段把间距让给折叠按钮。
-                        padding: EdgeInsets.only(
-                          bottom: i < paragraphs.length - 1 || foldable ? 8 : 0,
-                        ),
-                        child: _paragraph(paragraphs[i], theme, scheme),
-                      ),
-                    if (foldable)
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: TextButton(
-                          onPressed: () => setState(() => _open = !_open),
-                          style: TextButton.styleFrom(
-                            padding: EdgeInsets.zero,
-                            minimumSize: const Size(0, 26),
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            visualDensity: VisualDensity.compact,
-                            textStyle: theme.textTheme.labelSmall,
+                if (paragraphs.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                    child: open
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              for (var i = 0; i < paragraphs.length; i++)
+                                Padding(
+                                  // 段间距 8；末尾还有「未展开」提示时最后一段也让出间距。
+                                  padding: EdgeInsets.only(
+                                    bottom: i < paragraphs.length - 1 || hidden > 0 ? 8 : 0,
+                                  ),
+                                  child: _paragraph(paragraphs[i], theme),
+                                ),
+                              if (hidden > 0)
+                                Text(
+                                  '… 仅显示前 $_maxOpenLines 行，还有 $hidden 行未展开',
+                                  style: titleStyle,
+                                ),
+                            ],
+                          )
+                        // 折叠态：2 行预览，灰一档；超过 2 行由 `Notice.preview` 补 `…`。
+                        : Text(
+                            preview,
+                            maxLines: _previewLines,
+                            overflow: TextOverflow.ellipsis,
+                            style: bodyStyle.copyWith(
+                              color: scheme.onSurfaceVariant.withValues(alpha: 0.72),
+                            ),
                           ),
-                          child: Text(_open ? '收起' : '展开全部（还有 $hidden 行）'),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-          ],
+                  ),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 
+  TextStyle _bodyStyle(ThemeData theme) =>
+      theme.textTheme.bodySmall?.copyWith(
+        color: theme.colorScheme.onSurfaceVariant,
+        height: 1.5,
+      ) ??
+      TextStyle(fontSize: 12, height: 1.5, color: theme.colorScheme.onSurfaceVariant);
+
+  TextStyle _monoStyle(ThemeData theme) =>
+      theme.textTheme.labelSmall?.copyWith(
+        fontFamily: 'monospace',
+        fontSize: 11,
+        height: 1.45,
+        color: theme.colorScheme.onSurfaceVariant,
+      ) ??
+      const TextStyle(fontFamily: 'monospace', fontSize: 11, height: 1.45);
+
   /// 一段正文：整段 JSON 解析后按缩进等宽排，整段裸链接也等宽，其余走小号正文。
-  Widget _paragraph(String text, ThemeData theme, ColorScheme scheme) {
-    final body = theme.textTheme.bodySmall?.copyWith(
-      color: scheme.onSurfaceVariant,
-      height: 1.5,
-    );
-    final mono = theme.textTheme.labelSmall?.copyWith(
-      fontFamily: 'monospace',
-      fontSize: 11,
-      height: 1.45,
-      color: scheme.onSurfaceVariant,
-    );
-    final json = _Notice.prettyJson(text);
-    if (json != null) return SelectableText(json, style: mono);
-    if (_Notice.isUrlList(text)) return SelectableText(text, style: mono);
-    return SelectableText(text, style: body);
+  /// 段内换行原样保留：`[memory update]` 的 `- [ch-03 …]` 列表行各占一行。
+  Widget _paragraph(String text, ThemeData theme) {
+    final json = Notice.prettyJson(text);
+    if (json != null) return SelectableText(json, style: _monoStyle(theme));
+    if (Notice.isUrlList(text)) return SelectableText(text, style: _monoStyle(theme));
+    return SelectableText(text, style: _bodyStyle(theme));
   }
 }
 
 /// 框架消息的文本解析：抽出结构标题，丢掉首行的 `---` 与尾部空行，剩余行按空行分段。
-class _Notice {
-  const _Notice(this.title, this.lines);
+/// 公开给页面层：`ChatPage` 用 [parse]/[key] 判断相邻框架消息是否同一类型、能否合并成一块。
+class Notice {
+  const Notice(this.title, this.lines);
 
+  /// 标题：首行是 `[xxx]` 就整行拿来当标题；否则取首行前 24 字做预览标题。
   final String title;
 
   /// 正文行：`[xxx]` 标题行不进正文；`---` 分隔线只做视觉标记。
+  /// 没有结构头的首行只当标题预览，展开时正文仍保留它。
   final List<String> lines;
+
+  /// 无结构头时标题取的字符数。
+  static const _titleChars = 24;
 
   static final _bracketTitle = RegExp(r'^\[[^\]]+\]$');
   static final _rule = RegExp(r'^(-{3,}|\*{3,}|_{3,})$');
   static final _url = RegExp(r'^https?://\S+$');
+  static final _space = RegExp(r'\s+');
 
-  static _Notice parse(String raw) {
+  /// 合并分组键：标题忽略大小写与空白差异，`[Memory Update]` 与 `[memory update]` 同组。
+  /// 页面层用它判断相邻两条框架消息是不是同一类型。
+  static String key(String title) => title.toLowerCase().replaceAll(_space, '');
+
+  /// 结构化解析：首行 `[xxx]` 整行当标题，否则取首行前 24 字；其余行是正文。
+  static Notice parse(String raw) {
     final source = raw.split('\n');
     var start = 0;
-    var ruled = false;
     while (start < source.length) {
       final line = source[start].trim();
-      if (line.isEmpty) {
+      // 前导空行与 `---` 之类的分隔线都不算正文，也不当标题。
+      if (line.isEmpty || _rule.hasMatch(line)) {
         start += 1;
         continue;
       }
-      if (!_rule.hasMatch(line)) break;
-      ruled = true;
-      start += 1;
+      break;
     }
-    if (start >= source.length) return const _Notice('系统消息', []);
+    if (start >= source.length) return const Notice('系统消息', []);
     final first = source[start].trim();
-    final rest = source.sublist(start);
-    // `[memory recall]` 这类首行、以及 `---` 分隔线之后的首行都是结构头：
-    // 抽成标题并从正文去掉；普通首行只当标题预览，展开时正文仍保留全文。
-    if (ruled || _bracketTitle.hasMatch(first)) {
-      return _Notice(first, _trimTrailing(rest.sublist(1)));
+    final rest = _trimTrailing(source.sublist(start));
+    // `[memory update]` 这类首行是结构头：抽成标题并从正文去掉（长标题交给胶囊自身省略）。
+    if (_bracketTitle.hasMatch(first)) {
+      return Notice(first, _trimTrailing(rest.sublist(1)));
     }
-    return _Notice(first, _trimTrailing(rest));
+    return Notice(_clip(first), rest);
   }
+
+  static String _clip(String text) =>
+      text.length <= _titleChars ? text : '${text.substring(0, _titleChars)}…';
 
   static List<String> _trimTrailing(List<String> lines) {
     var end = lines.length;
@@ -611,12 +664,24 @@ class _Notice {
     return lines.sublist(0, end);
   }
 
-  /// 标题后缀：多行给行数，单行给字符数。
+  /// 标题后缀：显示正文的有效行数（空行只做分段，不计入；合并块因此是各条之和）。
   String get meta {
-    if (lines.isEmpty) return '';
-    if (lines.length > 1) return '· ${lines.length} 行';
-    final length = lines.first.trim().length;
-    return length == 0 ? '' : '· $length 字';
+    final count = lines.where((line) => line.trim().isNotEmpty).length;
+    return count == 0 ? '' : '· $count 行';
+  }
+
+  /// 折叠态预览：前 [limit] 个非空行；还有更多非空行就补 `…`。
+  static String preview(List<String> lines, int limit) {
+    final buffer = StringBuffer();
+    var used = 0;
+    for (final line in lines) {
+      if (line.trim().isEmpty) continue;
+      if (used == limit) return '$buffer…';
+      if (used > 0) buffer.write('\n');
+      buffer.write(line.trimRight());
+      used += 1;
+    }
+    return buffer.toString();
   }
 
   /// 空行分段，段内保留换行；段间 8px 由调用方补。

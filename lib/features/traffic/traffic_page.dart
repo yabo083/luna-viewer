@@ -32,6 +32,10 @@ class _TrafficPageState extends State<TrafficPage> {
   bool _loading = true;
   String? _error;
 
+  /// 分组展开状态：键是 `平台 + 频道`。刷新时保留用户手动收起/展开的选择。
+  final Map<String, bool> _expanded = {};
+  List<_TrafficGroup> _groups = const [];
+
   @override
   void initState() {
     super.initState();
@@ -61,6 +65,7 @@ class _TrafficPageState extends State<TrafficPage> {
           ..addAll(items);
         _platforms.addAll(items.map((item) => item.platform).where((p) => p.isNotEmpty));
         if (_platform != null) _platforms.add(_platform!);
+        _syncGroups(_items);
       });
     } on ApiFailure catch (e) {
       if (!mounted || request != _request) return;
@@ -120,6 +125,38 @@ class _TrafficPageState extends State<TrafficPage> {
     _toast('已复制整条消息');
   }
 
+  void _toggleGroup(String key, bool expanded) {
+    // 显式写回反值，这样手动收起的第一组不会再被默认展开覆盖。
+    setState(() => _expanded[key] = !expanded);
+  }
+
+  /// 按「平台 + 频道」重建分组。
+  /// 「默认展开第一组」由渲染时决定（`_expanded[key] ?? index == 0`），
+  /// 这里只清掉已经消失的分组的显式状态，保留用户手动收起/展开的选择。
+  void _syncGroups(List<TrafficEntry> items) {
+    final buckets = <String, List<TrafficEntry>>{};
+    for (final entry in items) {
+      buckets.putIfAbsent(entry.conversationKey, () => []).add(entry);
+    }
+    final groups = <_TrafficGroup>[];
+    for (final bucket in buckets.entries) {
+      final entries = bucket.value..sort((a, b) => b.time.compareTo(a.time));
+      groups.add(
+        _TrafficGroup(
+          key: bucket.key,
+          platform: entries.first.platform,
+          label: entries.first.channelLabel,
+          entries: entries,
+        ),
+      );
+    }
+    // 最近活跃的会话排在最前，第一组就是默认展开的那组。
+    groups.sort((a, b) => b.lastTime.compareTo(a.lastTime));
+    final keys = {for (final group in groups) group.key};
+    _expanded.removeWhere((key, _) => !keys.contains(key));
+    _groups = groups;
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -134,7 +171,7 @@ class _TrafficPageState extends State<TrafficPage> {
         children: [
           _filters(theme),
           Expanded(
-            child: RefreshIndicator(onRefresh: _load, child: _body(theme)),
+            child: RefreshIndicator(onRefresh: _load, child: _body()),
           ),
         ],
       ),
@@ -210,9 +247,9 @@ class _TrafficPageState extends State<TrafficPage> {
     );
   }
 
-  Widget _body(ThemeData theme) {
-    if (_loading && _items.isEmpty) return const Center(child: CircularProgressIndicator());
-    if (_items.isEmpty) {
+  Widget _body() {
+    if (_loading && _groups.isEmpty) return const Center(child: CircularProgressIndicator());
+    if (_groups.isEmpty) {
       final failed = _error != null;
       final filtered = _platform != null || _appliedChannel != null;
       return _StatusView(
@@ -233,23 +270,163 @@ class _TrafficPageState extends State<TrafficPage> {
     }
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
-      padding: const EdgeInsets.only(bottom: 24),
-      children: _rows(),
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 24),
+      children: [
+        for (var i = 0; i < _groups.length; i++) ..._groupSection(_groups[i], i),
+      ],
     );
   }
 
-  List<Widget> _rows() {
+  List<Widget> _groupSection(_TrafficGroup group, int index) {
+    // 排序后的第一组（最近活跃）默认展开；显式状态优先，手动收起后能记住。
+    final expanded = _expanded[group.key] ?? index == 0;
+    return [
+      _GroupHeader(
+        label: group.label,
+        platform: group.platform,
+        count: group.entries.length,
+        time: _stamp(group.lastTime),
+        expanded: expanded,
+        onTap: () => _toggleGroup(group.key, expanded),
+      ),
+      if (expanded) ..._groupRows(group),
+    ];
+  }
+
+  /// 组内保持时间倒序；跨天时插一条弱日期分隔，避免只靠 `时:分:秒` 分不清哪天。
+  List<Widget> _groupRows(_TrafficGroup group) {
     final rows = <Widget>[];
     String? day;
-    for (final entry in _items) {
+    for (final entry in group.entries) {
       final label = _dayLabel(entry.time);
       if (label != day) {
         day = label;
         rows.add(_DayHeader(label: label));
       }
-      rows.add(_TrafficTile(entry: entry, onTap: () => _copy(entry)));
+      rows.add(_TrafficTile(entry: entry, onTap: () => _copy(entry), showMeta: false));
     }
     return rows;
+  }
+}
+
+/// 一个「平台 + 频道」会话分组，组内消息按时间倒序。
+class _TrafficGroup {
+  const _TrafficGroup({
+    required this.key,
+    required this.platform,
+    required this.label,
+    required this.entries,
+  });
+
+  final String key;
+  final String platform;
+  final String label;
+  final List<TrafficEntry> entries;
+
+  DateTime get lastTime => entries.first.time;
+}
+
+/// 分组头：`群聊/私聊 · 尾 6 位`、平台、条数胶囊、最后时间，点一下展开/收起。
+class _GroupHeader extends StatelessWidget {
+  const _GroupHeader({
+    required this.label,
+    required this.platform,
+    required this.count,
+    required this.time,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  final String label;
+  final String platform;
+  final int count;
+  final String time;
+  final bool expanded;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 4, 0, 2),
+      child: Material(
+        color: expanded
+            ? scheme.primaryContainer.withValues(alpha: 0.28)
+            : scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(12),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(10, 9, 12, 9),
+            child: Row(
+              children: [
+                AnimatedRotation(
+                  turns: expanded ? 0.25 : 0,
+                  duration: const Duration(milliseconds: 150),
+                  child: Icon(Icons.chevron_right, size: 18, color: scheme.onSurfaceVariant),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text.rich(
+                    TextSpan(
+                      children: [
+                        TextSpan(
+                          text: label,
+                          style: theme.textTheme.titleSmall?.copyWith(
+                            fontWeight: FontWeight.w600,
+                            color: scheme.onSurface,
+                          ),
+                        ),
+                        // 同尾号可能出现在不同平台，平台跟着组头走才不会认错会话。
+                        if (platform.isNotEmpty)
+                          TextSpan(
+                            text: '  $platform',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: scheme.onSurfaceVariant.withValues(alpha: 0.85),
+                            ),
+                          ),
+                      ],
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: expanded
+                        ? scheme.primary.withValues(alpha: 0.14)
+                        : scheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    '$count',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      height: 1.5,
+                      fontWeight: FontWeight.w600,
+                      color: expanded ? scheme.primary : scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  time,
+                  maxLines: 1,
+                  softWrap: false,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: scheme.onSurfaceVariant.withValues(alpha: 0.8),
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -266,6 +443,12 @@ String _dayLabel(DateTime time) {
   if (diff == 1) return '昨天';
   if (time.year == now.year) return '${_two(time.month)}-${_two(time.day)}';
   return '${time.year}-${_two(time.month)}-${_two(time.day)}';
+}
+
+/// 分组头的最后时间：今天只给 `时:分:秒`，更早的带上日期。
+String _stamp(DateTime time) {
+  final label = _dayLabel(time);
+  return label == '今天' ? _hms(time) : '$label ${_hms(time)}';
 }
 
 class _DayHeader extends StatelessWidget {
@@ -291,10 +474,13 @@ class _DayHeader extends StatelessWidget {
 }
 
 class _TrafficTile extends StatelessWidget {
-  const _TrafficTile({required this.entry, required this.onTap});
+  const _TrafficTile({required this.entry, required this.onTap, this.showMeta = true});
 
   final TrafficEntry entry;
   final VoidCallback onTap;
+
+  /// 分组内已有平台与频道，行内就不再重复这一行。
+  final bool showMeta;
 
   @override
   Widget build(BuildContext context) {
@@ -319,7 +505,7 @@ class _TrafficTile extends StatelessWidget {
                 maxLines: 1,
                 softWrap: false,
                 style: theme.textTheme.labelSmall?.copyWith(
-                  height: 1.6,
+                  height: showMeta ? 1.6 : 1.3,
                   color: scheme.onSurfaceVariant.withValues(alpha: 0.8),
                   fontFeatures: const [FontFeature.tabularFigures()],
                 ),
@@ -330,15 +516,16 @@ class _TrafficTile extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    meta.isEmpty ? '未知来源' : meta,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      height: 1.6,
-                      color: scheme.onSurfaceVariant,
+                  if (showMeta)
+                    Text(
+                      meta.isEmpty ? '未知来源' : meta,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        height: 1.6,
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
-                  ),
                   Text(
                     content.isEmpty ? '（空消息）' : content,
                     maxLines: 1,

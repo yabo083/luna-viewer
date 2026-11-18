@@ -38,6 +38,8 @@ class _SessionsPageState extends State<SessionsPage> {
   late final ApiClient _api = ApiClient(base: widget.connection.base, token: widget.connection.token);
   late final SessionsRepository _repo = SessionsRepository(_api);
   final List<SessionSummary> _items = [];
+  final TextEditingController _search = TextEditingController();
+  bool _searching = false;
   BotProfile? _bot;
   bool _loading = true;
   String? _error;
@@ -98,6 +100,7 @@ class _SessionsPageState extends State<SessionsPage> {
 
   @override
   void dispose() {
+    _search.dispose();
     _api.close();
     super.dispose();
   }
@@ -146,6 +149,35 @@ class _SessionsPageState extends State<SessionsPage> {
   void _toast(String text) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  void _toggleSearch() {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _searching = !_searching;
+      // 退出搜索就清空关键词，回到原来的分组视图。
+      if (!_searching) _search.clear();
+    });
+  }
+
+  void _clearSearch() {
+    _search.clear();
+    setState(() {});
+  }
+
+  /// 标题（紧凑名与原始名）、引擎、模型都要能搜到；不区分大小写。
+  bool _matches(SessionSummary session, String query) {
+    final needle = query.toLowerCase();
+    final title = parseSessionTitle(session.title);
+    final fields = <String>[
+      session.title,
+      title.label,
+      title.tail ?? '',
+      title.compact,
+      session.engine,
+      session.model?.toString() ?? '',
+    ];
+    return fields.any((field) => field.toLowerCase().contains(needle));
   }
 
   Future<void> _openSettings() async {
@@ -407,46 +439,111 @@ class _SessionsPageState extends State<SessionsPage> {
       appBar: AppBar(
         title: const Text('会话'),
         actions: [
+          IconButton(
+            onPressed: _toggleSearch,
+            icon: Icon(_searching ? Icons.close : Icons.search),
+            tooltip: _searching ? '退出搜索' : '搜索',
+          ),
           IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh), tooltip: '刷新'),
-          IconButton(onPressed: _openSettings, icon: const Icon(Icons.tune), tooltip: '设置'),
+          if (!_searching)
+            IconButton(onPressed: _openSettings, icon: const Icon(Icons.tune), tooltip: '设置'),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _refresh,
-        child: _loading && _items.isEmpty
-            ? const Center(child: CircularProgressIndicator())
-            : _error != null && _items.isEmpty
-            ? _StatusView(
-                icon: Icons.cloud_off_outlined,
-                title: '加载失败',
-                message: _error!,
-                tinted: true,
-                action: FilledButton.tonalIcon(
-                  onPressed: () => _refresh(),
-                  icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('重试'),
-                ),
-              )
-            : _items.isEmpty
-            ? _StatusView(
-                icon: Icons.forum_outlined,
-                title: '暂无活跃会话',
-                message: '去聊天软件发一条消息，再回来刷新',
-                action: OutlinedButton.icon(
-                  onPressed: () => _refresh(),
-                  icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('刷新'),
-                ),
-              )
-            : ListView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
-                children: [
-                  for (final row in _rows()) row,
-                  SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
-                ],
-              ),
+      body: Column(
+        children: [
+          if (_searching) _searchBar(),
+          Expanded(
+            child: RefreshIndicator(onRefresh: _refresh, child: _content()),
+          ),
+        ],
       ),
+    );
+  }
+
+  Widget _searchBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      child: SearchBar(
+        controller: _search,
+        autoFocus: true,
+        hintText: '搜索会话名、引擎或模型',
+        leading: const Icon(Icons.search),
+        trailing: [
+          if (_search.text.isNotEmpty)
+            IconButton(
+              onPressed: _clearSearch,
+              icon: const Icon(Icons.close),
+              tooltip: '清除',
+            ),
+        ],
+        elevation: const WidgetStatePropertyAll<double?>(0),
+        textInputAction: TextInputAction.search,
+        onChanged: (_) => setState(() {}),
+        onSubmitted: (_) => setState(() {}),
+      ),
+    );
+  }
+
+  Widget _content() {
+    if (_loading && _items.isEmpty) return const Center(child: CircularProgressIndicator());
+    if (_items.isEmpty) {
+      if (_error != null) {
+        return _StatusView(
+          icon: Icons.cloud_off_outlined,
+          title: '加载失败',
+          message: _error!,
+          tinted: true,
+          action: FilledButton.tonalIcon(
+            onPressed: () => _refresh(),
+            icon: const Icon(Icons.refresh, size: 18),
+            label: const Text('重试'),
+          ),
+        );
+      }
+      return _StatusView(
+        icon: Icons.forum_outlined,
+        title: '暂无活跃会话',
+        message: '去聊天软件发一条消息，再回来刷新',
+        action: OutlinedButton.icon(
+          onPressed: () => _refresh(),
+          icon: const Icon(Icons.refresh, size: 18),
+          label: const Text('刷新'),
+        ),
+      );
+    }
+    final query = _search.text.trim();
+    if (query.isNotEmpty) {
+      final matches = _items.where((item) => _matches(item, query)).toList();
+      if (matches.isEmpty) {
+        return _StatusView(
+          icon: Icons.search_off,
+          title: '没有匹配的会话',
+          message: '换个关键词，或清空搜索查看全部会话',
+          action: OutlinedButton.icon(
+            onPressed: _clearSearch,
+            icon: const Icon(Icons.backspace_outlined, size: 18),
+            label: const Text('清空搜索'),
+          ),
+        );
+      }
+      // 搜索要覆盖全部会话，所以和普通视图一样继续翻页。
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+        children: [
+          for (final session in matches) _tile(session),
+          SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
+        ],
+      );
+    }
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+      children: [
+        for (final row in _rows()) row,
+        SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
+      ],
     );
   }
 

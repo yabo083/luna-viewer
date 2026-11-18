@@ -60,7 +60,9 @@ class _ChatLunaAppState extends State<ChatLunaApp> {
     return ThemeData(
       colorScheme: scheme,
       useMaterial3: true,
-      scaffoldBackgroundColor: brightness == Brightness.dark ? const Color(0xFF0B0D10) : null,
+      scaffoldBackgroundColor: brightness == Brightness.dark
+          ? const Color(0xFF0B0D10)
+          : const Color(0xFFF7F8FB),
       inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder(), isDense: true),
     );
   }
