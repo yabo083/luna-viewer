@@ -9,7 +9,7 @@ enum EndpointKind { lan, publicEndpoint, p2p }
 
 class Endpoint {
   final EndpointKind kind;
-  final Uri base;        // 形如 http://192.168.0.107:5028 或 https://bot.example.com
+  final Uri base;        // 形如 http://<lan-ip>:5028 或 https://bot.example.com
   final String? label;   // 用户可读名，仅 UI 用
 }
 

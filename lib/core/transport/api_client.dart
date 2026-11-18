@@ -37,6 +37,9 @@ class ApiClient {
     if (token != null && token!.isNotEmpty) 'authorization': 'Bearer $token',
   };
 
+  /// 供 `Image.network` 之类需要直连资源的组件复用（工作区图片走 Bearer）。
+  Map<String, String> get authHeaders => {..._headers};
+
   Uri _uri(String path, [Map<String, String>? query]) {
     final p = path.startsWith('/') ? path.substring(1) : path;
     final uri = base.resolve(p);

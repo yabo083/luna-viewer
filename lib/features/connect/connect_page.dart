@@ -21,6 +21,16 @@ class _ConnectPageState extends State<ConnectPage> {
   String? _error;
 
   @override
+  void initState() {
+    super.initState();
+    widget.store.lastBase().then((uri) {
+      if (uri != null && mounted && _base.text.isEmpty) {
+        _base.text = '${uri.host}:${uri.port}';
+      }
+    });
+  }
+
+  @override
   void dispose() {
     _base.dispose();
     _token.dispose();

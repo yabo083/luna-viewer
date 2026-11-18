@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:markdown_widget/markdown_widget.dart';
 
 import '../../core/model/models.dart';
+import 'assistant_avatar.dart';
 
 /// 一条消息的渲染：助手走「无气泡 + markdown + 思考折叠 + 工具计数」，
 /// 用户走右侧浅色气泡。图片按 markdown `![]()` 出现，统一圆角并可点开全屏。
@@ -10,10 +11,16 @@ class MessageView extends StatelessWidget {
     super.key,
     required this.message,
     required this.base,
+    required this.headers,
+    this.avatarUrl,
   });
 
   final ChatMessage message;
   final Uri base;
+
+  /// 工作区图片需要 Bearer 才能取，`Image.network` 直连时复用同一份头。
+  final Map<String, String> headers;
+  final String? avatarUrl;
 
   @override
   Widget build(BuildContext context) {
@@ -32,9 +39,19 @@ class MessageView extends StatelessWidget {
             key: ValueKey('reasoning-${message.id}'),
             icon: Icons.psychology_outlined,
             title: '思考过程',
-            child: _Markdown(data: reasoning, base: base, muted: true),
+            child: SelectableText(
+              reasoning,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                height: 1.5,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
           ),
-        if (body.isNotEmpty) _Markdown(data: body, base: base),
+        if (body.isNotEmpty)
+          // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
+          message.hasMarkup
+              ? _Markdown(data: body, base: base, headers: headers)
+              : SelectableText(body, style: theme.textTheme.bodyMedium?.copyWith(height: 1.55)),
         if (message.toolCalls.isNotEmpty)
           _Foldable(
             key: ValueKey('tools-${message.id}'),
@@ -75,26 +92,33 @@ class MessageView extends StatelessWidget {
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
-      child: content,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          AssistantAvatar(size: 28, imageUrl: avatarUrl),
+          const SizedBox(width: 10),
+          Expanded(child: content),
+        ],
+      ),
     );
   }
 }
 
 class _Markdown extends StatelessWidget {
-  const _Markdown({required this.data, required this.base, this.muted = false});
+  const _Markdown({
+    required this.data,
+    required this.base,
+    required this.headers,
+  });
 
   final String data;
   final Uri base;
-  final bool muted;
+  final Map<String, String> headers;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final textStyle =
-        ((muted ? theme.textTheme.bodySmall : theme.textTheme.bodyMedium)?.copyWith(
-          height: 1.55,
-          color: muted ? theme.colorScheme.onSurfaceVariant : null,
-        )) ??
+    final textStyle = (theme.textTheme.bodyMedium?.copyWith(height: 1.55)) ??
         const TextStyle(fontSize: 15, height: 1.55);
     return MarkdownWidget(
       data: data,
@@ -104,7 +128,7 @@ class _Markdown extends StatelessWidget {
         configs: [
           PConfig(textStyle: textStyle),
           ImgConfig(
-            builder: (url, _) => _ChatImage(url: url, resolve: _resolve),
+            builder: (url, _) => _ChatImage(url: url, resolve: _resolve, headers: headers),
           ),
           PreConfig(
             textStyle:
@@ -126,15 +150,17 @@ class _Markdown extends StatelessWidget {
       return Uri.parse(url);
     }
     final name = url.startsWith('/') ? url.substring(1) : url;
-    return base.replace(path: '/files/${Uri.encodeComponent(name)}');
+    // 相对路径是 agent 工作区（data/chatluna/agents-work）里的文件，由 companion 插件以 Bearer 提供。
+    return base.replace(path: '/api/workspace', queryParameters: {'path': name});
   }
 }
 
 class _ChatImage extends StatelessWidget {
-  const _ChatImage({required this.url, required this.resolve});
+  const _ChatImage({required this.url, required this.resolve, required this.headers});
 
   final String url;
   final Uri Function(String) resolve;
+  final Map<String, String> headers;
 
   @override
   Widget build(BuildContext context) {
@@ -151,7 +177,7 @@ class _ChatImage extends StatelessWidget {
               children: [
                 Positioned.fill(
                   child: InteractiveViewer(
-                    child: Image.network(uri.toString(), fit: BoxFit.contain),
+                    child: Image.network(uri.toString(), fit: BoxFit.contain, headers: headers),
                   ),
                 ),
                 Positioned(
@@ -172,6 +198,8 @@ class _ChatImage extends StatelessWidget {
             constraints: const BoxConstraints(maxWidth: 280, maxHeight: 360),
             child: Image.network(
               uri.toString(),
+              headers: headers,
+              cacheWidth: 560,
               fit: BoxFit.cover,
               loadingBuilder: (context, child, progress) => progress == null
                   ? child

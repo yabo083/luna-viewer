@@ -89,7 +89,7 @@ class ChatBlock {
 }
 
 class ChatMessage {
-  const ChatMessage({
+  ChatMessage({
     required this.id,
     required this.role,
     required this.blocks,
@@ -128,7 +128,9 @@ class ChatMessage {
 
   /// 角色引擎把正文包在 `<message>…</message>` 里；图片是 `<img src="…">`；`<status/>` 是状态栏，不展示。
   /// 输出是 markdown：`<img>` 已转成 `![](url)`，其余标签剥掉（`<br>` 保留）。
-  String get bodyMarkdown {
+  late final String bodyMarkdown = _bodyMarkdown();
+
+  String _bodyMarkdown() {
     var raw = _collectText();
     // 多数回合的答复是通过 `reply` 工具发出的，assistant 自身没有 text 块。
     if (raw.trim().isEmpty) raw = _replyContent();
@@ -146,7 +148,9 @@ class ChatMessage {
   }
 
   /// 模型的思考过程（reasoning 块），UI 折叠展示。
-  String get reasoningText {
+  late final String reasoningText = _reasoningText();
+
+  String _reasoningText() {
     final buffer = StringBuffer();
     for (final block in blocks) {
       if (block.type != 'reasoning') continue;
@@ -161,7 +165,9 @@ class ChatMessage {
 
   /// 一次消息里真正做了事的工具调用（`reply`/`finish` 是发言工具，不算），
   /// 并按 `toolCallId` 关联同一条消息里的 `tool-result`。
-  List<ToolCallInfo> get toolCalls {
+  late final List<ToolCallInfo> toolCalls = _toolCalls();
+
+  List<ToolCallInfo> _toolCalls() {
     final outputs = <String, String>{};
     for (final block in blocks) {
       if (block.type != 'tool-result') continue;
@@ -197,6 +203,20 @@ class ChatMessage {
   }
 
   int get toolCallCount => toolCalls.length;
+
+  /// 正文是否真的含 markdown 语法。纯散文消息直接走 Text，省掉整棵 markdown widget 的构建。
+  late final bool hasMarkup = _hasMarkup(bodyMarkdown);
+
+  static bool _hasMarkup(String text) {
+    if (text.isEmpty) return false;
+    return RegExp(r'(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|\|)'
+            r'|```'
+            r'|`[^`\n]+`'
+            r'|\*\*|__'
+            r'|!\['
+            r'|\[[^\]]+\]\([^)]+\)')
+        .hasMatch(text);
+  }
 
   String _replyContent() {
     for (final block in blocks.reversed) {

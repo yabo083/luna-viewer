@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chatluna_mobile/core/model/models.dart';
+import 'package:chatluna_mobile/core/update/update_checker.dart';
 import 'package:chatluna_mobile/core/store/connection_store.dart';
 
 void main() {
@@ -166,6 +167,16 @@ void main() {
 
     test('未知事件忽略', () {
       expect(LiveEvent.fromSse('pong', null), isNull);
+    });
+  });
+
+  group('UpdateChecker.isNewer', () {
+    test('比较数字段并忽略 v 前缀与预发布后缀', () {
+      expect(UpdateChecker.isNewer('v0.2.0', '0.1.0'), isTrue);
+      expect(UpdateChecker.isNewer('0.1.1', '0.1.0'), isTrue);
+      expect(UpdateChecker.isNewer('0.1.0', '0.1.0'), isFalse);
+      expect(UpdateChecker.isNewer('0.1.0-rc.1', '0.1.0'), isFalse);
+      expect(UpdateChecker.isNewer('0.10.0', '0.9.9'), isTrue);
     });
   });
 

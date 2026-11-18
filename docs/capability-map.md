@@ -35,7 +35,13 @@
 | 事件流 | `GET /api/sessions/:id/events`（SSE） | `message` / `cut` / mark；`Last-Event-ID` 续传，超限先发 `truncated` |
 | 多 agent | `GET /api/agents` | `[{rootSessionId,members:[…]}]` |
 | 待审批 | `GET /api/interaction/pending?routeId=` / `POST /api/interaction/answer {routeId,answer}` | 回合会挂起等待 |
-| 附件 | `GET /files/:name` | 无鉴权、无 `/api` 前缀 |
+| 附件（storage） | `GET /files/:name` | 无鉴权、无 `/api` 前缀 |
+| 工作区文件（伴侣插件） | `GET /api/workspace?path=<相对路径>` | 需 Bearer；路径限定在 `data/chatluna/agents-work`；消息里的相对 `<img src>` 走这里 |
+
+## 平台与 bot
+
+WS `sub {key:'adapters.bots'}` → `{bots:[{platform,selfId,status,user:{id,name,nick,avatar}}]}`。
+WebUI「聊天平台」卡片显示的头像就来自 `user.avatar`；App 用同一个源，取不到时退化为渐变图标。
 
 ## 模型与引擎
 

@@ -31,7 +31,13 @@ class ConnectionStore {
 
   Future<Connection?> load() async {
     final base = (await SharedPreferences.getInstance()).getString(_baseKey);
-    final token = await _secure.read(key: _tokenKey);
+    String? token;
+    try {
+      token = await _secure.read(key: _tokenKey);
+    } catch (_) {
+      // Keystore 不可用或旧版本写入的数据解不开：当作未连接，走登录页，不要在这里抛。
+      token = null;
+    }
     if (base == null || token == null || token.isEmpty) return null;
     final uri = Uri.tryParse(base);
     if (uri == null) return null;
@@ -42,6 +48,12 @@ class ConnectionStore {
     await _secure.write(key: _tokenKey, value: connection.token);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_baseKey, connection.base.toString());
+  }
+
+  /// 上次连接的地址，用于登录页预填。
+  Future<Uri?> lastBase() async {
+    final value = (await SharedPreferences.getInstance()).getString(_baseKey);
+    return value == null ? null : Uri.tryParse(value);
   }
 
   Future<String?> label() async =>

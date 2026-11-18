@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/capability/sessions_repository.dart';
@@ -9,11 +10,26 @@ import 'message_view.dart';
 /// 会话详情：只读历史 + 实时流 + 会话级操作（中止 / 压缩 / 分叉 / 重新载入）。
 /// v0.1.0 不在 App 里发消息——平台会话的输入仍由聊天软件承担。
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key, required this.repo, required this.base, required this.session});
+  const ChatPage({
+    super.key,
+    required this.repo,
+    required this.base,
+    required this.headers,
+    required this.session,
+    this.avatarUrl,
+    this.botName,
+    this.initial,
+  });
 
   final SessionsRepository repo;
   final Uri base;
+  final Map<String, String> headers;
   final SessionSummary session;
+  final String? avatarUrl;
+  final String? botName;
+
+  /// 列表页预先取回的历史：有值时第一帧直接有内容。
+  final Transcript? initial;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -21,7 +37,11 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final _scroll = ScrollController();
-  final List<ChatMessage> _messages = [];
+  /// 全量历史；渲染只用 `_windowStart` 之后的一段，避免一次排版上百条 markdown。
+  List<ChatMessage> _all = const [];
+  int _windowStart = 0;
+  static const _initialWindow = 12;
+
   final StringBuffer _streaming = StringBuffer();
   StreamSubscription<LiveEvent>? _live;
   Timer? _poll;
@@ -30,34 +50,65 @@ class _ChatPageState extends State<ChatPage> {
   bool _running = false;
   String? _error;
 
+  bool _awayFromBottom = false;
+  int _unseen = 0;
+
+  late final DateTime _t0;
+  int? _netMs;
+  int? _paintMs;
+  int? _liveMs;
+
   @override
   void initState() {
     super.initState();
+    _t0 = DateTime.now();
     _running = widget.session.running;
-    _load();
-    _startLive();
+    _scroll.addListener(_onScroll);
+    final initial = widget.initial;
+    if (initial != null) {
+      _all = initial.messages;
+      _windowStart = _all.length > _initialWindow ? _all.length - _initialWindow : 0;
+      _loading = false;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => _paintMs = _since());
+      });
+    } else {
+      _load();
+    }
+    // 首帧先画出来再连实时流：SSE 握手与首个 snapshot 会和首屏排版抢时间。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _startLive();
+    });
   }
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     _live?.cancel();
     _poll?.cancel();
     _scroll.dispose();
     super.dispose();
   }
 
+  int _since() => DateTime.now().difference(_t0).inMilliseconds;
+
   Future<void> _load() async {
     try {
       final transcript = await widget.repo.transcript(widget.session.id);
       if (!mounted) return;
+      _netMs = _since();
       setState(() {
-        _messages
-          ..clear()
-          ..addAll(transcript.messages);
+        final keepWindow = _all.isNotEmpty;
+        _all = transcript.messages;
+        if (!keepWindow) {
+          _windowStart = _all.length > _initialWindow ? _all.length - _initialWindow : 0;
+        }
         _loading = false;
         _error = null;
       });
-      _scrollToEnd();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => _paintMs = _since());
+      });
     } on ApiFailure catch (e) {
       if (!mounted) return;
       setState(() {
@@ -77,6 +128,7 @@ class _ChatPageState extends State<ChatPage> {
     _live = widget.repo.live(widget.session.id).listen(
       (event) {
         if (!mounted) return;
+        _liveMs ??= _since();
         switch (event.kind) {
           case LiveEventKind.snapshot:
             setState(() {
@@ -88,19 +140,21 @@ class _ChatPageState extends State<ChatPage> {
                 }
               }
             });
-            _scrollToEnd();
+            _followIfAtBottom();
           case LiveEventKind.delta:
             setState(() {
               _running = true;
               _streaming.write(event.delta ?? '');
+              if (_awayFromBottom) _unseen += 1;
             });
-            _scrollToEnd();
+            _followIfAtBottom();
           case LiveEventKind.tool:
             setState(() => _running = true);
           case LiveEventKind.settled:
             setState(() {
               _running = false;
               _streaming.clear();
+              if (_awayFromBottom) _unseen += 1;
             });
             _load();
           case LiveEventKind.lagged:
@@ -128,15 +182,32 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
-  void _scrollToEnd() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      _scroll.animateTo(
-        _scroll.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 180),
-        curve: Curves.easeOut,
-      );
-    });
+  /// 滚到历史尽头时自动往前扩一页（倒序列表里 maxScrollExtent 是最早那条）。
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final position = _scroll.position;
+    final away = position.pixels > 400;
+    if (away != _awayFromBottom) setState(() => _awayFromBottom = away);
+    if (_windowStart == 0) return;
+    if (position.pixels < position.maxScrollExtent - 320) return;
+    setState(() => _windowStart = (_windowStart - _initialWindow).clamp(0, _all.length));
+  }
+
+  void _jumpToLatest() {
+    setState(() => _unseen = 0);
+    _scrollToLatest();
+  }
+
+  /// 倒序列表：offset 0 就是最新一条，不需要「跳到末尾」的动画。
+  bool get _nearBottom => !_scroll.hasClients || _scroll.offset < 160;
+
+  void _followIfAtBottom() {
+    if (_nearBottom) _scrollToLatest();
+  }
+
+  void _scrollToLatest() {
+    if (!_scroll.hasClients) return;
+    _scroll.jumpTo(0);
   }
 
   void _toast(String text) {
@@ -176,9 +247,21 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  String? get _debugTiming {
+    if (!kDebugMode) return null;
+    final parts = [
+      if (_netMs != null) 'net ${_netMs}ms',
+      if (_paintMs != null) 'paint ${_paintMs}ms',
+      if (_liveMs != null) 'live ${_liveMs}ms',
+    ];
+    return parts.isEmpty ? null : parts.join(' · ');
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final visible = _all.length - _windowStart;
+    final streaming = _streaming.isEmpty ? 0 : 1;
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -202,29 +285,87 @@ class _ChatPageState extends State<ChatPage> {
           ),
         ],
       ),
+      floatingActionButton: AnimatedScale(
+        scale: _awayFromBottom ? 1 : 0,
+        duration: const Duration(milliseconds: 150),
+        child: FloatingActionButton.small(
+          onPressed: _jumpToLatest,
+          tooltip: '回到最新',
+          child: Badge(
+            isLabelVisible: _unseen > 0,
+            label: Text('$_unseen'),
+            child: const Icon(Icons.arrow_downward),
+          ),
+        ),
+      ),
       body: Column(
         children: [
-          _Header(session: widget.session, running: _running, liveOk: _liveOk),
+          _Header(
+            session: widget.session,
+            running: _running,
+            liveOk: _liveOk,
+            botName: widget.botName,
+            debugTiming: _debugTiming,
+          ),
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
-                : _error != null && _messages.isEmpty
-                ? Center(child: Text(_error!, style: TextStyle(color: theme.colorScheme.error)))
+                : _error != null && _all.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(_error!, style: TextStyle(color: theme.colorScheme.error)),
+                        const SizedBox(height: 12),
+                        FilledButton(onPressed: _load, child: const Text('重试')),
+                      ],
+                    ),
+                  )
+                : _all.isEmpty && _streaming.isEmpty
+                ? Center(
+                    child: Text(
+                      '这个会话还没有消息',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  )
                 : ListView.builder(
                     controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
-                    itemCount: _messages.length + (_streaming.isEmpty ? 0 : 1),
+                    reverse: true,
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      12,
+                      16,
+                      24 + MediaQuery.paddingOf(context).bottom,
+                    ),
+                    cacheExtent: 200,
+                    itemCount: visible + streaming + (_windowStart > 0 ? 1 : 0),
                     itemBuilder: (context, index) {
-                      if (index == _messages.length) {
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 8),
-                          child: SelectableText(
-                            _streaming.toString(),
-                            style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
-                          ),
+                      var cursor = index;
+                      if (streaming == 1) {
+                        if (cursor == 0) {
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: SelectableText(
+                              _streaming.toString(),
+                              style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
+                            ),
+                          );
+                        }
+                        cursor -= 1;
+                      }
+                      if (cursor < visible) {
+                        final message = _all[_all.length - 1 - cursor];
+                        return MessageView(
+                          message: message,
+                          base: widget.base,
+                          headers: widget.headers,
+                          avatarUrl: widget.avatarUrl,
                         );
                       }
-                      return MessageView(message: _messages[index], base: widget.base);
+                      // 反向列表的末端 = 最早一条；进入视口即由 _onScroll 自动扩窗。
+                      return const SizedBox(height: 32);
                     },
                   ),
           ),
@@ -235,21 +376,31 @@ class _ChatPageState extends State<ChatPage> {
 }
 
 class _Header extends StatelessWidget {
-  const _Header({required this.session, required this.running, required this.liveOk});
+  const _Header({
+    required this.session,
+    required this.running,
+    required this.liveOk,
+    this.botName,
+    this.debugTiming,
+  });
 
   final SessionSummary session;
   final bool running;
   final bool liveOk;
+  final String? botName;
+  final String? debugTiming;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final parts = [
+      ?botName,
       session.origin,
       if (session.engine.isNotEmpty) session.engine,
       if (session.model != null) session.model!.toString(),
-      if (running) '生成中',
+      if (running) '运行中',
       if (!liveOk) '实时流不可用·轮询中',
+      ?debugTiming,
     ];
     return Container(
       width: double.infinity,
