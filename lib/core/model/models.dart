@@ -416,6 +416,7 @@ class ChatMessage {
     bool isFramework = false,
     this.detectCommands = true,
     this.time,
+    this.meta,
   }) : _declaredFramework = isFramework;
 
   final String id;
@@ -424,6 +425,10 @@ class ChatMessage {
 
   /// 落库时间（服务端给了才非空）：框架块按它插入时间线并与平台消息对齐。
   final DateTime? time;
+
+  /// 引擎元数据：`turn` / `step` / `usage` / `timing`（每个 block 的 startedAt/endedAt）。
+  /// 这是轨迹视图的同源数据，用来给出权威的阶段耗时。
+  final Map<String, Object?>? meta;
 
   /// 服务端标记的消息形态：`notice` 是引擎/插件注入的内部消息（wake、turn 装配），不是用户发言。
   final String form;
@@ -467,6 +472,10 @@ class ChatMessage {
       time: _optionalTime(
         json['time'] ?? json['at'] ?? json['timestamp'] ?? json['createdAt'],
       ),
+      // 引擎侧的权威计时（webui 轨迹视图同源）：`meta.timing = {startedAt, endedAt, blocks[]}`。
+      meta: json['meta'] is Map
+          ? (json['meta'] as Map).cast<String, Object?>()
+          : null,
     );
   }
 

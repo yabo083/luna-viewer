@@ -213,12 +213,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 骨架当前对应的轮次号（[TurnClockView.round]）：换轮才清空本轮的外发标记。
   int _skeletonRound = -1;
 
+  /// 一次「turn」可能由多个 attempt/round 组成（异步工具会让引擎开新的一轮）：
+  /// 脚注要按 turn 汇总，而不是按我们自己的 round 切。
+  final List<String> _turnOutboundIds = <String>[];
+  Timer? _adoptTimer;
+
   /// 在跑的工具调用：`callId → 阶段名`。`tool-result` 按 callId 精确配对，
   /// 同名工具重试或与前一步的「思考」并存时不会关错段。
   final Map<String, String> _openToolCalls = <String, String>{};
 
   /// 没有 callId 的老帧：按先进先出配对。
   final List<String> _openToolNames = <String>[];
+
+  /// 已经拿到 `tool-result` 的调用 id：settle 时仍没有结果的，就是被转到后台去了。
+  final Set<String> _resultToolCalls = <String>{};
 
   /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
   /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
@@ -344,6 +352,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _liveSub?.cancel();
     _eventsSub?.cancel();
     _eventsRetry?.cancel();
+    _adoptTimer?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
     _snapshotTimer?.cancel();
@@ -697,6 +706,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     return last?.add(anchorTick) ?? DateTime.now();
   }
 
+  /// 本地合成一条框架块：服务端没有对应 mark 时用（例如工具被转到后台）。
+  /// 文本即去重键，同一句只出现一次。
+  void _pushFrameworkNotice(String text) {
+    final id = 'local-${noticeKey(text)}';
+    if (!_frameworkIds.add(id)) return;
+    setState(() {
+      _framework = orderNotices([
+        ..._framework,
+        TimelineNotice(id: id, text: text, time: DateTime.now()),
+      ]);
+    });
+    _followIfAtBottom();
+  }
+
   /// `/events` 增量：mark 驱动计时，消息只收框架类。平台 `stream` 才是消息本体。
   /// 等日志 head 到手再订阅：不带游标的重放会让上一轮的 mark 变成这一轮的起点。
   void _startEvents() {
@@ -760,6 +783,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
     final message = event.message;
     if (message == null) return;
+    for (final block in message.blocks) {
+      if (block.type != 'tool-result') continue;
+      final callId = block.data['toolCallId'];
+      if (callId is String && callId.isNotEmpty) _resultToolCalls.add(callId);
+    }
     // `tool-result` 落库只说明模型拿到了返回值；异步工具（draw）的产物还在路上。
     // 阶段不在这里关：等模型下一步真的开始（reasoning / prompt / text）再关，
     // 这样 draw 的耗时覆盖到「图片生成完、模型接着说话」为止。
@@ -850,6 +878,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         // 顺序要紧：先记下「本轮已有外发」，再收表——收表会同步触发骨架撤场判断。
         _outboundInRound = true;
         _roundOutboundIds.add(message.id);
+        _turnOutboundIds.add(message.id);
         _clock.delivered();
         _verifyTurnEnd();
         // bot 的第一条气泡上屏 = 这一轮的活动结束，骨架立刻让位（不再等 hold）。
@@ -1014,6 +1043,19 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 // 落库的那条由 `platform/stream` 送来，这里不重取历史。
                 // 一次 attempt 结束只收阶段，**不是**整轮终点：投递与后续 step 还可能在跑。
                 _snapshotTimer?.cancel();
+                // 还开着、却已经 settle 的工具 = 引擎把它转到了后台：
+                // 在中间块说明一句，用户才知道这一轮为什么"没声了"。
+                final backgrounded = [
+                  for (final entry in _openToolCalls.entries)
+                    if (!_resultToolCalls.contains(entry.key) &&
+                        entry.value != replyPhase)
+                      entry.value,
+                ];
+                if (backgrounded.isNotEmpty) {
+                  _pushFrameworkNotice(
+                    '[${backgrounded.toSet().join('、')} 转入后台执行，完成后会回来告诉你]',
+                  );
+                }
                 _clock.attemptSettled();
                 _flushTimer?.cancel();
                 _flushTimer = null;
@@ -1204,18 +1246,25 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       // 新的一轮：用轮次序号判断，不能靠「读数还很小」（会漏判/误判）。
       if (view.round != _skeletonRound) {
         _skeletonRound = view.round;
+        _adoptTimer?.cancel();
+        _adoptTimer = null;
         _outboundInRound = false;
         _roundOutboundIds.clear();
         _openToolCalls.clear();
         _openToolNames.clear();
+        _resultToolCalls.clear();
       }
       // 本轮已经出过真实气泡：不再补骨架（等 running=false 收表即可）。
       if (_skeleton == _SkeletonPhase.none && !_outboundInRound) _startSkeleton();
       return;
     }
-    // 骨架可能在本轮第一条外发气泡上屏时就被撤掉（比收表早），
-    // 脚注不能跟着骨架一起走：收表这一刻无条件补上。
-    if (_stampTurnEnd(view)) setState(() {});
+    // 先拿引擎的权威计时（轨迹视图同源）校正总时长与各工具耗时，再盖脚注。
+    // 一次 turn 可能继续开下一轮（异步工具）：等 3 秒没有新一轮再按 turn 汇总。
+    _adoptTimer?.cancel();
+    _adoptTimer = Timer(const Duration(seconds: 3), () {
+      _adoptTimer = null;
+      unawaited(_adoptTiming());
+    });
     if (_skeleton == _SkeletonPhase.running) _endSkeleton(view);
   }
 
@@ -1233,9 +1282,65 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     if (_nearBottom) _scrollToLatest();
   }
 
+  /// 从会话日志的 `meta.timing` 取权威计时（与 webui 轨迹视图同源）。
+  ///
+  /// - 总时长 = 本轮所有回复里最早的 `startedAt` → 最晚的 `endedAt`；
+  /// - 工具耗时 = `tool-call` block 对应的 `timing.blocks[index]` 区间，涵盖真实执行。
+  Future<void> _adoptTiming() async {
+    final session = _session;
+    if (session == null) return;
+    try {
+      final transcript = await widget.repo.transcript(session.id);
+      // 只校正「阶段」：总时长仍用本地钟（它跨 attempt，覆盖用户真正等的整段），
+      // 引擎的 `timing` 按 turn 切分，直接拿来当总时长会因为后台轮次而偏小。
+      final view = _clock.view.value;
+      if (view == null) return;
+      final windowMs = view.total.inMilliseconds + 10000;
+      final cutoff = DateTime.now().millisecondsSinceEpoch - windowMs;
+      final phases = <TurnPhaseRecord>[];
+      for (final message in transcript.messages) {
+        final timing = message.meta?['timing'];
+        if (timing is! Map) continue;
+        final started = timing['startedAt'];
+        if (started is! num || started < cutoff) continue;
+        final spans = timing['blocks'];
+        if (spans is! List) continue;
+        final byIndex = <Object?, Map>{
+          for (final span in spans)
+            if (span is Map) span['index']: span,
+        };
+        for (var i = 0; i < message.blocks.length; i++) {
+          final block = message.blocks[i];
+          if (block.type != 'tool-call') continue;
+          final span = byIndex[i];
+          final name = block.data['toolName'];
+          if (span == null || name is! String) continue;
+          final a = span['startedAt'];
+          final b = span['endedAt'];
+          if (a is! num || b is! num || b < a) continue;
+          phases.add(
+            TurnPhaseRecord(
+              normalizeTurnPhase(name),
+              Duration(milliseconds: b.toInt() - a.toInt()),
+            ),
+          );
+        }
+      }
+      if (phases.isNotEmpty) {
+        _clock.adoptExact(
+          total: view.total,
+          phases: phases.reversed.toList(growable: false),
+        );
+      }
+    } catch (_) {
+      // 拿不到权威数据就保留实时读数，脚注照盖。
+    }
+    if (!mounted) return;
+    final view = _clock.view.value;
+    if (view != null && _stampTurnEnd(view)) setState(() {});
+  }
+
   void _endSkeleton(TurnClockView view) {
-    // 总时长写进真实气泡的脚注：骨架撤掉后读数不丢。
-    _stampTurnEnd(view);
     if (_skeletonAborted) {
       // 中止：保留可操作态（已中止 + 重新发送），不自动消失。
       setState(() => _skeleton = _SkeletonPhase.holding);
@@ -1253,13 +1358,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 本轮最后一颗 out 气泡的脚注：`turnStartedAt`/`turnEndedAt` 是本地推算，服务端没有。
   /// 只写本轮新落库的消息（[_roundOutboundIds]）：改写上一轮那条会得出 0.0s 的假读数。
   bool _stampTurnEnd(TurnClockView view) {
-    if (_roundOutboundIds.isEmpty) return false;
+    if (_turnOutboundIds.isEmpty) return false;
     if (view.total < const Duration(milliseconds: 200)) return false;
     final end = DateTime.now();
     final start = end.subtract(view.total);
     var changed = false;
-    // 本轮所有外发气泡都盖同一个总时长：多消息轮次里，任何一条都能解释「等了多久」。
-    for (final id in _roundOutboundIds) {
+    // 一次 turn 里的所有外发气泡都盖同一个总时长：多消息、多 attempt 都一致。
+    for (final id in _turnOutboundIds) {
       for (var i = _messages.length - 1; i >= 0; i--) {
         final message = _messages[i];
         if (message.id != id) continue;
@@ -1273,6 +1378,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         break;
       }
     }
+    if (changed) _turnOutboundIds.clear();
     return changed;
   }
 
