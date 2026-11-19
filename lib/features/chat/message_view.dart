@@ -20,6 +20,8 @@ import 'message_logic.dart';
 ///
 /// 媒体（[PlatformMessage.media]）在气泡里单独成块：图片走缩略图/网格，视频/音频/文件走一行胶囊。
 /// 正文只剩占位文案（`[图片]`）时不再重复显示——媒体本身已经把这层信息表达完了。
+/// 正文里混着占位（「文字—图—文字」）时按占位位置交错渲染，元素顺序与发送时一致；
+/// 没有占位的老消息仍是「正文 + 媒体块」。
 class MessageView extends StatelessWidget {
   const MessageView({
     super.key,
@@ -72,15 +74,20 @@ class MessageView extends StatelessWidget {
   static const double _avatarGap = 8;
   static const double _maxWidthRatio = 0.82;
 
+  /// 有序混排里相邻两块的间距：文本与媒体之间有呼吸，连续图片仍交给网格拼块。
+  static const double _segmentGap = 6;
+
   /// 正文的确定性解析结果：气泡每次重建都不重算（键就是正文本身，
   /// 同一条消息换实例也命中；内存只多存一份引用，不复制字符串）。
   static final MemoCache<CommandHelp?> _helpMemo = MemoCache<CommandHelp?>(capacity: 200);
   static final MemoCache<bool> _placeholderMemo = MemoCache<bool>(capacity: 200);
+  static final MemoCache<bool> _hasPlaceholderMemo = MemoCache<bool>(capacity: 200);
 
   /// 清掉正文解析缓存：切后台/退出详情页时把 Dart 堆里的解析结果一并释放。
   static void clearCaches() {
     _helpMemo.clear();
     _placeholderMemo.clear();
+    _hasPlaceholderMemo.clear();
     _clearFrameworkCaches();
   }
 
@@ -119,6 +126,16 @@ class MessageView extends StatelessWidget {
 
     // bot 把 `chatluna` 的帮助清单发成一整段文本：排版成卡片，其余正文一律走原路径。
     final help = showBody ? _helpMemo.value(body, () => CommandHelp.parse(body)) : null;
+    final bodyStyle = theme.textTheme.bodyMedium?.copyWith(height: 1.5, color: foreground);
+
+    // 插件按元素顺序把消息写成占位（`[图片] [表情] [文件]`），附件列表同序：有占位时按
+    // 占位位置交错渲染，才能还原「文字—图—文字」。没有占位就保持「正文 + 媒体块」的老布局。
+    final segments = help == null &&
+            media.isNotEmpty &&
+            body.isNotEmpty &&
+            _hasPlaceholderMemo.value(body, () => hasMediaPlaceholder(body))
+        ? interleaveContent(body, media)
+        : null;
 
     final content = <Widget>[
       if (reasoning.isNotEmpty)
@@ -131,31 +148,40 @@ class MessageView extends StatelessWidget {
             style: theme.textTheme.bodySmall?.copyWith(height: 1.5, color: mutedForeground),
           ),
         ),
-      if (help != null)
-        _CommandHelpCard(
-          key: ValueKey('command-help-${message.id}'),
-          help: help,
-          foreground: foreground,
-          muted: mutedForeground,
-          commandColor: outbound ? foreground : scheme.primary,
-        )
-      else if (showBody)
-        // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
-        message.hasMarkup
-            ? _Markdown(data: body, base: base, headers: headers, foreground: foreground)
-            : SelectableText(
-                body,
-                style: theme.textTheme.bodyMedium?.copyWith(height: 1.5, color: foreground),
-              ),
-      if (media.isNotEmpty)
-        _MediaBlock(
-          key: ValueKey('media-${message.id}'),
-          media: media,
+      if (segments != null)
+        ..._interleavedContent(
+          segments,
+          media,
           base: base,
           headers: headers,
           foreground: foreground,
           muted: mutedForeground,
-        ),
+          textStyle: bodyStyle,
+        )
+      else ...[
+        if (help != null)
+          _CommandHelpCard(
+            key: ValueKey('command-help-${message.id}'),
+            help: help,
+            foreground: foreground,
+            muted: mutedForeground,
+            commandColor: outbound ? foreground : scheme.primary,
+          )
+        else if (showBody)
+          // 纯散文直接 Text：markdown 树构建是首帧的主要开销，只有真含语法时才付这笔钱。
+          message.hasMarkup
+              ? _Markdown(data: body, base: base, headers: headers, foreground: foreground)
+              : SelectableText(body, style: bodyStyle),
+        if (media.isNotEmpty)
+          _MediaBlock(
+            key: ValueKey('media-${message.id}'),
+            media: media,
+            base: base,
+            headers: headers,
+            foreground: foreground,
+            muted: mutedForeground,
+          ),
+      ],
       if (message.toolCalls.isNotEmpty)
         _Foldable(
           key: ValueKey('tools-${message.id}'),
@@ -262,6 +288,54 @@ class MessageView extends StatelessWidget {
               ],
       ),
     );
+  }
+
+  /// 按正文顺序把文本段与媒体段排出来：文本走现有的 SelectableText / markdown 分支，
+  /// 媒体走现有的 [_MediaBlock]（图片鉴权、重试、单张/网格全都沿用）。
+  ///
+  /// 连续媒体段并成一块：`[图片][图片]` 仍然是网格而不是两张上下叠的大图；
+  /// 块与块之间留 [_segmentGap]，首块不留（气泡内边距已经给过了）。
+  List<Widget> _interleavedContent(
+    List<ContentSegment> segments,
+    List<PlatformMedia> media, {
+    required Uri base,
+    required Map<String, String> headers,
+    required Color foreground,
+    required Color muted,
+    required TextStyle? textStyle,
+  }) {
+    final widgets = <Widget>[];
+    for (var i = 0; i < segments.length; i++) {
+      final Widget child;
+      switch (segments[i]) {
+        case TextSegment(:final text):
+          child = message.hasMarkup
+              ? _Markdown(data: text, base: base, headers: headers, foreground: foreground)
+              : SelectableText(text, style: textStyle);
+        case MediaSegment(:final mediaIndex):
+          final items = <PlatformMedia>[media[mediaIndex]];
+          while (i + 1 < segments.length) {
+            final next = segments[i + 1];
+            if (next is! MediaSegment) break;
+            items.add(media[next.mediaIndex]);
+            i++;
+          }
+          child = _MediaBlock(
+            key: ValueKey('media-${message.id}-${widgets.length}'),
+            media: items,
+            base: base,
+            headers: headers,
+            foreground: foreground,
+            muted: muted,
+          );
+      }
+      widgets.add(
+        widgets.isEmpty
+            ? child
+            : Padding(padding: const EdgeInsets.only(top: _segmentGap), child: child),
+      );
+    }
+    return widgets;
   }
 }
 
