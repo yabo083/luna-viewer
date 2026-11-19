@@ -578,7 +578,7 @@ class _SessionsPageState extends State<SessionsPage> with WidgetsBindingObserver
         }
       case 'diag':
         final text = [
-          'ChatLuna Mobile $appVersion',
+          'Luna Viewer $appVersion',
           'base ${widget.connection.base}',
           'bot ${_bot?.name ?? '-'} (${_bot?.platform ?? '-'}:${_bot?.selfId ?? '-'})',
         ].join('\n');
@@ -588,7 +588,7 @@ class _SessionsPageState extends State<SessionsPage> with WidgetsBindingObserver
         if (!mounted) return;
         showAboutDialog(
           context: context,
-          applicationName: 'ChatLuna',
+          applicationName: 'Luna Viewer',
           applicationVersion: appVersion,
           applicationLegalese: '连接到自托管的 ChatLuna v2 实例',
         );
@@ -635,7 +635,7 @@ class _SessionsPageState extends State<SessionsPage> with WidgetsBindingObserver
               ),
               ListTile(
                 leading: const Icon(Icons.info_outline),
-                title: const Text('关于 ChatLuna'),
+                title: const Text('关于 Luna Viewer'),
                 onTap: () => Navigator.pop(context, 'about'),
               ),
               const _SheetSectionLabel('开发者'),

@@ -163,7 +163,7 @@ class _ConnectPageState extends State<ConnectPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'ChatLuna',
+                            'Luna Viewer',
                             style: theme.textTheme.headlineSmall?.copyWith(
                               fontWeight: FontWeight.w600,
                             ),
