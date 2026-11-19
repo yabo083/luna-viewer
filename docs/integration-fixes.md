@@ -51,3 +51,46 @@
 | 404 降级回归 | 需「先已加载、后被服务端卸载」的会话 | **未覆盖**（当前没有已加载会话） | — |
 
 结论：构建、静默安装、凭证保留、未加载态渲染在真机上通过；状态灯与阶段明细两项修复**未取得真机证据**，原因是服务端当前没有任何已加载会话，且 web 会话创建被路由配置禁用（`403 this route is disabled`）。待下一次 QQ agent 认领会话（bot 实际参与一轮对话后 `GET /api/sessions` 出现 `items`）时，按 `integration-report.md` 第 5 节最小复现补测：steer 后 1–3 s 内截图看状态灯、点骨架骑缝读秒标签看明细弹层。
+
+## 真机复核（2026-11-19 23:04–23:37）
+
+补测上一节标记「未覆盖」的两项。设备 `10CF8403GA0049P`（USB），实例 `192.168.0.107:5028`，私聊会话 `route:r-4a066453788c:user:664BAF4D09142330988FECAE7EA6B166:rab6c602f`（列表 `ch-03 (2657455842)`）已加载且 `running=false`。
+
+### 构建与安装
+
+| 项 | 方法 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 构建（当前源码） | 删掉旧产物后 `flutter build apk --debug --target-platform android-arm64` | `✓ Built`；`app-debug.apk` 162,211,903 B，mtime 2026-11-19 23:04 | `build/app/outputs/flutter-apk/app-debug.apk`、`tmp/verify-light/build-install.txt` |
+| 静默安装 | `adb push … /data/local/tmp/clm.apk`（2.3 s）+ `pm install -r -t`（3.7 s） | `Success`；`lastUpdateTime=2026-11-19 23:05:00`，`firstInstallTime` 仍为 2026-11-18 16:48:20（未 uninstall / pm clear）；`verifier_verify_adb_installs=0`；打开即会话列表，凭证保留 | `dumpsys package love.mikumiku.chatluna_mobile`、`tmp/verify-light/build-install.txt` |
+
+### 1. 状态灯在 steer 后 1–3 s 内转「思考中」
+
+- **期望**：`POST /api/sessions/:id/steer` 后 1–3 s 内，信息栏状态灯为「思考中」，不再长时间停在「待机」。
+- **实际**（以 POST 发出为 t=0，逐帧截图；t 取 `adb screencap` 采集时刻）：
+  - 基线：进入详情后灯「待机」、无计时胶囊 —— `tmp/verify-light/08-baseline.png`
+  - steer `{"text":"请用一句话介绍你自己"}` → `202 {"accepted":true}`，响应耗时 88 ms。
+  - +0.31 s：灯「思考中」，骨架骑缝 `0.6s · 思考 0.0s` —— `tmp/verify-light/steer2_1.png`
+  - +0.74 s：灯「思考中」，`1.0s · 思考 0.4s` —— `tmp/verify-light/steer2_2.png`
+  - +1.15 s：灯「思考中」，`1.4s · 思考 0.8s` —— `tmp/verify-light/steer2_3.png`
+  - +2.41 s：灯「思考中」，`2.7s · 思考 2.1s` —— `tmp/verify-light/steer2_6.png`
+  - +3.25 s：灯「思考中」，`3.5s · 思考 2.9s` —— `tmp/verify-light/steer2_8.png`
+- **达标**：是。最早一帧 0.31 s 已亮「思考中」，1–3 s 窗口内各帧全部为「思考中」，与骨架里的「思考」阶段一致；修复前实测 3.2/5.0/7.7 s 仍「待机」、约 14 s 才变。
+
+### 2. 骨架骑缝计时标签点开阶段明细
+
+- **期望**：点骨架气泡骑缝上的计时标签 → 弹出本轮阶段明细。
+- **实际**：
+  - steer `{"text":"请用大约400字描写深夜城市的雨景，分三段。"}` → 202；+1.6 s 截到骨架与骑缝标签 `1.8s · 思考 1.2s`（信息栏同时有 `1.8s · 思考` 胶囊）—— `tmp/verify-light/10-skeleton.png`
+  - 在标签位置 tap（1080×2400 下 x=413, y=2058，即 52 dp 命中区中心）：底部弹出明细「本轮 2.3s / 当前 思考 / 还没有完成的阶段 / 阶段可能并行：各自耗时之和可以超过整轮。」—— `tmp/verify-light/11-phases-tap.png`
+- **达标**：是（弹层标题的时间与点按时刻的读秒一致，确认走的是这一轮的 `TurnClockView`）。
+
+### 复现步骤
+
+1. 启动 App → 打开列表顶部已加载的 `ch-03`，确认灯「待机」、信息栏无计时胶囊。
+2. `curl -X POST -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"text":"请用一句话介绍你自己"}' "http://192.168.0.107:5028/api/sessions/<urlencoded id>/steer"`
+3. 0.3–3 s 内 `adb exec-out screencap -p`：状态灯应为「思考中」，列表末尾出现骨架，骑缝为 `总时长 · 阶段 耗时`。
+4. 再 steer 一句更长的（400 字），骨架出现后 1–3 s 内点骑缝标签（1080×2400 约 x=413, y=2058）→ 底部弹出阶段明细。
+
+### 备注：一次作废的尝试（不计入结论）
+
+23:33 首测时该会话正被 QQ 侧遗留的长轮（含 `draw` 工具，服务端 `running=true`）占着；steer 注入已运行的轮次、App 收不到新的 turn_start，+4.3 s 仍为「待机」，约 +12.7 s 才因兜底探测转「轮询中」，信息栏读数还是上一轮冻结的 `36.9s · draw`。等 `running=false` 后重开详情再测，即得上表结果。该现象属于「中途插话」而非新轮次起点，不作为本次两项修复的判据。
