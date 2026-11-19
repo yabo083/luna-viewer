@@ -1,0 +1,35 @@
+name: npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/chatluna-plugin-media-bridge
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest && npm --version
+
+      - name: Publish (OIDC, no token)
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "chatluna-plugin-media-bridge@$version" version >/dev/null 2>&1; then
+            echo "$version is already on the registry; skipping"
+          else
+            npm publish --access public --provenance
+          fi
