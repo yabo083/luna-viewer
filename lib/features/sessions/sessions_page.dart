@@ -9,6 +9,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/capability/platform_repository.dart';
 import '../../core/capability/platform_stream.dart';
 import '../../core/capability/sessions_repository.dart';
+import '../../core/design/app_tokens.dart';
 import '../../core/model/models.dart';
 import '../../core/store/connection_store.dart';
 import '../../core/transport/api_client.dart';
@@ -18,10 +19,7 @@ import '../chat/assistant_avatar.dart';
 import '../chat/chat_chrome.dart';
 import '../chat/chat_page.dart';
 import '../chat/message_view.dart';
-
-/// 活跃窗口：最后一条消息在 72 小时内的会话留在主列表，更早的收进「归档」。
-/// 时间基准是设备当前时间，由列表每次重建时重新计算（收到新消息就自动回到主列表）。
-const Duration activeWindow = Duration(days: 3);
+import 'session_logic.dart';
 
 class SessionsPage extends StatefulWidget {
   const SessionsPage({
@@ -82,9 +80,13 @@ class _SessionsPageState extends State<SessionsPage> {
   /// 已加载表最近一次对齐时间：流帧触发的 `/api/sessions` 补齐最多 5s 一次。
   DateTime? _loadedSyncedAt;
 
+  /// 活跃/归档切分的时间基准：挂载时取一次，列表开着期间不随重建漂移。
+  late final DateTime _mountedAt;
+
   @override
   void initState() {
     super.initState();
+    _mountedAt = DateTime.now();
     // 同实例取过一次就直接用，不等 WS 再回一遍；换实例后缓存自动作废。
     _bot = BotIdentity.profileFor(widget.connection.base);
     _botAvatar = BotIdentity.avatarFor(widget.connection.base);
@@ -358,7 +360,7 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   /// 会话名（插件名与原始 id）、平台、引擎、模型都要能搜到；不区分大小写。
-  bool _matches(_SessionRow row, String query) {
+  bool _matches(SessionRow row, String query) {
     final needle = query.toLowerCase();
     final session = row.session;
     final parsed = parseSessionTitle(row.title);
@@ -528,7 +530,7 @@ class _SessionsPageState extends State<SessionsPage> {
     }
   }
 
-  Future<void> _open(_SessionRow row) async {
+  Future<void> _open(SessionRow row) async {
     if (!mounted) return;
     // 立即反馈：手感 + 同步推路由。任何网络请求都放到详情页首帧之后，
     // 点击与可见响应之间不留空白等待。
@@ -559,7 +561,7 @@ class _SessionsPageState extends State<SessionsPage> {
     _syncLoaded(force: true);
   }
 
-  Future<void> _actions(_SessionRow row) async {
+  Future<void> _actions(SessionRow row) async {
     final session = row.session;
     if (session == null) {
       _toast('该会话尚未被 ChatLuna 加载，只能查看消息。');
@@ -582,7 +584,7 @@ class _SessionsPageState extends State<SessionsPage> {
             ),
             ListTile(
               leading: const Icon(Icons.delete_outline),
-              title: const Text('删除'),
+              title: const Text('从本地移除'),
               onTap: () => Navigator.pop(context, 'delete'),
             ),
           ],
@@ -615,8 +617,9 @@ class _SessionsPageState extends State<SessionsPage> {
       try {
         await _repo.delete(session.id);
         await _refresh();
+        _toast('已从本地移除；平台历史未删除，刷新后可能重新出现');
       } on ApiFailure catch (e) {
-        _toast('删除失败 ${e.code}');
+        _toast('移除失败 ${e.code}');
       }
     }
   }
@@ -747,21 +750,21 @@ class _SessionsPageState extends State<SessionsPage> {
 
   /// 列表全集：插件会话在前（每行可能挂着一份已加载会话），已加载但插件里没有的接在后面。
   /// 排序：运行中优先，其后按最后一条消息时间倒序。
-  List<_SessionRow> get _rows {
+  List<SessionRow> get _rows {
     final loadedByKey = <String, SessionSummary>{};
     for (final session in _loaded) {
       final key = normalizeConversationKey(session.id);
       if (key.isEmpty) continue;
       loadedByKey.putIfAbsent(key, () => session);
     }
-    final rows = <_SessionRow>[];
+    final rows = <SessionRow>[];
     for (final conversation in _conversations) {
       final key = conversation.key.trim();
       if (key.isEmpty) continue;
       final session = loadedByKey.remove(normalizeConversationKey(key));
       final last = conversation.last;
       rows.add(
-        _SessionRow(
+        SessionRow(
           // 原键给 `/api/platform/messages` 用；归一只用于和已加载会话、实时帧比较。
           key: key,
           title: conversation.title.isEmpty ? key : conversation.title,
@@ -776,7 +779,7 @@ class _SessionsPageState extends State<SessionsPage> {
     // 已加载但插件里没有的会话照旧列出（标题退回 App 侧的解析规则）。
     for (final session in loadedByKey.values) {
       rows.add(
-        _SessionRow(
+        SessionRow(
           key: normalizeConversationKey(session.id),
           title: parseSessionTitle(session.title).compact,
           subtitle: null,
@@ -794,24 +797,13 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   /// 一次遍历把行分成「活跃」与「归档」：运行中或最后一条消息在 [activeWindow] 内算活跃。
-  /// 时间基准是设备当前时间，每次重建重新算——收到新消息就自动回到主列表。
-  (List<_SessionRow>, List<_SessionRow>) _split() {
-    final now = DateTime.now();
-    final active = <_SessionRow>[];
-    final archived = <_SessionRow>[];
-    for (final row in _rows) {
-      if (row.running || now.difference(row.time) <= activeWindow) {
-        active.add(row);
-      } else {
-        archived.add(row);
-      }
-    }
-    return (active, archived);
-  }
+  /// 时间基准是挂载快照，列表开着期间不会因为流帧重建而漂移。
+  (List<SessionRow>, List<SessionRow>) _partition() =>
+      partitionSessions(_rows, now: _mountedAt);
 
   Widget _content() {
     if (_archiveOpen) return _archiveContent();
-    final (rows, archived) = _split();
+    final (rows, archived) = _partition();
     if (_loading && rows.isEmpty && archived.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -822,11 +814,10 @@ class _SessionsPageState extends State<SessionsPage> {
           title: '加载失败',
           message: _error!,
           tinted: true,
-          action: FilledButton.tonalIcon(
-            onPressed: () => _refresh(),
-            icon: const Icon(Icons.refresh, size: 18),
-            label: const Text('重试'),
-          ),
+          actionLabel: '重试',
+          actionIcon: Icons.refresh,
+          filled: true,
+          onAction: _refresh,
         );
       }
       // 主列表没有活跃会话，但归档里还有：给出明确的归档入口，而不是「暂无会话」。
@@ -835,22 +826,18 @@ class _SessionsPageState extends State<SessionsPage> {
           icon: Icons.inbox_outlined,
           title: '最近 ${activeWindow.inDays} 天没有活跃会话',
           message: '更早的 ${archived.length} 个会话已收进归档',
-          action: OutlinedButton.icon(
-            onPressed: _openArchive,
-            icon: const Icon(Icons.inventory_2_outlined, size: 18),
-            label: Text('查看归档 · ${archived.length}'),
-          ),
+          actionLabel: '查看归档 · ${archived.length}',
+          actionIcon: Icons.inventory_2_outlined,
+          onAction: _openArchive,
         );
       }
       return _StatusView(
         icon: Icons.forum_outlined,
         title: '暂无活跃会话',
         message: '去聊天软件发一条消息，再回来刷新',
-        action: OutlinedButton.icon(
-          onPressed: () => _refresh(),
-          icon: const Icon(Icons.refresh, size: 18),
-          label: const Text('刷新'),
-        ),
+        actionLabel: '刷新',
+        actionIcon: Icons.refresh,
+        onAction: _refresh,
       );
     }
     final query = _search.text.trim();
@@ -860,11 +847,9 @@ class _SessionsPageState extends State<SessionsPage> {
         icon: Icons.search_off,
         title: '没有匹配的会话',
         message: '换个关键词，或清空搜索查看全部活跃会话',
-        action: OutlinedButton.icon(
-          onPressed: _clearSearch,
-          icon: const Icon(Icons.backspace_outlined, size: 18),
-          label: const Text('清空搜索'),
-        ),
+        actionLabel: '清空搜索',
+        actionIcon: Icons.backspace_outlined,
+        onAction: _clearSearch,
       );
     }
     // 已加载会话是分页取的：列表走到末尾就补下一页，搜索要覆盖全部会话。
@@ -878,13 +863,15 @@ class _SessionsPageState extends State<SessionsPage> {
       for (final row in shown)
         if (!row.running) row,
     ];
+    // 时间标签一次算好传给每行：滚动时不会为每一行重新读设备时钟。
+    final now = DateTime.now();
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+      padding: const EdgeInsets.only(top: 4),
       children: [
         if (active.isNotEmpty) ...[
           _SectionHeader(label: '运行中会话', count: active.length, highlighted: true, topPadding: 8),
-          for (final row in active) _tile(row),
+          for (final row in active) _tile(row, now),
         ],
         if (rest.isNotEmpty) ...[
           _SectionHeader(
@@ -892,7 +879,7 @@ class _SessionsPageState extends State<SessionsPage> {
             count: rest.length,
             topPadding: active.isEmpty ? 8 : 12,
           ),
-          for (final row in rest) _tile(row),
+          for (final row in rest) _tile(row, now),
         ],
         // 归档入口固定在列表底部：弱化一行，与「运行中/其他」的分组头区分开。
         if (archived.isNotEmpty) _ArchiveEntry(count: archived.length, onTap: _openArchive),
@@ -903,25 +890,24 @@ class _SessionsPageState extends State<SessionsPage> {
 
   /// 归档子视图：列表样式完全复用会话行，只少了搜索与分组。
   Widget _archiveContent() {
-    final (_, rows) = _split();
+    final (_, rows) = _partition();
     if (rows.isEmpty) {
       return _StatusView(
         icon: Icons.inventory_2_outlined,
         title: '归档是空的',
         message: '超过 ${activeWindow.inDays} 天没有新消息的会话会出现在这里',
-        action: OutlinedButton.icon(
-          onPressed: _closeArchive,
-          icon: const Icon(Icons.arrow_back, size: 18),
-          label: const Text('返回会话'),
-        ),
+        actionLabel: '返回会话',
+        actionIcon: Icons.arrow_back,
+        onAction: _closeArchive,
       );
     }
+    final now = DateTime.now();
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+      padding: const EdgeInsets.only(top: 4),
       children: [
         _SectionHeader(label: '归档会话', count: rows.length, topPadding: 8),
-        for (final row in rows) _tile(row),
+        for (final row in rows) _tile(row, now),
         SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
       ],
     );
@@ -941,10 +927,11 @@ class _SessionsPageState extends State<SessionsPage> {
     setState(() => _archiveOpen = false);
   }
 
-  Widget _tile(_SessionRow row) => _SessionTile(
+  Widget _tile(SessionRow row, DateTime now) => _SessionTile(
     // 固定 key：实时帧引起的重排只移动元素，不会把手指下的 InkWell 重建掉。
     key: ValueKey(row.key),
     row: row,
+    now: now,
     // 会话头像只代表对方/群：插件给 `conversation.avatar` 就用它（相对路径补成绝对地址），
     // 缺了由 `_SessionTile` 按会话形态退回首字/图标占位——**不回退 bot 头像**
     // （那是助手自己，会把会话认错）。
@@ -954,63 +941,13 @@ class _SessionsPageState extends State<SessionsPage> {
   );
 }
 
-String _relativeTime(DateTime time) {
-  final now = DateTime.now();
+String _relativeTime(DateTime time, DateTime now) {
   final day = DateTime(time.year, time.month, time.day);
   final today = DateTime(now.year, now.month, now.day);
   final hm = '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
   if (day == today) return '今天 $hm';
   if (today.difference(day).inDays == 1) return '昨天 $hm';
   return '${time.month.toString().padLeft(2, '0')}-${time.day.toString().padLeft(2, '0')} $hm';
-}
-
-/// 列表一行：插件会话（[conversation]）与它可能对应的已加载会话（[session]）。
-/// 两者都有 = 已加载；只有 [conversation] = 插件有消息但 ChatLuna 还没加载它。
-class _SessionRow {
-  const _SessionRow({
-    required this.key,
-    required this.title,
-    required this.subtitle,
-    required this.count,
-    required this.time,
-    this.conversation,
-    this.session,
-  });
-
-  /// 插件侧的原始会话键：打开详情页时原样传给 `/api/platform/messages`（插件按它查表）。
-  /// 与已加载会话、实时帧比较时再走 `normalizeConversationKey`，不要在这里先归一。
-  final String key;
-
-  /// 展示名：插件给的 title；已加载但插件里没有的会话用 App 侧的紧凑名。
-  final String title;
-
-  /// 最后一条消息的正文（压成一行）；没有消息时为 null。
-  final String? subtitle;
-
-  /// 插件统计的消息条数。
-  final int count;
-
-  /// 最后一条消息的时间；没有消息时退回已加载会话的创建时间。
-  final DateTime time;
-  final PlatformConversation? conversation;
-  final SessionSummary? session;
-
-  bool get running => session?.running ?? false;
-
-  /// 群聊还是私聊：插件判定（`conversation.kind`）。没有插件会话（只存在于 App 侧）时按私聊处理，
-  /// 头像退回首字而不是群组图标。
-  bool get isGroup => conversation?.kind == 'group';
-
-  /// 没有最后一条消息时的副标题：已加载会话退回平台/引擎/模型，未加载就没有副标题。
-  String? get fallbackSubtitle {
-    final session = this.session;
-    if (session == null) return null;
-    return [
-      session.origin,
-      if (session.engine.isNotEmpty) session.engine,
-      if (session.model != null) session.model!.toString(),
-    ].join(' · ');
-  }
 }
 
 class _SectionHeader extends StatelessWidget {
@@ -1031,7 +968,7 @@ class _SectionHeader extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     return Padding(
-      padding: EdgeInsets.fromLTRB(12, topPadding, 12, 8),
+      padding: EdgeInsets.fromLTRB(20, topPadding, 20, 8),
       child: Row(
         children: [
           Text(
@@ -1078,10 +1015,10 @@ class _ArchiveEntry extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 8, 4, 0),
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.tile),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           child: Row(
@@ -1112,20 +1049,22 @@ class _ArchiveEntry extends StatelessWidget {
   }
 }
 
-/// 会话行：运行中的左侧留 2px 色条，标题最多两行，副标题是最后一条消息。
-/// 右侧是最后消息时间与插件的消息计数。
+/// 会话行：8dp 外边距的独立卡片；运行中时铺 `surface_l1`，左缘一条 `statusRunning` 竖条。
+/// 右侧是最后消息时间、运行灯（未加载不画）与未读计数。
 class _SessionTile extends StatelessWidget {
   const _SessionTile({
     super.key,
     required this.row,
+    required this.now,
     required this.avatarUrl,
     required this.onTap,
     required this.onLongPress,
   });
 
-  static const _runningDot = Color(0xFF22C55E);
+  final SessionRow row;
 
-  final _SessionRow row;
+  /// 时间标签的基准：列表一次算好传给每行，滚动时不会逐行读设备时钟。
+  final DateTime now;
 
   /// 会话头像（`conversation.avatar`）：null 或加载失败时按 [row] 的形态退回首字/图标占位。
   final String? avatarUrl;
@@ -1135,164 +1074,237 @@ class _SessionTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final colors = context.colors;
     final subtitle = row.subtitle ?? row.fallbackSubtitle;
     final showTime = row.time.millisecondsSinceEpoch > 0;
-    return Stack(
-      children: [
-        InkWell(
-          onTap: onTap,
-          onLongPress: onLongPress,
-          borderRadius: BorderRadius.circular(12),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-            child: Row(
-              children: [
-                ConversationAvatar(
-                  size: 36,
-                  imageUrl: avatarUrl,
-                  title: row.title,
-                  isGroup: row.isGroup,
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        row.title,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.titleSmall?.copyWith(
-                          height: 1.25,
-                          fontWeight: row.running ? FontWeight.w600 : FontWeight.w500,
-                        ),
-                      ),
-                      if (subtitle != null && subtitle.isNotEmpty) ...[
-                        const SizedBox(height: 3),
-                        Text(
-                          subtitle,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: scheme.onSurfaceVariant.withValues(alpha: 0.85),
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 88,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.end,
+    final previewStyle = TextStyle(
+      fontSize: 12,
+      height: 16 / 12,
+      letterSpacing: 0.2,
+      color: colors.textSecondary,
+    );
+    final captionStyle = TextStyle(
+      fontSize: 11,
+      height: 14 / 11,
+      letterSpacing: 0.3,
+      fontWeight: FontWeight.w500,
+      fontFeatures: const [FontFeature.tabularFigures()],
+      color: colors.textTertiary,
+    );
+    return Padding(
+      // 卡片之间留出 8/2 的外边距：列表背景上是一行行独立卡片，而不是无缝长条。
+      padding: const EdgeInsets.symmetric(horizontal: Space.x8, vertical: Space.x2),
+      child: Material(
+        // 运行中的行浮一层 surface_l1；普通行透明，与画布融为一体。
+        color: row.running ? colors.surfaceL1 : Colors.transparent,
+        borderRadius: BorderRadius.circular(Radii.tile),
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          children: [
+            InkWell(
+              onTap: onTap,
+              onLongPress: onLongPress,
+              highlightColor: colors.surfaceL3,
+              splashColor: colors.surfaceL3,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: Space.x12, vertical: 10),
+                child: Row(
+                  children: [
+                    ConversationAvatar(
+                      size: 40,
+                      imageUrl: avatarUrl,
+                      title: row.title,
+                      isGroup: row.isGroup,
+                    ),
+                    const SizedBox(width: Space.x8),
+                    Expanded(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          if (showTime)
-                            Flexible(
-                              child: Text(
-                                _relativeTime(row.time),
-                                maxLines: 1,
-                                softWrap: false,
-                                overflow: TextOverflow.fade,
-                                textAlign: TextAlign.end,
-                                style: theme.textTheme.labelSmall?.copyWith(
-                                  color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
-                                ),
-                              ),
+                          Text(
+                            row.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              fontWeight: FontWeight.w500,
+                              color: colors.textPrimary,
                             ),
-                          if (row.running) ...[
-                            const SizedBox(width: 6),
-                            Tooltip(
-                              message: '运行中',
-                              child: Container(
-                                width: 16,
-                                height: 16,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: _runningDot.withValues(alpha: 0.16),
-                                ),
-                                child: Container(
-                                  width: 7,
-                                  height: 7,
-                                  decoration: const BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: _runningDot,
+                          ),
+                          if (row.unloaded) ...[
+                            const SizedBox(height: Space.x4),
+                            Text.rich(
+                              TextSpan(
+                                children: [
+                                  TextSpan(
+                                    text: '未加载',
+                                    style: TextStyle(color: colors.textTertiary),
                                   ),
-                                ),
+                                  if (subtitle != null && subtitle.isNotEmpty)
+                                    TextSpan(text: ' · $subtitle'),
+                                ],
                               ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: previewStyle,
+                            ),
+                          ] else if (subtitle != null && subtitle.isNotEmpty) ...[
+                            const SizedBox(height: Space.x4),
+                            Text(
+                              subtitle,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: previewStyle,
                             ),
                           ],
                         ],
                       ),
-                      if (row.count > 0) ...[
-                        const SizedBox(height: 4),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                          decoration: BoxDecoration(
-                            color: scheme.surfaceContainerHighest.withValues(alpha: 0.8),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(
-                            '${row.count}',
-                            style: theme.textTheme.labelSmall?.copyWith(
-                              height: 1.4,
-                              fontWeight: FontWeight.w600,
-                              color: scheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: Space.x12),
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (showTime)
+                              Text(
+                                _relativeTime(row.time, now),
+                                maxLines: 1,
+                                softWrap: false,
+                                textAlign: TextAlign.end,
+                                style: captionStyle,
+                              ),
+                            // 未加载的会话不可能在跑：不画状态点，避免一个假绿点。
+                            if (row.running && !row.unloaded) ...[
+                              const SizedBox(width: 6),
+                              Tooltip(
+                                message: '运行中',
+                                child: Container(
+                                  width: 16,
+                                  height: 16,
+                                  alignment: Alignment.center,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: colors.statusRunning.withValues(alpha: 0.16),
+                                  ),
+                                  child: Container(
+                                    width: 6,
+                                    height: 6,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: colors.statusRunning,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        if (row.count > 0) ...[
+                          const SizedBox(height: Space.x4),
+                          Container(
+                            height: 18,
+                            alignment: Alignment.center,
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: colors.surfaceL3,
+                              borderRadius: BorderRadius.circular(Radii.pill),
+                            ),
+                            child: Text(
+                              '${row.count}',
+                              style: captionStyle.copyWith(color: colors.textSecondary),
                             ),
                           ),
-                        ),
+                        ],
                       ],
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
-          ),
-        ),
-        if (row.running)
-          Positioned(
-            left: 0,
-            top: 12,
-            bottom: 12,
-            child: Container(
-              width: 2,
-              decoration: BoxDecoration(
-                color: scheme.primary,
-                borderRadius: BorderRadius.circular(2),
               ),
             ),
-          ),
-      ],
+            // 竖条与右侧运行灯同色：都取 statusRunning，不再和主色打架。
+            if (row.running)
+              Positioned(
+                left: 0,
+                top: 18,
+                bottom: 18,
+                child: Container(
+                  width: 3,
+                  decoration: BoxDecoration(
+                    color: colors.statusRunning,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
 
-/// 空/错误共用的居中状态：一个图标、一句原因、一个动作，垂直居中且可下拉刷新。
+/// 空/错误共用的居中状态：56dp 圆底座、一句原因、一个 36dp 动作，垂直居中且可下拉刷新。
 class _StatusView extends StatelessWidget {
   const _StatusView({
     required this.icon,
     required this.title,
     required this.message,
-    required this.action,
+    required this.actionLabel,
+    required this.actionIcon,
+    required this.onAction,
     this.tinted = false,
+    this.filled = false,
   });
 
   final IconData icon;
   final String title;
   final String message;
-  final Widget action;
+
+  /// 动作按钮：36dp 高、8dp 圆角、16dp 图标，错误态用 tonal 实心以突出重试。
+  final String actionLabel;
+  final IconData actionIcon;
+  final VoidCallback onAction;
+
+  /// 错误态：图标换成 statusError，动作按钮用 tonal 变体。
   final bool tinted;
+  final bool filled;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final colors = context.colors;
+    final textStyle = const TextStyle(fontSize: 13, fontWeight: FontWeight.w500);
+    final shape = RoundedRectangleBorder(borderRadius: BorderRadius.circular(Radii.tile));
+    const padding = EdgeInsets.symmetric(horizontal: Space.x16);
+    final iconWidget = Icon(actionIcon, size: 16);
+    final label = Text(actionLabel);
+    final action = filled
+        ? FilledButton.tonalIcon(
+            onPressed: onAction,
+            icon: iconWidget,
+            label: label,
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, 36),
+              padding: padding,
+              shape: shape,
+              textStyle: textStyle,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          )
+        : OutlinedButton.icon(
+            onPressed: onAction,
+            icon: iconWidget,
+            label: label,
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size(0, 36),
+              padding: padding,
+              shape: shape,
+              textStyle: textStyle,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          );
     return LayoutBuilder(
       builder: (context, constraints) => ListView(
         physics: const AlwaysScrollableScrollPhysics(),
@@ -1301,45 +1313,49 @@ class _StatusView extends StatelessWidget {
             constraints: BoxConstraints(minHeight: constraints.maxHeight),
             child: Center(
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: Space.x20),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Container(
-                      width: 64,
-                      height: 64,
+                      width: 56,
+                      height: 56,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: tinted
-                            ? scheme.errorContainer.withValues(alpha: 0.45)
-                            : scheme.surfaceContainerHighest.withValues(alpha: 0.7),
+                        color: colors.surfaceL2,
                       ),
                       child: Icon(
                         icon,
-                        size: 26,
-                        color: tinted ? scheme.onErrorContainer : scheme.onSurfaceVariant,
+                        size: 28,
+                        color: tinted ? colors.statusError : colors.textTertiary,
                       ),
                     ),
-                    const SizedBox(height: 18),
+                    const SizedBox(height: Space.x16),
                     Text(
                       title,
                       textAlign: TextAlign.center,
-                      style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        height: 22 / 16,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: -0.2,
+                        color: colors.textPrimary,
+                      ),
                     ),
-                    const SizedBox(height: 6),
+                    const SizedBox(height: Space.x8),
                     ConstrainedBox(
                       constraints: const BoxConstraints(maxWidth: 300),
                       child: Text(
                         message,
                         textAlign: TextAlign.center,
-                        maxLines: 4,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: scheme.onSurfaceVariant,
+                        style: TextStyle(
+                          fontSize: 12,
+                          height: 1.4,
+                          letterSpacing: 0.2,
+                          color: colors.textSecondary,
                         ),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: Space.x20),
                     action,
                   ],
                 ),

@@ -7,11 +7,13 @@ import 'package:flutter/services.dart';
 import 'package:markdown_widget/markdown_widget.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../core/design/app_tokens.dart';
 import '../../core/model/models.dart';
 import 'assistant_avatar.dart';
+import 'message_logic.dart';
 
-/// 一条消息的渲染（bot 视角）：`dir=out` 是机器人自己的发言 → **右侧主色气泡**；
-/// `dir=in` 是其他人 → **左侧中性气泡**。两侧都走 markdown 与富媒体（图片缩略 + 全屏）。
+/// 一条消息的渲染（bot 视角）：`dir=out` 是机器人自己的发言 → **右侧外发气泡**；
+/// `dir=in` 是其他人 → **左侧接收气泡**。两侧都走 markdown 与富媒体（图片缩略 + 全屏）。
 /// 框架消息不参与左右布局，仍是居中的单卡片。
 ///
 /// 头像槽左右各留一份：`showHeader` 为 false 时留空占位，连续消息因此保持缩进对齐。
@@ -68,7 +70,7 @@ class MessageView extends StatelessWidget {
 
   static const double _avatarSize = 28;
   static const double _avatarGap = 8;
-  static const double _maxWidthRatio = 0.86;
+  static const double _maxWidthRatio = 0.82;
 
   @override
   Widget build(BuildContext context) {
@@ -81,7 +83,7 @@ class MessageView extends StatelessWidget {
     }
 
     // 有媒体时，正文只剩 `[图片]` 这类占位就是重复信息：媒体块已经把它表达完了。
-    final showBody = body.isNotEmpty && !(media.isNotEmpty && _placeholderOnly(body));
+    final showBody = body.isNotEmpty && !(media.isNotEmpty && isPlaceholderOnly(body));
 
     // 框架消息不参与左右布局：先短路，省掉整棵 markdown 构建。
     if (message.isFramework) {
@@ -95,12 +97,11 @@ class MessageView extends StatelessWidget {
       );
     }
 
-    // bot 自己的发言在右（主色底），其他人发言在左（中性底）。
+    // bot 自己的发言在右（外发底），其他人发言在左（接收底）。
     final outbound = !message.isUser;
-    final foreground = outbound ? scheme.onPrimary : scheme.onSurface;
-    final mutedForeground = outbound
-        ? scheme.onPrimary.withValues(alpha: 0.72)
-        : scheme.onSurfaceVariant.withValues(alpha: 0.75);
+    final colors = context.colors;
+    final foreground = outbound ? colors.bubbleOutText : colors.bubbleInText;
+    final mutedForeground = outbound ? colors.bubbleOutMuted : colors.bubbleInMuted;
 
     // bot 把 `chatluna` 的帮助清单发成一整段文本：排版成卡片，其余正文一律走原路径。
     final help = showBody ? CommandHelp.parse(body) : null;
@@ -159,15 +160,15 @@ class MessageView extends StatelessWidget {
       constraints: BoxConstraints(
         maxWidth: MediaQuery.sizeOf(context).width * _maxWidthRatio - (_avatarSize + _avatarGap),
       ),
-      margin: EdgeInsets.only(top: showHeader ? 2 : 0),
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 7),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
       decoration: BoxDecoration(
-        color: outbound ? scheme.primary : scheme.surfaceContainerHighest,
+        color: outbound ? colors.bubbleOutBg : colors.bubbleInBg,
+        border: Border.all(color: outbound ? colors.bubbleOutBorder : colors.bubbleInBorder),
         borderRadius: BorderRadius.only(
-          topLeft: Radius.circular(outbound ? 16 : 4),
-          topRight: Radius.circular(outbound ? 4 : 16),
-          bottomLeft: const Radius.circular(16),
-          bottomRight: const Radius.circular(16),
+          topLeft: Radius.circular(outbound ? Radii.bubble : Radii.bubbleTail),
+          topRight: Radius.circular(outbound ? Radii.bubbleTail : Radii.bubble),
+          bottomLeft: const Radius.circular(Radii.bubble),
+          bottomRight: const Radius.circular(Radii.bubble),
         ),
       ),
       child: Column(
@@ -177,7 +178,7 @@ class MessageView extends StatelessWidget {
           ...content,
           if (time != null || footnote != null)
             Padding(
-              padding: const EdgeInsets.only(top: 4),
+              padding: const EdgeInsets.only(top: 6),
               child: Align(
                 alignment: Alignment.centerRight,
                 child: Text(
@@ -186,9 +187,9 @@ class MessageView extends StatelessWidget {
                     ?footnote,
                   ].join(' · '),
                   style: theme.textTheme.labelSmall?.copyWith(
-                    fontSize: 10,
                     height: 1.2,
                     color: mutedForeground,
+                    fontFeatures: const [FontFeature.tabularFigures()],
                   ),
                 ),
               ),
@@ -200,15 +201,14 @@ class MessageView extends StatelessWidget {
     final name = senderName?.trim();
     final header = showHeader && name != null && name.isNotEmpty
         ? Padding(
-            padding: EdgeInsets.only(bottom: 3, left: outbound ? 0 : 3, right: outbound ? 3 : 0),
+            padding: const EdgeInsets.only(bottom: 4),
             child: Text(
               name,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: theme.textTheme.labelSmall?.copyWith(
-                fontSize: 11,
                 height: 1.2,
-                color: scheme.onSurfaceVariant,
+                color: colors.textSecondary,
               ),
             ),
           )
@@ -230,8 +230,8 @@ class MessageView extends StatelessWidget {
     );
 
     return Padding(
-      // 分组之间 16，同一发送者的连续消息之间 8。
-      padding: EdgeInsets.only(top: showHeader ? 16 : 8),
+      // 换人或超时后的第一条 16；同一发送者的连续消息 4。
+      padding: EdgeInsets.only(top: showHeader ? 16 : 4),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: outbound ? MainAxisAlignment.end : MainAxisAlignment.start,
@@ -385,9 +385,10 @@ class _Markdown extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final colors = context.colors;
     final color = foreground;
-    final textStyle = (theme.textTheme.bodyMedium?.copyWith(height: 1.55, color: color)) ??
-        TextStyle(fontSize: 15, height: 1.55, color: color);
+    final textStyle = (theme.textTheme.bodyMedium?.copyWith(height: 1.5, color: color)) ??
+        TextStyle(fontSize: 14, height: 1.5, color: color);
     return MarkdownWidget(
       data: data,
       shrinkWrap: true,
@@ -399,16 +400,17 @@ class _Markdown extends StatelessWidget {
             builder: (url, _) => _ChatImage(url: url, resolve: _resolve, headers: headers),
           ),
           PreConfig(
+            // 代码块：11sp 等宽、surface_l2 底、4dp 圆角。
             textStyle:
-                theme.textTheme.bodySmall?.copyWith(
+                theme.textTheme.labelSmall?.copyWith(
                   fontFamily: 'monospace',
                   height: 1.45,
                   color: color,
                 ) ??
-                TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.45, color: color),
+                TextStyle(fontFamily: 'monospace', fontSize: 11, height: 1.45, color: color),
             decoration: BoxDecoration(
-              color: color?.withValues(alpha: 0.12) ?? scheme.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(10),
+              color: colors.surfaceL2,
+              borderRadius: BorderRadius.circular(Radii.bar),
             ),
           ),
           LinkConfig(
@@ -572,19 +574,6 @@ bool _needsAuth(Uri base, Uri uri) =>
 Map<String, String> _authHeadersFor(Uri base, String raw, Map<String, String> headers) {
   final uri = _resolveAsset(base, _ChatImage._normalizeSource(raw));
   return _needsAuth(base, uri) ? headers : const <String, String>{};
-}
-
-/// 正文占位文案：插件在「没有文字、只有媒体」时写的就是这些。
-final RegExp _mediaPlaceholder = RegExp(
-  r'\[\s*(?:图片|照片|截图|视频|视频消息|语音|语音消息|音频|文件|表情|动画表情|贴图|贴纸|引用|卡片|小程序|未知消息)\s*\]',
-);
-final RegExp _placeholderPunctuation = RegExp(r'[\s\.,，。、;;；:：!！?？~～\-—_|*（）()【】\[\]]+');
-
-/// 去掉占位文案与标点后什么都不剩 = 正文本来只是媒体的旁白，跳过它。
-bool _placeholderOnly(String text) {
-  if (!_mediaPlaceholder.hasMatch(text)) return false;
-  final rest = text.replaceAll(_mediaPlaceholder, '').replaceAll(_placeholderPunctuation, '');
-  return rest.isEmpty;
 }
 
 class _ChatImage extends StatefulWidget {
@@ -1432,7 +1421,7 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final colors = context.colors;
     final notice = Notice.parse(widget.text);
     final open = _open;
     final openLines = notice.lines.length > _maxOpenLines
@@ -1440,31 +1429,42 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
         : notice.lines;
     final hidden = notice.lines.length - openLines.length;
     final paragraphs = Notice.paragraphs(openLines);
-    final titleStyle = theme.textTheme.labelSmall?.copyWith(
-      color: scheme.onSurfaceVariant,
-      height: 1.35,
-    );
-    final metaStyle = titleStyle?.copyWith(
-      fontSize: 10,
-      color: scheme.onSurfaceVariant.withValues(alpha: 0.65),
-    );
+    final titleStyle =
+        theme.textTheme.bodySmall?.copyWith(
+          fontWeight: FontWeight.w500,
+          color: colors.textPrimary,
+          height: 1.35,
+        ) ??
+        TextStyle(
+          fontSize: 12,
+          height: 1.35,
+          fontWeight: FontWeight.w500,
+          color: colors.textPrimary,
+        );
+    final metaStyle = theme.textTheme.labelSmall?.copyWith(color: colors.textTertiary);
     // 后缀：合并块先报条数（`· 2 条`），再报正文行数（`· 6 行`）。
     final meta = [
       if (widget.count > 1) '· ${widget.count} 条',
       notice.meta,
     ].where((part) => part.isNotEmpty).join(' ');
     final preview = Notice.preview(notice.lines, _previewLines);
-    final bodyStyle = _bodyStyle(theme);
-    return Align(
-      alignment: Alignment.center,
-      child: ConstrainedBox(
-        constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.86),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
+    final bodyStyle = _bodyStyle(theme, colors);
+    // 记忆类消息用 memory 图标，其余框架消息（wake / 工具 / 同步）用终端图标。
+    final icon = notice.tag.toLowerCase().contains('memory') ? Icons.memory : Icons.terminal;
+    return Padding(
+      // 上下各 6：卡片之间、卡片与气泡之间都只隔一道呼吸缝。
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Align(
+        alignment: Alignment.center,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.84),
           // 整块只有这一层卡片容器：头与正文共用同一张卡，不再有「居中胶囊 + 正文卡片」两层。
           child: Material(
-            color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
-            borderRadius: BorderRadius.circular(12),
+            color: colors.surfaceL1,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(Radii.card),
+              side: BorderSide(color: colors.borderSubtle),
+            ),
             clipBehavior: Clip.antiAlias,
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -1474,14 +1474,10 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
                 InkWell(
                   onTap: _toggle,
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
+                    padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
                     child: Row(
                       children: [
-                        Icon(
-                          Icons.subdirectory_arrow_right,
-                          size: 14,
-                          color: scheme.onSurfaceVariant,
-                        ),
+                        Icon(icon, size: 14, color: colors.textSecondary),
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
@@ -1499,7 +1495,7 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
                         Icon(
                           open ? Icons.expand_less : Icons.expand_more,
                           size: 16,
-                          color: scheme.onSurfaceVariant,
+                          color: colors.textTertiary,
                         ),
                       ],
                     ),
@@ -1507,34 +1503,33 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
                 ),
                 if (paragraphs.isNotEmpty)
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                    padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
                     child: open
                         ? Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               for (var i = 0; i < paragraphs.length; i++)
                                 Padding(
-                                  // 段间距 8；末尾还有「未展开」提示时最后一段也让出间距。
-                                  padding: EdgeInsets.only(
-                                    bottom: i < paragraphs.length - 1 || hidden > 0 ? 8 : 0,
-                                  ),
-                                  child: _paragraph(paragraphs[i], theme),
+                                  // 段间距 6。
+                                  padding: EdgeInsets.only(top: i > 0 ? 6 : 0),
+                                  child: _paragraph(paragraphs[i], theme, colors),
                                 ),
                               if (hidden > 0)
-                                Text(
-                                  '… 仅显示前 $_maxOpenLines 行，还有 $hidden 行未展开',
-                                  style: titleStyle,
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 6),
+                                  child: Text(
+                                    '… 仅显示前 $_maxOpenLines 行，还有 $hidden 行未展开',
+                                    style: metaStyle,
+                                  ),
                                 ),
                             ],
                           )
-                        // 折叠态：2 行预览，灰一档；超过 2 行由 `Notice.preview` 补 `…`。
+                        // 折叠态：2 行预览；超过 2 行由 `Notice.preview` 补 `…`。
                         : Text(
                             preview,
                             maxLines: _previewLines,
                             overflow: TextOverflow.ellipsis,
-                            style: bodyStyle.copyWith(
-                              color: scheme.onSurfaceVariant.withValues(alpha: 0.72),
-                            ),
+                            style: bodyStyle,
                           ),
                   ),
               ],
@@ -1545,29 +1540,34 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
     );
   }
 
-  TextStyle _bodyStyle(ThemeData theme) =>
-      theme.textTheme.bodySmall?.copyWith(
-        color: theme.colorScheme.onSurfaceVariant,
-        height: 1.5,
-      ) ??
-      TextStyle(fontSize: 12, height: 1.5, color: theme.colorScheme.onSurfaceVariant);
+  TextStyle _bodyStyle(ThemeData theme, AppColors colors) =>
+      theme.textTheme.bodySmall?.copyWith(color: colors.textSecondary, height: 1.5) ??
+      TextStyle(fontSize: 12, height: 1.5, color: colors.textSecondary);
 
-  TextStyle _monoStyle(ThemeData theme) =>
+  TextStyle _monoStyle(ThemeData theme, AppColors colors) =>
       theme.textTheme.labelSmall?.copyWith(
         fontFamily: 'monospace',
-        fontSize: 11,
         height: 1.45,
-        color: theme.colorScheme.onSurfaceVariant,
+        color: colors.textSecondary,
       ) ??
-      const TextStyle(fontFamily: 'monospace', fontSize: 11, height: 1.45);
+      TextStyle(fontFamily: 'monospace', fontSize: 11, height: 1.45, color: colors.textSecondary);
 
   /// 一段正文：整段 JSON 解析后按缩进等宽排，整段裸链接也等宽，其余走小号正文。
+  /// 等宽块自带 `surface_l2` 底与 4dp 圆角，与正文分开。
   /// 段内换行原样保留：`[memory update]` 的 `- [ch-03 …]` 列表行各占一行。
-  Widget _paragraph(String text, ThemeData theme) {
+  Widget _paragraph(String text, ThemeData theme, AppColors colors) {
     final json = Notice.prettyJson(text);
-    if (json != null) return SelectableText(json, style: _monoStyle(theme));
-    if (Notice.isUrlList(text)) return SelectableText(text, style: _monoStyle(theme));
-    return SelectableText(text, style: _bodyStyle(theme));
+    final mono = json ?? (Notice.isUrlList(text) ? text : null);
+    if (mono == null) return SelectableText(text, style: _bodyStyle(theme, colors));
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: colors.surfaceL2,
+        borderRadius: BorderRadius.circular(Radii.bar),
+      ),
+      child: SelectableText(mono, style: _monoStyle(theme, colors)),
+    );
   }
 }
 

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'core/design/app_tokens.dart';
 import 'core/store/connection_store.dart';
 import 'features/connect/connect_page.dart';
 import 'features/sessions/sessions_page.dart';
@@ -56,14 +57,61 @@ class _ChatLunaAppState extends State<ChatLunaApp> {
   }
 
   ThemeData _theme(Brightness brightness) {
-    final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF5B8DEF), brightness: brightness);
+    final colors = AppColors.of(brightness);
+    final scheme = ColorScheme.fromSeed(
+      seedColor: const Color(0xFF5B8DEF),
+      brightness: brightness,
+      surface: colors.canvas,
+      surfaceContainerLowest: colors.canvas,
+      surfaceContainerLow: colors.surfaceL1,
+      surfaceContainer: colors.surfaceL2,
+      surfaceContainerHigh: colors.surfaceL3,
+      onSurface: colors.textPrimary,
+      onSurfaceVariant: colors.textSecondary,
+      outline: colors.borderSubtle,
+      outlineVariant: colors.borderDivider,
+      primary: colors.accent,
+      onPrimary: const Color(0xFFFFFFFF),
+      primaryContainer: colors.bubbleOutBg,
+      onPrimaryContainer: colors.bubbleOutText,
+      error: colors.statusError,
+    );
+    TextStyle type(double size, double height, FontWeight weight,
+            {double spacing = 0, bool tabular = false}) =>
+        TextStyle(
+          fontSize: size,
+          height: height / size,
+          fontWeight: weight,
+          letterSpacing: spacing,
+          color: colors.textPrimary,
+          fontFeatures: tabular ? const [FontFeature.tabularFigures()] : null,
+        );
     return ThemeData(
       colorScheme: scheme,
       useMaterial3: true,
-      scaffoldBackgroundColor: brightness == Brightness.dark
-          ? const Color(0xFF0B0D10)
-          : const Color(0xFFF7F8FB),
-      inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder(), isDense: true),
+      scaffoldBackgroundColor: colors.canvas,
+      extensions: [colors],
+      textTheme: TextTheme(
+        titleMedium: type(16, 22, FontWeight.w600, spacing: -0.2),
+        bodyMedium: type(14, 21, FontWeight.w400, spacing: 0.1),
+        bodySmall: type(12, 16, FontWeight.w400, spacing: 0.2)
+            .copyWith(color: colors.textSecondary),
+        labelSmall: type(11, 14, FontWeight.w500, spacing: 0.3, tabular: true)
+            .copyWith(color: colors.textSecondary),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(Radii.tile),
+          borderSide: BorderSide(color: colors.borderSubtle),
+        ),
+        isDense: true,
+      ),
+      bottomSheetTheme: BottomSheetThemeData(
+        backgroundColor: colors.surfaceL2,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(Radii.sheet)),
+        ),
+      ),
     );
   }
 

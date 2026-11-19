@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../core/design/app_tokens.dart';
 import '../../core/model/models.dart';
 import '../../core/transport/state_socket.dart';
 import 'assistant_avatar.dart';
@@ -121,19 +122,19 @@ class ChatTitle extends StatelessWidget {
   }
 }
 
-/// 信息栏常驻状态灯：四种状态共用同一枚胶囊（[_PillSurface]，22dp 高、圆角 20），
+/// 信息栏常驻状态灯：四种状态共用同一枚胶囊（[_PillSurface]，24dp 高、999 圆角），
 /// 只有圆点颜色与底色档位随状态变化，呼吸动画只在 [StatusLight.thinking] 时挂载。
 enum StatusLight {
-  /// 待机：`onSurfaceVariant` 静态点，中性底色 —— 与模型胶囊同一块底，安静但不消失。
+  /// 待机：`textTertiary` 静态点 + 中性底色，文字 `textSecondary` —— 安静但不消失。
   idle('待机'),
 
-  /// 思考中：主色圆点呼吸。
+  /// 思考中：`accent@12%` 底 + `accent@30%` 描边，主色圆点 1100ms 呼吸。
   thinking('思考中'),
 
-  /// 回复中：主色静态圆点，不抢正文的注意力。
+  /// 回复中：与思考中同一块底与描边，主色静态实心圆点，不抢正文的注意力。
   replying('回复中'),
 
-  /// 轮询中：`/live` 掉线，3s 轮询接管；错误色静态点。
+  /// 轮询中：`/live` 掉线，3s 轮询接管；`statusError@12%` 底 + 静态错误色点。
   polling('轮询中');
 
   const StatusLight(this.label);
@@ -174,9 +175,9 @@ class ChatInfoBar extends StatelessWidget {
     final name = botName?.trim();
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.fromLTRB(16, 1, 16, 5),
+      padding: const EdgeInsets.fromLTRB(Space.x16, Space.x4, Space.x16, Space.x8),
       child: Row(
-        spacing: 6,
+        spacing: _PillSurface.gap,
         children: [
           if (name != null && name.isNotEmpty)
             _InfoPill(
@@ -224,14 +225,14 @@ class ChatUnloadedBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final colors = context.colors;
     final name = botName?.trim() ?? '';
     final platform = origin.trim();
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.fromLTRB(16, 1, 16, 5),
+      padding: const EdgeInsets.fromLTRB(Space.x16, Space.x4, Space.x16, Space.x8),
       child: Row(
-        spacing: 6,
+        spacing: _PillSurface.gap,
         children: [
           if (name.isNotEmpty)
             _InfoPill(
@@ -247,11 +248,11 @@ class ChatUnloadedBar extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               spacing: _PillSurface.gap,
               children: [
-                _Dot(color: scheme.onSurfaceVariant),
+                _Dot(color: colors.textTertiary),
                 Text(
                   '未加载',
                   maxLines: 1,
-                  style: _pillLabelStyle(context, scheme.onSurfaceVariant),
+                  style: _pillLabelStyle(context, colors.textSecondary),
                 ),
               ],
             ),
@@ -331,10 +332,11 @@ enum _PillTone {
   alert,
 }
 
-/// 胶囊内文字：11px / 行高 1.2 / 字距 0.2，颜色由调用方按档位给定。
+/// 胶囊内文字：统一走主题的 `labelSmall`（11sp / 行高 14 / 字距 0.3 / 等宽数字），
+/// 只由调用方给定颜色。
 TextStyle _pillLabelStyle(BuildContext context, Color color) {
   final base = Theme.of(context).textTheme.labelSmall ?? const TextStyle();
-  return base.copyWith(fontSize: 11, height: 1.2, letterSpacing: 0.2, color: color);
+  return base.copyWith(color: color);
 }
 
 /// 信息栏里不带状态的胶囊：bot 名（可带头像）、平台/引擎/计时、模型。
@@ -353,7 +355,7 @@ class _InfoPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final colors = context.colors;
     return _PillSurface(
       onTap: onTap,
       child: Row(
@@ -362,11 +364,11 @@ class _InfoPill extends StatelessWidget {
         children: [
           ?leading,
           if (icon case final iconData?)
-            Icon(iconData, size: 13, color: scheme.onSurfaceVariant),
+            Icon(iconData, size: 13, color: colors.textSecondary),
           Text(
             label,
             maxLines: 1,
-            style: _pillLabelStyle(context, scheme.onSurfaceVariant),
+            style: _pillLabelStyle(context, colors.textSecondary),
           ),
         ],
       ),
@@ -375,7 +377,7 @@ class _InfoPill extends StatelessWidget {
 }
 
 /// 常驻状态灯：与模型胶囊同款底座 + 圆点 + 文案。
-/// 底色档位与圆点颜色随状态变化；只有「思考中」挂呼吸动画，其余状态是静态圆点。
+/// 底色档位、圆点与文字颜色随状态变化；只有「思考中」挂呼吸动画，其余状态是静态圆点。
 class _StatusPill extends StatelessWidget {
   const _StatusPill({required this.light});
 
@@ -383,19 +385,23 @@ class _StatusPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final colors = context.colors;
     final (Color dot, Color foreground, _PillTone tone) = switch (light) {
       StatusLight.idle => (
-        scheme.onSurfaceVariant,
-        scheme.onSurfaceVariant,
+        colors.textTertiary,
+        colors.textSecondary,
         _PillTone.neutral,
       ),
       StatusLight.thinking || StatusLight.replying => (
-        scheme.primary,
-        scheme.primary,
+        colors.accent,
+        colors.accent,
         _PillTone.accent,
       ),
-      StatusLight.polling => (scheme.error, scheme.error, _PillTone.alert),
+      StatusLight.polling => (
+        colors.statusError,
+        colors.statusError,
+        _PillTone.alert,
+      ),
     };
     return Semantics(
       label: '状态：${light.label}',
@@ -425,10 +431,9 @@ class _StatusPill extends StatelessWidget {
 /// 阶段明细：本轮总耗时 + 最近完成的几段。阶段可以并行（draw 与 reply 同时跑），
 /// 所以各自耗时之和可以超过整轮——这里只解释「刚才在干什么」。
 Future<void> showTurnPhases(BuildContext context, TurnClockView view) {
-  return showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    builder: (context) => _TurnPhasesSheet(view: view),
+  return _showChromeSheet<void>(
+    context,
+    (context) => _TurnPhasesSheet(view: view),
   );
 }
 
@@ -440,46 +445,33 @@ class _TurnPhasesSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final colors = context.colors;
     final mono = theme.textTheme.bodyMedium?.copyWith(
+      color: colors.textPrimary,
       fontFeatures: const [FontFeature.tabularFigures()],
     );
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+    return _SheetFrame(
+      title: '本轮 ${formatElapsed(view.total)}',
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(Space.x16, 0, Space.x16, Space.x16),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '本轮 ${formatElapsed(view.total)}',
-                    style: theme.textTheme.titleMedium,
-                  ),
-                ),
-                IconButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  icon: const Icon(Icons.close),
-                  tooltip: '关闭',
-                ),
-              ],
-            ),
             Text(
               view.phase == null ? '已完成' : '当前 ${view.phase}',
-              style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+              style: theme.textTheme.labelSmall?.copyWith(color: colors.textSecondary),
             ),
-            const SizedBox(height: 6),
+            const SizedBox(height: Space.x8),
             if (view.recent.isEmpty)
               Text(
                 '还没有完成的阶段',
-                style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                style: theme.textTheme.bodyMedium?.copyWith(color: colors.textSecondary),
               )
             else
               for (final group in aggregatePhases(view.recent))
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  padding: const EdgeInsets.symmetric(vertical: Space.x8),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -493,16 +485,16 @@ class _TurnPhasesSheet extends StatelessWidget {
                         Text(
                           group.spans.map(formatElapsed).join(' · '),
                           style: theme.textTheme.labelSmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
+                            color: colors.textSecondary,
                           ),
                         ),
                     ],
                   ),
                 ),
-            const SizedBox(height: 8),
+            const SizedBox(height: Space.x8),
             Text(
               '阶段可能并行：各自耗时之和可以超过整轮。',
-              style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+              style: theme.textTheme.labelSmall?.copyWith(color: colors.textTertiary),
             ),
           ],
         ),
@@ -545,7 +537,7 @@ class _PulseDotState extends State<_PulseDot> with SingleTickerProviderStateMixi
     duration: const Duration(milliseconds: 1100),
   )..repeat(reverse: true);
 
-  late final Animation<double> _opacity = Tween<double>(begin: 0.28, end: 1).animate(
+  late final Animation<double> _opacity = Tween<double>(begin: 0.35, end: 1).animate(
     CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
   );
 
@@ -561,7 +553,7 @@ class _PulseDotState extends State<_PulseDot> with SingleTickerProviderStateMixi
   }
 }
 
-/// 信息栏所有胶囊的唯一底座：固定 22dp 高、圆角 20、内边距 8/4/10/4、无描边，
+/// 信息栏所有胶囊的唯一底座：固定 24dp 高、999 圆角、内边距 8/4、1px `borderSubtle` 描边，
 /// 底色只由 [_PillTone] 决定。模型胶囊、开发者信息胶囊、状态灯都走这里，
 /// 所以并排不会出现两套尺寸。
 class _PillSurface extends StatelessWidget {
@@ -572,18 +564,19 @@ class _PillSurface extends StatelessWidget {
   });
 
   /// 胶囊总高（含上下各 4dp 内边距）。
-  static const double height = 22;
+  static const double height = 24;
 
   /// 内容可用高度 = [height] − 上下内边距，头像/图标按它对齐。
-  static const double contentHeight = 14;
+  static const double contentHeight = height - Space.x4 * 2;
 
-  /// 圆角：小尺寸胶囊统一取 20（视觉上接近胶囊形）。
-  static const double radius = 20;
+  /// 圆角：完整胶囊形。
+  static const double radius = Radii.pill;
 
   /// 圆点/图标/头像与文字之间的间距。
-  static const double gap = 5;
+  static const double gap = Space.x4;
 
-  static const EdgeInsets padding = EdgeInsets.fromLTRB(8, 4, 10, 4);
+  static const EdgeInsets padding =
+      EdgeInsets.symmetric(horizontal: Space.x8, vertical: Space.x4);
 
   final Widget child;
   final _PillTone tone;
@@ -591,25 +584,36 @@ class _PillSurface extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final fill = switch (tone) {
-      _PillTone.neutral => scheme.surfaceContainerHighest.withValues(alpha: 0.6),
-      _PillTone.accent => scheme.primary.withValues(alpha: 0.12),
-      _PillTone.alert => scheme.errorContainer.withValues(alpha: 0.3),
+    final colors = context.colors;
+    final (Color fill, Color border) = switch (tone) {
+      _PillTone.neutral => (colors.surfaceL2, colors.borderSubtle),
+      _PillTone.accent => (
+        colors.accent.withValues(alpha: 0.12),
+        colors.accent.withValues(alpha: 0.30),
+      ),
+      _PillTone.alert => (
+        colors.statusError.withValues(alpha: 0.12),
+        colors.statusError.withValues(alpha: 0.30),
+      ),
     };
+    final shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(radius),
+      side: BorderSide(color: border, width: 1),
+    );
     return Material(
       color: fill,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.all(Radius.circular(radius)),
-      ),
+      shape: shape,
       clipBehavior: Clip.antiAlias,
       child: InkWell(
-        onTap: onTap,
-        customBorder: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.all(Radius.circular(radius)),
-        ),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: height),
+        onTap: onTap == null
+            ? null
+            : () {
+                HapticFeedback.selectionClick();
+                onTap!();
+              },
+        customBorder: shape,
+        child: SizedBox(
+          height: height,
           child: Padding(
             padding: padding,
             child: child,
@@ -620,13 +624,11 @@ class _PillSurface extends StatelessWidget {
   }
 }
 
-/// 完整原名 + ID / 平台 / 引擎 / 模型，每行点击即复制。
+/// 完整原名 + ID / 平台 / 引擎 / 模型，每行右侧一键复制（值文本可选中）。
 Future<void> showSessionDetails(BuildContext context, SessionSummary session) {
-  return showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    isScrollControlled: true,
-    builder: (context) => _SessionDetailsSheet(session: session),
+  return _showChromeSheet<void>(
+    context,
+    (context) => _SessionDetailsSheet(session: session),
   );
 }
 
@@ -638,50 +640,40 @@ class _SessionDetailsSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final colors = context.colors;
     final model = session.model;
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 0, 12, 12),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
+    final valueStyle = theme.textTheme.bodyMedium?.copyWith(
+      color: colors.textPrimary,
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+    return _SheetFrame(
+      title: '会话详情',
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.only(bottom: Space.x12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(Space.x16, 0, Space.x16, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(child: Text('会话详情', style: theme.textTheme.titleMedium)),
-                  IconButton(
-                    onPressed: () => Navigator.of(context).pop(),
-                    icon: const Icon(Icons.close),
-                    tooltip: '关闭',
+                  Text(
+                    '完整名称',
+                    style: theme.textTheme.bodySmall?.copyWith(color: colors.textSecondary),
                   ),
+                  const SizedBox(height: Space.x4),
+                  SelectableText(session.title, style: valueStyle),
                 ],
               ),
-              Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: Text(
-                  '完整名称',
-                  style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
-                ),
-              ),
-              const SizedBox(height: 2),
-              Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: SelectableText(
-                  session.title,
-                  style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Divider(height: 1, color: scheme.outlineVariant.withValues(alpha: 0.5)),
-              _CopyRow(label: '会话 ID', value: session.id),
-              _CopyRow(label: '平台', value: session.origin),
-              if (session.engine.isNotEmpty) _CopyRow(label: '引擎', value: session.engine),
-              if (model != null) _CopyRow(label: '模型', value: model.toString()),
-            ],
-          ),
+            ),
+            const SizedBox(height: Space.x12),
+            Divider(height: 1, thickness: 1, color: colors.borderDivider),
+            _CopyRow(label: '会话 ID', value: session.id),
+            _CopyRow(label: '平台', value: session.origin),
+            if (session.engine.isNotEmpty) _CopyRow(label: '引擎', value: session.engine),
+            if (model != null) _CopyRow(label: '模型', value: model.toString()),
+          ],
         ),
       ),
     );
@@ -722,39 +714,122 @@ class _CopyRowState extends State<_CopyRow> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    return InkWell(
-      onTap: _copy,
-      borderRadius: BorderRadius.circular(8),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 64,
-              child: Text(
-                widget.label,
-                style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+    final colors = context.colors;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: Space.x16, vertical: 10),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 72,
+            child: Text(
+              widget.label,
+              style: theme.textTheme.bodySmall?.copyWith(color: colors.textSecondary),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              widget.value,
+              maxLines: 2,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: colors.textPrimary,
+                fontFeatures: const [FontFeature.tabularFigures()],
               ),
             ),
-            Expanded(
-              child: Text(
-                widget.value,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall,
+          ),
+          const SizedBox(width: Space.x8),
+          SizedBox(
+            width: 32,
+            height: 32,
+            child: IconButton(
+              onPressed: _copy,
+              padding: EdgeInsets.zero,
+              iconSize: 16,
+              visualDensity: VisualDensity.compact,
+              tooltip: _copied ? '已复制' : '复制',
+              icon: Icon(
+                _copied ? Icons.check : Icons.copy_rounded,
+                size: 16,
+                color: _copied ? colors.statusRunning : colors.textTertiary,
               ),
             ),
-            const SizedBox(width: 8),
-            Icon(
-              _copied ? Icons.check : Icons.copy_rounded,
-              size: 16,
-              color: _copied
-                  ? scheme.primary
-                  : scheme.onSurfaceVariant.withValues(alpha: 0.6),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 弹层统一外框：`surfaceL2` 底、16dp 顶部圆角，拖拽手柄与标题栏由 [_SheetFrame] 画。
+Future<T?> _showChromeSheet<T>(BuildContext context, WidgetBuilder builder) {
+  return showModalBottomSheet<T>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: context.colors.surfaceL2,
+    clipBehavior: Clip.antiAlias,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(Radii.sheet)),
+    ),
+    builder: builder,
+  );
+}
+
+/// 弹层头部：32×4 拖拽手柄（上下各 8）+ 标题栏（16,4,8,12）+ 32×32 关闭按钮。
+class _SheetFrame extends StatelessWidget {
+  const _SheetFrame({required this.title, required this.child});
+
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = context.colors;
+    return SafeArea(
+      top: false,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: Space.x8),
+            child: Center(
+              child: Container(
+                width: 32,
+                height: Radii.bar,
+                decoration: BoxDecoration(
+                  color: colors.borderSubtle,
+                  borderRadius: BorderRadius.circular(Radii.bar / 2),
+                ),
+              ),
             ),
-          ],
-        ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(Space.x16, Space.x4, Space.x8, Space.x12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    style: theme.textTheme.titleMedium?.copyWith(color: colors.textPrimary),
+                  ),
+                ),
+                SizedBox(
+                  width: 32,
+                  height: 32,
+                  child: IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    padding: EdgeInsets.zero,
+                    iconSize: 18,
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '关闭',
+                    icon: Icon(Icons.close, size: 18, color: colors.textSecondary),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Flexible(child: child),
+        ],
       ),
     );
   }

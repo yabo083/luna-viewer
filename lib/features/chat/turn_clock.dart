@@ -281,13 +281,6 @@ class TurnPhaseLog {
     _done.clear();
   }
 
-  /// 用权威数据整体替换已完成阶段（传入顺序：最新在前）。
-  void replace(List<TurnPhaseRecord> phases) {
-    _done
-      ..clear()
-      ..addAll(phases.take(_phaseHistory).toList().reversed);
-  }
-
   /// 最近的阶段，最新在前。
   List<TurnPhaseRecord> get recent =>
       List<TurnPhaseRecord>.unmodifiable(_done.reversed);
@@ -468,20 +461,6 @@ class TurnClock {
     for (final name in _phases.activeNames.toList(growable: false)) {
       if (!_toolPhases.contains(name)) _phases.leave(now, name);
     }
-    _publish();
-  }
-
-  /// 用引擎侧的权威计时覆盖本轮读数（webui 轨迹视图同源）。
-  ///
-  /// [phases] 最新在前；只在本轮已收表时生效，未收表（还在跑）不打断实时读数。
-  void adoptExact({
-    required Duration total,
-    required List<TurnPhaseRecord> phases,
-  }) {
-    final start = _start;
-    if (start == null || _end == null) return;
-    _end = start + total;
-    _phases.replace(phases);
     _publish();
   }
 

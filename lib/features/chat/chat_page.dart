@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../../core/capability/platform_repository.dart';
 import '../../core/capability/platform_stream.dart';
 import '../../core/capability/sessions_repository.dart';
+import '../../core/design/app_tokens.dart';
 import '../../core/model/models.dart';
 import 'assistant_avatar.dart';
 import 'chat_chrome.dart';
@@ -216,7 +216,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 一次「turn」可能由多个 attempt/round 组成（异步工具会让引擎开新的一轮）：
   /// 脚注要按 turn 汇总，而不是按我们自己的 round 切。
   final List<String> _turnOutboundIds = <String>[];
-  Timer? _adoptTimer;
 
   /// 在跑的工具调用：`callId → 阶段名`。`tool-result` 按 callId 精确配对，
   /// 同名工具重试或与前一步的「思考」并存时不会关错段。
@@ -323,18 +322,52 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _foreground = state == AppLifecycleState.resumed;
     if (_foreground) {
-      _ensurePolling();
       // 回前台按真实墙钟重算：后台那段也算进本轮（用户离开 3 秒但实际过了 30 秒）。
       _clock.resume();
+      _ensurePolling();
       // 回前台立刻补一拍，不等下一个 3s；`/live` 掉了也在这里接回来。
       if (_pollTimer != null) unawaited(_pollTick());
-      if (_loaded) _restartLive();
+      // 后台被显式掐断的三路流在这里按需重建。三个 `_start*` 都有「已启动」闸门，
+      // 所以 inactive→resumed 这类没经过 paused 的切换不会叠出第二条订阅。
+      if (_loaded) {
+        _startLive();
+        _startEvents();
+      }
+      _startStream();
     } else {
-      // 切后台只停 tick：没有屏幕可看，定时器不该继续空转，时钟本身不停。
+      // 切后台：没有屏幕可看，定时器不该继续空转，时钟本身不停。
       _clock.suspend();
       _stopProbe();
       _stopPolling();
+      // paused 时三路 SSE 必须断开：后台广播帧会持续唤醒主 isolate 解析 JSON。
+      if (state == AppLifecycleState.paused) _pauseStreams();
     }
+  }
+
+  /// 切后台：显式断开 `/live`、`/events`、平台流，并把启动闸门复位。
+  /// 只置空订阅不够——不复位闸门，回前台的重建会被「已启动」判断直接跳过。
+  void _pauseStreams() {
+    _liveSub?.cancel();
+    _liveSub = null;
+    _liveStarted = false;
+    _snapshotTimer?.cancel();
+    _snapshotTimer = null;
+    _liveRetryTimer?.cancel();
+    _liveRetryTimer = null;
+    _eventsSub?.cancel();
+    _eventsSub = null;
+    _eventsStarted = false;
+    _eventsRetry?.cancel();
+    _eventsRetry = null;
+    _streamSub?.cancel();
+    _streamSub = null;
+    _stream?.dispose();
+    _stream = null;
+    // 流断了，后台也不该再排重连/补帧：回来时由 resumed 分支重建。
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _streaming.clear();
+    _streamingText.value = '';
   }
 
   @override
@@ -355,7 +388,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _liveSub?.cancel();
     _eventsSub?.cancel();
     _eventsRetry?.cancel();
-    _adoptTimer?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
     _snapshotTimer?.cancel();
@@ -851,6 +883,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 插件实时流：服务端不做订阅过滤，这里按会话键丢弃别的会话。
   /// 详情页只拿到 `ApiClient.authHeaders`，从同一个头里取回 token 自建客户端。
   void _startStream() {
+    // 回前台会重走这里；已有订阅就不再开第二条（PlatformStream 自己不带幂等）。
+    if (_streamSub != null) return;
     final token = _bearer;
     if (token == null || token.isEmpty) return;
     final stream = PlatformStream(widget.base, token);
@@ -1093,15 +1127,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         );
   }
 
-  /// 重建 `/live`：手机切网或长时间待机后，旧连接常常收不到 FIN，
-  /// 客户端只看到「一直很安静」——重开一条拿新快照，比等心跳超时快也更确定。
-  void _restartLive() {
-    _liveSub?.cancel();
-    _liveSub = null;
-    _liveStarted = false;
-    _startLive();
-  }
-
   /// `/live` 掉线：轮询接管状态，9s 后再试一次流。
   /// 轮询的停止条件与探测共用一张表：页面不可见、或流重新接上（snapshot）即停。
   void _liveDown() {
@@ -1252,8 +1277,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       // 新的一轮：用轮次序号判断，不能靠「读数还很小」（会漏判/误判）。
       if (view.round != _skeletonRound) {
         _skeletonRound = view.round;
-        _adoptTimer?.cancel();
-        _adoptTimer = null;
         _outboundInRound = false;
         _roundOutboundIds.clear();
         _openToolCalls.clear();
@@ -1265,15 +1288,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (_skeleton == _SkeletonPhase.none && !_outboundInRound) _startSkeleton();
       return;
     }
-    // 先拿引擎的权威计时（轨迹视图同源）校正总时长与各工具耗时，再盖脚注。
-    // 脚注先按本地钟落定（一轮一套读数，用户看到的就是他等的时间）。
+    // 脚注直接用本地钟 `view.total` 盖印：它覆盖网络往返与用户真实等待的整段，
+    // 不再回拉全量日志用引擎 timing 校正（那一步的收益远小于反序列化开销）。
     if (_stampTurnEnd(view)) setState(() {});
-    // 引擎的 `timing` 只用来校正阶段耗时：稍后拉日志替换 phase 明细。
-    _adoptTimer?.cancel();
-    _adoptTimer = Timer(const Duration(seconds: 2), () {
-      _adoptTimer = null;
-      unawaited(_adoptTiming());
-    });
     if (_skeleton == _SkeletonPhase.running) _endSkeleton(view);
   }
 
@@ -1289,61 +1306,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     setState(() => _skeleton = _SkeletonPhase.running);
     // 只在插入时滚一次；之后不因 tick 滚动。
     if (_nearBottom) _scrollToLatest();
-  }
-
-  /// 从会话日志的 `meta.timing` 取权威计时（与 webui 轨迹视图同源）。
-  ///
-  /// - 总时长 = 本轮所有回复里最早的 `startedAt` → 最晚的 `endedAt`；
-  /// - 工具耗时 = `tool-call` block 对应的 `timing.blocks[index]` 区间，涵盖真实执行。
-  Future<void> _adoptTiming() async {
-    final session = _session;
-    if (session == null) return;
-    try {
-      final transcript = await widget.repo.transcript(session.id);
-      // 只校正「阶段」：总时长仍用本地钟（它跨 attempt，覆盖用户真正等的整段），
-      // 引擎的 `timing` 按 turn 切分，直接拿来当总时长会因为后台轮次而偏小。
-      final view = _clock.view.value;
-      if (view == null) return;
-      final windowMs = view.total.inMilliseconds + 10000;
-      final cutoff = DateTime.now().millisecondsSinceEpoch - windowMs;
-      final phases = <TurnPhaseRecord>[];
-      for (final message in transcript.messages) {
-        final timing = message.meta?['timing'];
-        if (timing is! Map) continue;
-        final started = timing['startedAt'];
-        if (started is! num || started < cutoff) continue;
-        final spans = timing['blocks'];
-        if (spans is! List) continue;
-        final byIndex = <Object?, Map>{
-          for (final span in spans)
-            if (span is Map) span['index']: span,
-        };
-        for (var i = 0; i < message.blocks.length; i++) {
-          final block = message.blocks[i];
-          if (block.type != 'tool-call') continue;
-          final span = byIndex[i];
-          final name = block.data['toolName'];
-          if (span == null || name is! String) continue;
-          final a = span['startedAt'];
-          final b = span['endedAt'];
-          if (a is! num || b is! num || b < a) continue;
-          phases.add(
-            TurnPhaseRecord(
-              normalizeTurnPhase(name),
-              Duration(milliseconds: b.toInt() - a.toInt()),
-            ),
-          );
-        }
-      }
-      if (phases.isNotEmpty) {
-        _clock.adoptExact(
-          total: view.total,
-          phases: phases.reversed.toList(growable: false),
-        );
-      }
-    } catch (_) {
-      // 拿不到权威数据就保留实时读数，脚注照盖。
-    }
   }
 
   void _endSkeleton(TurnClockView view) {
@@ -1642,7 +1604,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 列表末格：骨架气泡（灰条占位 + 描边上的计时标签 + 中止后的重新发送）。
   /// 只有标签自己监听 [_clock]，tick 不动列表、不重建页面。
-  Widget _skeletonBubble(ThemeData theme) => _SkeletonBubble(
+  Widget _skeletonBubble() => _SkeletonBubble(
     clock: _clock.view,
     aborted: _skeletonAborted,
     fading: _skeleton == _SkeletonPhase.fading,
@@ -1777,31 +1739,19 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
                 : _error != null && messages.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          _error!,
-                          style: TextStyle(color: theme.colorScheme.error),
-                        ),
-                        const SizedBox(height: 12),
-                        FilledButton(onPressed: _load, child: const Text('重试')),
-                      ],
-                    ),
+                ? _StatusView(
+                    icon: Icons.cloud_off_outlined,
+                    title: '加载失败',
+                    message: _error!,
+                    error: true,
+                    actionLabel: '重试',
+                    onAction: _load,
                   )
                 : items.isEmpty && _live == LiveState.idle
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 32),
-                      child: Text(
-                        '插件还没有这个会话的消息',
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
+                ? const _StatusView(
+                    icon: Icons.chat_bubble_outline,
+                    title: '还没有消息',
+                    message: '插件还没有这个会话的消息',
                   )
                 : ListView.builder(
                     controller: _scroll,
@@ -1817,7 +1767,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                     itemBuilder: (context, index) {
                       // 反向列表：index 0 是最新（屏幕最下方）。
                       if (skeleton == 1) {
-                        if (index == 0) return _skeletonBubble(theme);
+                        if (index == 0) return _skeletonBubble();
                         index -= 1;
                       }
                       if (slot == 1) {
@@ -1830,6 +1780,102 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                   ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 空态/错误态共用的居中状态：圆底座图标、标题、说明与可选动作。
+/// 样式对齐规格 B.6；只在本文件内复用，不改会话列表页的实现。
+class _StatusView extends StatelessWidget {
+  const _StatusView({
+    required this.icon,
+    required this.title,
+    required this.message,
+    this.error = false,
+    this.actionLabel,
+    this.onAction,
+  });
+
+  final IconData icon;
+  final String title;
+  final String message;
+
+  /// 错误态：图标换成 `statusError`。
+  final bool error;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = context.colors;
+    final actionLabel = this.actionLabel;
+    final onAction = this.onAction;
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: colors.surfaceL2,
+              ),
+              child: Icon(
+                icon,
+                size: 28,
+                color: error ? colors.statusError : colors.textTertiary,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: colors.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 300),
+              child: Text(
+                message,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  fontSize: 12,
+                  height: 1.4,
+                  color: colors.textSecondary,
+                ),
+              ),
+            ),
+            if (actionLabel != null && onAction != null) ...[
+              const SizedBox(height: 20),
+              OutlinedButton.icon(
+                onPressed: onAction,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: Text(actionLabel),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size(0, 36),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(Radii.tile),
+                  ),
+                  textStyle: theme.textTheme.labelMedium?.copyWith(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -1865,12 +1911,9 @@ class _SkeletonBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final colors = context.colors;
     final screen = MediaQuery.sizeOf(context).width;
-    final width = math.min(
-      screen * 0.6,
-      screen * 0.86 - (_avatarSize + _avatarGap),
-    );
+    final width = screen * 0.62;
     return AnimatedSize(
       duration: const Duration(milliseconds: 160),
       curve: Curves.easeOut,
@@ -1896,11 +1939,10 @@ class _SkeletonBubble extends StatelessWidget {
                           width: width,
                           padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
                           decoration: BoxDecoration(
-                            color: scheme.surfaceContainerHighest.withValues(
-                              alpha: 0.3,
-                            ),
+                            color: colors.skeletonBg,
                             border: Border.all(
-                              color: scheme.primary.withValues(alpha: 0.38),
+                              color: colors.skeletonBorder,
+                              width: 1,
                             ),
                             borderRadius: const BorderRadius.only(
                               topLeft: Radius.circular(16),
@@ -1912,12 +1954,14 @@ class _SkeletonBubble extends StatelessWidget {
                           child: const _SkeletonBars(),
                         ),
                         Positioned(
-                          top: -7,
+                          top: -8,
                           left: 12,
                           // 标签底色取聊天区底色，才能把 1px 描边压断。
                           child: Container(
                             color: theme.scaffoldBackgroundColor,
-                            padding: const EdgeInsets.symmetric(horizontal: 5),
+                            // 固定最小宽度：`9.9s→10.0s` 或阶段名切换时不挤动骑缝位置。
+                            constraints: const BoxConstraints(minWidth: 96),
+                            padding: const EdgeInsets.symmetric(horizontal: 6),
                             child: ValueListenableBuilder<TurnClockView?>(
                               valueListenable: clock,
                               builder: (context, view, _) => Text(
@@ -1926,9 +1970,10 @@ class _SkeletonBubble extends StatelessWidget {
                                     : turnLineLabel(view, aborted: aborted),
                                 maxLines: 1,
                                 style: theme.textTheme.labelSmall?.copyWith(
-                                  fontSize: 11.5,
+                                  fontSize: 11,
                                   height: 1.2,
-                                  color: scheme.onSurfaceVariant,
+                                  fontWeight: FontWeight.w600,
+                                  color: colors.accent,
                                   fontFeatures: const [
                                     FontFeature.tabularFigures(),
                                   ],
@@ -1941,16 +1986,21 @@ class _SkeletonBubble extends StatelessWidget {
                     ),
                     if (aborted && canResend)
                       Padding(
-                        padding: const EdgeInsets.only(top: 2),
+                        padding: const EdgeInsets.only(top: 4),
                         child: TextButton.icon(
                           onPressed: onResend,
-                          icon: const Icon(Icons.refresh, size: 16),
+                          icon: const Icon(Icons.refresh, size: 14),
                           // 走的是 `POST /steer`（把原文追加进会话继续跑），不是平台的「发送消息」。
                           label: const Text('重发这条'),
                           style: TextButton.styleFrom(
-                            visualDensity: VisualDensity.compact,
+                            minimumSize: const Size(0, 28),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                             padding: const EdgeInsets.symmetric(horizontal: 8),
-                            textStyle: theme.textTheme.labelMedium,
+                            foregroundColor: colors.statusWarning,
+                            textStyle: theme.textTheme.labelSmall?.copyWith(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                            ),
                           ),
                         ),
                       ),
@@ -1991,9 +2041,9 @@ class _SkeletonBarsState extends State<_SkeletonBars>
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final base = scheme.onSurfaceVariant.withValues(alpha: 0.14);
-    final highlight = scheme.onSurfaceVariant.withValues(alpha: 0.34);
+    final colors = context.colors;
+    final base = colors.shimmerBase;
+    final highlight = colors.shimmerLit;
     return AnimatedBuilder(
       animation: _controller,
       builder: (context, _) {
@@ -2003,9 +2053,9 @@ class _SkeletonBarsState extends State<_SkeletonBars>
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _bar(base, highlight, head, at, widthFactor: 1),
-            const SizedBox(height: 7),
-            _bar(base, highlight, head, at, widthFactor: 0.62),
+            _bar(base, highlight, head, at, widthFactor: 1.0),
+            const SizedBox(height: 8),
+            _bar(base, highlight, head, at, widthFactor: 0.60),
           ],
         );
       },
@@ -2022,9 +2072,9 @@ class _SkeletonBarsState extends State<_SkeletonBars>
     alignment: Alignment.centerLeft,
     widthFactor: widthFactor,
     child: Container(
-      height: 9,
+      height: 8,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(4),
         gradient: LinearGradient(
           colors: [base, highlight, base],
           stops: [at(head - 0.35), at(head), at(head + 0.35)],
@@ -2046,7 +2096,6 @@ class _DayDivider extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     final diff = today.difference(day).inDays;
@@ -2057,24 +2106,23 @@ class _DayDivider extends StatelessWidget {
         '${day.year}-${day.month.toString().padLeft(2, '0')}-'
             '${day.day.toString().padLeft(2, '0')}',
     };
+    final colors = context.colors;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHighest.withValues(alpha: 0.65),
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Text(
-            label,
-            style: theme.textTheme.labelSmall?.copyWith(
-              fontSize: 11,
-              height: 1.2,
-              color: scheme.onSurfaceVariant,
+      padding: const EdgeInsets.symmetric(vertical: Space.x12),
+      child: Row(
+        children: [
+          Expanded(child: Divider(height: 1, color: colors.borderDivider)),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: Space.x8),
+            child: Text(
+              label,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: colors.textTertiary,
+              ),
             ),
           ),
-        ),
+          Expanded(child: Divider(height: 1, color: colors.borderDivider)),
+        ],
       ),
     );
   }
