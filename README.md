@@ -13,7 +13,7 @@
 服务端需要一个 ChatLuna v2 实例；平台消息与控制接口由仓库内插件 `packages/chatluna-plugin-media-bridge` 提供：
 
 ```bash
-npm install -g chatluna-plugin-media-bridge   # 或从源码 file:// 引用
+npm install -g chatluna-plugin-media-bridge@0.1.0   # 或从源码 file:// 引用
 ```
 
 在实例 `chatluna.yml` 里加一个插件节点指向它，重启后 `/api/platform/*` 生效（详见插件 README）。
