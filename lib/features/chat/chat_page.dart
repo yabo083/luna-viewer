@@ -291,12 +291,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 没有 callId 的老帧：按先进先出配对。
   final List<String> _openToolNames = <String>[];
 
-  /// 已经拿到 `tool-result` 的调用 id：settle 时仍没有结果的，就是被转到后台去了。
-  final Set<String> _resultToolCalls = <String>{};
-
-  /// 已经播报过「转入后台」的工具（`round:name`）：一次调用只提示一次。
-  final Set<String> _notifiedBackground = <String>{};
-
   /// 平台流先到消息说明这一轮要开始了：`/live` 若在这之后一帧不发（手机切网后常见的
   /// 半死连接），就用服务端的 `running` 兜底——只看服务端怎么说，不猜阶段。
   Timer? _probeDelay;
@@ -993,23 +987,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     return last?.add(anchorTick) ?? DateTime.now();
   }
 
-  /// 本地合成一条框架块：服务端没有对应 mark 时用（例如工具被转到后台）。
-  /// 时间锚在「最近一条平台消息之后 1ms」，与本机时钟无关——否则它会越过
-  /// 已经到达但时戳偏早的 bot 气泡，看起来时序错乱。
-  void _pushFrameworkNotice(String text) {
-    final id = 'local-${DateTime.now().microsecondsSinceEpoch}';
-    if (!_frameworkIds.add(id)) return;
-    setState(() {
-      _setFramework(
-        orderNotices([
-          ..._framework,
-          TimelineNotice(id: id, text: text, time: _afterLatest()),
-        ]),
-      );
-    });
-    _followIfAtBottom();
-  }
-
   /// `/events` 增量：mark 驱动计时，消息只收框架类。平台 `stream` 才是消息本体。
   /// 等日志 head 到手再订阅：不带游标的重放会让上一轮的 mark 变成这一轮的起点。
   void _startEvents() {
@@ -1119,11 +1096,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
     final message = event.message;
     if (message == null) return;
-    for (final block in message.blocks) {
-      if (block.type != 'tool-result') continue;
-      final callId = block.data['toolCallId'];
-      if (callId is String && callId.isNotEmpty) _resultToolCalls.add(callId);
-    }
     // `tool-result` 落库只说明模型拿到了返回值；异步工具（draw）的产物还在路上。
     // 阶段不在这里关：等模型下一步真的开始（reasoning / prompt / text）再关，
     // 这样 draw 的耗时覆盖到「图片生成完、模型接着说话」为止。
@@ -1407,21 +1379,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 // 落库的那条由 `platform/stream` 送来，这里不重取历史。
                 // 一次 attempt 结束只收阶段，**不是**整轮终点：投递与后续 step 还可能在跑。
                 _snapshotTimer?.cancel();
-                // 还开着、却已经 settle 的工具 = 引擎把它转到了后台：
-                // 在中间块说明一句，用户才知道这一轮为什么"没声了"。
-                final backgrounded = <String>{
-                  for (final entry in _openToolCalls.entries)
-                    if (!_resultToolCalls.contains(entry.key) &&
-                        entry.value != replyPhase)
-                      entry.value,
-                }..removeWhere(
-                  (name) => !_notifiedBackground.add('$_skeletonRound:$name'),
-                );
-                if (backgrounded.isNotEmpty) {
-                  _pushFrameworkNotice(
-                    '[${backgrounded.join('、')} 转入后台执行，完成后会回来告诉你]',
-                  );
-                }
+                // 转后台不在这里猜：同步工具也是先 settle 再执行，客户端无从判断。
+                // 真正的后台任务完成时，服务端自己会发 `[background …]` 中间块。
                 _clock.attemptSettled();
                 _flushTimer?.cancel();
                 _flushTimer = null;
@@ -1646,8 +1605,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _roundOutboundIds.clear();
         _openToolCalls.clear();
         _openToolNames.clear();
-        _resultToolCalls.clear();
-        _notifiedBackground.clear();
         // 计时表已开表说明这一轮真的在跑：`/live` 还没发话也先亮「思考中」。
         // 每个轮次只清一次——settle 之后 `_setLive(idle)` 会把它收掉，
         // tick 不能反复点灯，否则投递等待期里状态灯会一直闪回「思考中」。
