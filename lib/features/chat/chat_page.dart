@@ -35,6 +35,22 @@ enum LiveState {
   };
 }
 
+/// 信息栏状态灯的唯一判定：
+/// - `/live` 给了阶段就按阶段显示（思考/回复优先级最高）；
+/// - `/live` 还没出声，但本轮计时表已开表、或入站消息后 6s 无帧 → 乐观的「思考中」；
+/// - 再退到「轮询中」，最后才是「待机」。
+/// 中止按钮不看这里（它只认计时表与 [LiveState]），乐观亮灯不会放开 Stop。
+StatusLight statusLightFor({
+  required LiveState live,
+  required bool optimisticThinking,
+  required bool polling,
+}) {
+  if (live != LiveState.idle) return live.statusLight;
+  if (optimisticThinking) return StatusLight.thinking;
+  if (polling) return StatusLight.polling;
+  return StatusLight.idle;
+}
+
 /// 会话详情：消息**只来自插件**，`/api/sessions*` 只提供已加载会话的状态与操作。
 /// v0.1.0 不在 App 里发消息——平台会话的输入仍由聊天软件承担。
 class ChatPage extends StatefulWidget {
@@ -216,6 +232,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   StreamSubscription<PlatformEvent>? _streamSub;
 
   LiveState _live = LiveState.idle;
+
+  /// 乐观的「思考中」：入站消息后 6s 没有 `/live` 帧时先亮灯，探测/真实帧到达再回落。
+  /// 只影响状态灯，不改 [_live]——中止按钮的可用性判定不跟着变。
+  bool _optimisticThinking = false;
+
+  /// `/live` 是否已经对当前这一段给出「没在生成」的结论（无 attempt 的快照、settled、
+  /// 轮询读到 running=false）。计时表在跑但它为真时，状态灯按「停了」回落。
+  bool _liveSettled = true;
+
+  /// 服务端已把会话卸载（`/live`、`/events`、`/messages` 回 404）：本页就地降级成
+  /// 「未加载」，不再自动重连或重登。要恢复只能返回列表重新打开（重新查一次加载态）。
+  bool _sessionGone = false;
 
   /// 中止请求在途：按钮暂时置灰，避免连点发出两次 cancel。
   bool _cancelling = false;
@@ -472,7 +500,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// - 页面不可见（App 后台 / 被别的路由盖住）→ 停表；
   /// - 已加载且流在线 → 停表。
   void _ensurePolling() {
-    final needed = !_authFailed && _foreground && _routeVisible && (!_loaded || _polling);
+    final needed =
+        !_authFailed &&
+        !_sessionGone &&
+        _foreground &&
+        _routeVisible &&
+        (!_loaded || _polling);
     if (needed) {
       _pollTimer ??= Timer.periodic(
         _pollInterval,
@@ -499,7 +532,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       final match = await _lookupSession();
       if (!mounted) return;
       if (!_loaded) {
-        if (match != null) _attach(match);
+        // 404 降级后不再自动重挂：服务端的 `/api/sessions` 可能还会短暂列出它，
+        // 重挂只会再撞一次 404，来回刷提示。
+        if (match != null && !_sessionGone) _attach(match);
         return;
       }
       // 已加载、`/live` 不在线：只能从 `running` 判断有没有在生成，
@@ -547,8 +582,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _probeDelay = null;
       final last = _lastLiveAt;
       if (!mounted || (last != null && last.isAfter(armedAt))) return;
+      // 6s 一帧都没有：先亮「思考中」（乐观），探测读到 running=false 再回落。
+      // 等首个 HTTP 返回才亮灯，网络差时会白白空着十几秒。
+      _markOptimisticThinking();
       _startProbe();
     });
+  }
+
+  /// 计时表/入站消息已经说明这一轮在跑，但 `/live` 还没发话：状态灯先亮「思考中」。
+  void _markOptimisticThinking() {
+    if (_live != LiveState.idle || _optimisticThinking || !mounted) return;
+    setState(() => _optimisticThinking = true);
   }
 
   void _startProbe() {
@@ -633,10 +677,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   }
 
   /// `/live` 不掉线时，状态灯的第四种「轮询中」由这里接管。
-  StatusLight get _statusLight {
-    // 有生成在跑就优先报实际阶段——这是 App 的核心信息，不能被兜底模式盖掉。
-    if (_live != LiveState.idle) return _live.statusLight;
-    return _polling ? StatusLight.polling : StatusLight.idle;
+  StatusLight get _statusLight => statusLightFor(
+    live: _live,
+    optimisticThinking: _optimisticThinking || _clockActiveForLight,
+    polling: _polling,
+  );
+
+  /// 本轮计时表已开表（读数非空且未收表），而 `/live` 还没有说「停了」：
+  /// 状态灯据此先亮「思考中」，不再等迟到十几秒的首个 active 快照。
+  bool get _clockActiveForLight {
+    final view = _clock.view.value;
+    return view != null && !view.finished && !_liveSettled;
   }
 
   /// 列表页没拿到 bot 身份时补一次：`adapters.bots` 全进程只取一次（见 [BotIdentity]）。
@@ -708,6 +759,51 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  /// 服务端把会话卸载了（`/live`、`/events`、`/messages` 都回 404 `NOT_FOUND`）：
+  /// 就地降级成「未加载」——收起信息栏状态灯与中止/菜单、清掉实时流与计时，
+  /// 只提示一次。不重连、不重登：404 不会自己恢复，继续退避只会反复撞同一个错。
+  /// 也不重启 3s 探测：服务端在这段时间里仍可能把会话列在 `/api/sessions`，
+  /// 重挂只会再撞一次 404。返回列表重新打开会重新问一次加载态。
+  void _handleSessionUnloaded() {
+    if (!mounted || _session == null) return;
+    _sessionGone = true;
+    _liveStarted = false;
+    _liveSub?.cancel();
+    _liveSub = null;
+    _liveIdleTimer?.cancel();
+    _liveIdleTimer = null;
+    _snapshotTimer?.cancel();
+    _snapshotTimer = null;
+    _liveRetryTimer?.cancel();
+    _liveRetryTimer = null;
+    _eventsStarted = false;
+    _eventsSub?.cancel();
+    _eventsSub = null;
+    _eventsRetry?.cancel();
+    _eventsRetry = null;
+    _eventsIdleTimer?.cancel();
+    _eventsIdleTimer = null;
+    _truncatedRefresh?.cancel();
+    _truncatedRefresh = null;
+    _runningCheck?.cancel();
+    _runningCheck = null;
+    _stopProbe();
+    _stopPolling();
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _streaming.clear();
+    _streamingText.value = '';
+    // 会话已经不在服务端：本轮不可能再有投递，计时表按「停止」收尾。
+    _clock.stopped();
+    _snapshotSeen = false;
+    _polling = false;
+    _optimisticThinking = false;
+    _liveSettled = true;
+    _live = LiveState.idle;
+    setState(() => _session = null);
+    _toast('会话已在服务端卸载');
   }
 
   /// 错误页/HTML 正文不进 UI：只给稳定的短文案，原正文留在 ApiFailure 里供调试。
@@ -859,7 +955,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       });
     } on ApiFailure catch (e) {
       // 框架块只是补充：拿不到就只显示平台消息，不弹错；401 仍要收敛。
-      if (e.isUnauthorized) _handleAuthFailure();
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      } else if (e.isNotFound) {
+        // `/api/sessions/:id/messages` 404：会话在服务端已被卸载，别再伪装成已加载。
+        _handleSessionUnloaded();
+      }
     } catch (_) {
       // 坏字段同样只影响框架块，不影响平台消息。
     } finally {
@@ -939,9 +1040,16 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             _eventsSub = null;
             _eventsIdleTimer?.cancel();
             _eventsIdleTimer = null;
-            if (error is ApiFailure && error.isUnauthorized) {
-              _handleAuthFailure();
-              return;
+            if (error is ApiFailure) {
+              if (error.isUnauthorized) {
+                _handleAuthFailure();
+                return;
+              }
+              // 会话日志都 404 了：会话已被卸载，退避重连没有意义。
+              if (error.isNotFound) {
+                _handleSessionUnloaded();
+                return;
+              }
             }
             _restartEvents();
           },
@@ -1334,9 +1442,16 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           onError: (Object error) {
             if (!mounted) return;
             // 401 不重连：token 不会自己恢复，交给页面提示重新连接。
-            if (error is ApiFailure && error.isUnauthorized) {
-              _handleAuthFailure();
-              return;
+            if (error is ApiFailure) {
+              if (error.isUnauthorized) {
+                _handleAuthFailure();
+                return;
+              }
+              // 404 = 服务端把这个会话的 agent 卸了：再连也只会一直 404。
+              if (error.isNotFound) {
+                _handleSessionUnloaded();
+                return;
+              }
             }
             // `/live` 断了就没法知道具体阶段：退回 3s 轮询读 running，
             // 信息栏显示「轮询中」，消息仍由平台流补上。
@@ -1395,10 +1510,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 唯一的写入口：相同状态不触发重建。本轮计时由 turn_start/终点事件单独驱动，
   /// 这里只在「有生成在跑」时保证表已经走起来（`running=true` 也是一种起点）。
+  /// `/live` 的任何结论（阶段帧、settled、无 attempt 的快照）都盖掉乐观亮灯。
   void _setLive(LiveState next) {
-    if (_live == next) return;
-    if (next.generating) _clock.start();
-    setState(() => _live = next);
+    final wasOptimistic = _optimisticThinking;
+    final settled = next == LiveState.idle;
+    final settledChanged = _liveSettled != settled;
+    _optimisticThinking = false;
+    _liveSettled = settled;
+    if (_live != next) {
+      if (next.generating) _clock.start();
+      setState(() => _live = next);
+    } else if ((wasOptimistic || settledChanged) && mounted) {
+      // `_live` 没变，但状态灯从乐观的「思考中」回到了真实状态，需要重画。
+      setState(() {});
+    }
   }
 
   // ---------------------------------------------------------------- 本轮计时
@@ -1523,11 +1648,21 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _openToolNames.clear();
         _resultToolCalls.clear();
         _notifiedBackground.clear();
+        // 计时表已开表说明这一轮真的在跑：`/live` 还没发话也先亮「思考中」。
+        // 每个轮次只清一次——settle 之后 `_setLive(idle)` 会把它收掉，
+        // tick 不能反复点灯，否则投递等待期里状态灯会一直闪回「思考中」。
+        _liveSettled = false;
       }
       // 本轮已经出过真实气泡：不再补骨架（等 running=false 收表即可）。
       if (_skeleton == _SkeletonPhase.none && !_outboundInRound) _startSkeleton();
       return;
     }
+    // 收表：乐观亮灯到此为止，状态灯回到真实状态（之后由 `/live` 的 idle 维持）。
+    final wasOptimistic = _optimisticThinking;
+    final settledChanged = !_liveSettled;
+    _optimisticThinking = false;
+    _liveSettled = true;
+    if ((wasOptimistic || settledChanged) && mounted) setState(() {});
     // 脚注直接用本地钟 `view.total` 盖印：它覆盖网络往返与用户真实等待的整段，
     // 不再回拉全量日志用引擎 timing 校正（那一步的收益远小于反序列化开销）。
     if (_stampTurnEnd(view)) setState(() {});
@@ -1929,8 +2064,16 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     fading: _skeleton == _SkeletonPhase.fading,
     canResend: _skeletonResend != null,
     onResend: _resend,
+    onShowPhases: _showTurnPhases,
     avatarUrl: _botAvatar,
   );
+
+  /// 打开本轮阶段明细：读的是点下去那一刻的读数，不是列表构建时的旧值。
+  void _showTurnPhases() {
+    final view = _clock.view.value;
+    if (view == null || !mounted) return;
+    unawaited(showTurnPhases(context, view));
+  }
 
   /// 列表首格：流式正文。只有这一格监听 delta，整页不随 token 重建。
   /// 阶段与耗时由末尾的骨架气泡承担，这里不再画「思考中」胶囊。
@@ -2047,6 +2190,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
               debugMetrics: _debugMetrics(),
               showDeveloperInfo: widget.showDeveloperInfo,
               onModelTap: _pickModel,
+              turnClock: _clock.view,
+              onTurnPhases: (view) => unawaited(showTurnPhases(context, view)),
             )
           else
             ChatUnloadedBar(
@@ -2209,6 +2354,7 @@ class _SkeletonBubble extends StatelessWidget {
     required this.fading,
     required this.canResend,
     this.onResend,
+    this.onShowPhases,
     this.avatarUrl,
   });
 
@@ -2222,6 +2368,7 @@ class _SkeletonBubble extends StatelessWidget {
 
   final bool canResend;
   final VoidCallback? onResend;
+  final VoidCallback? onShowPhases;
   final String? avatarUrl;
 
   static const double _avatarSize = 28;
@@ -2275,30 +2422,10 @@ class _SkeletonBubble extends StatelessWidget {
                         Positioned(
                           top: -8,
                           left: 12,
-                          // 标签底色取聊天区底色，才能把 1px 描边压断。
-                          child: Container(
-                            color: theme.scaffoldBackgroundColor,
-                            // 固定最小宽度：`9.9s→10.0s` 或阶段名切换时不挤动骑缝位置。
-                            constraints: const BoxConstraints(minWidth: 96),
-                            padding: const EdgeInsets.symmetric(horizontal: 6),
-                            child: ValueListenableBuilder<TurnClockView?>(
-                              valueListenable: clock,
-                              builder: (context, view, _) => Text(
-                                view == null
-                                    ? ''
-                                    : turnLineLabel(view, aborted: aborted),
-                                maxLines: 1,
-                                style: theme.textTheme.labelSmall?.copyWith(
-                                  fontSize: 11,
-                                  height: 1.2,
-                                  fontWeight: FontWeight.w600,
-                                  color: colors.accent,
-                                  fontFeatures: const [
-                                    FontFeature.tabularFigures(),
-                                  ],
-                                ),
-                              ),
-                            ),
+                          child: TurnClockLabel(
+                            clock: clock,
+                            aborted: aborted,
+                            onTap: onShowPhases,
                           ),
                         ),
                       ],

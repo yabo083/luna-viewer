@@ -16,6 +16,9 @@ class ApiFailure implements Exception {
   bool get isNetwork => code == 'NETWORK';
   bool get isTimeout => code == 'TIMEOUT';
 
+  /// 资源不存在：会话被服务端卸载/删除后 `/live`、`/events`、`/messages` 都回 404。
+  bool get isNotFound => code == 'NOT_FOUND' || status == 404;
+
   @override
   String toString() => '$code: $message';
 }

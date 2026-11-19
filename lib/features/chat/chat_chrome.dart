@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -153,6 +154,8 @@ class ChatInfoBar extends StatelessWidget {
     this.debugMetrics = const [],
     this.showDeveloperInfo = false,
     this.onModelTap,
+    this.turnClock,
+    this.onTurnPhases,
   });
 
   final SessionSummary session;
@@ -168,6 +171,11 @@ class ChatInfoBar extends StatelessWidget {
   /// 轮询状态不在这里：它由常驻状态灯始终显示。
   final bool showDeveloperInfo;
   final VoidCallback? onModelTap;
+
+  /// 本轮计时表（骨架同一个 notifier）：有读数时信息栏多一枚可点的耗时胶囊，
+  /// 骨架撤场后仍能从信息栏翻看本轮/上一轮的阶段明细。
+  final ValueListenable<TurnClockView?>? turnClock;
+  final ValueChanged<TurnClockView>? onTurnPhases;
 
   @override
   Widget build(BuildContext context) {
@@ -203,6 +211,8 @@ class ChatInfoBar extends StatelessWidget {
               onTap: onModelTap,
             ),
           _StatusPill(light: light),
+          if (turnClock case final clock? when clock.value != null)
+            _TurnPill(clock: clock, onTap: onTurnPhases),
           if (showDeveloperInfo)
             for (final metric in debugMetrics) _InfoPill(label: metric),
         ],
@@ -422,6 +432,104 @@ class _StatusPill extends StatelessWidget {
               style: _pillLabelStyle(context, foreground),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 信息栏里的本轮耗时胶囊：读数由计时表自己刷新，整页不随 tick 重建。
+/// 点开就是阶段明细——骨架撤场后仍能回看这一轮花在了哪些阶段。
+class _TurnPill extends StatelessWidget {
+  const _TurnPill({required this.clock, this.onTap});
+
+  final ValueListenable<TurnClockView?> clock;
+  final ValueChanged<TurnClockView>? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<TurnClockView?>(
+      valueListenable: clock,
+      builder: (context, view, _) => view == null
+          ? const SizedBox.shrink()
+          : _InfoPill(
+              label: turnLineLabel(view),
+              icon: Icons.timer_outlined,
+              onTap: onTap == null ? null : () => onTap!(view),
+            ),
+    );
+  }
+}
+
+/// 骨架气泡骑缝上的计时标签：视觉尺寸与位置都不变（11sp 等宽数字、贴边压描边），
+/// 命中区按 Material 的最小触控高度向气泡内部扩——点开本轮的阶段明细。
+class TurnClockLabel extends StatelessWidget {
+  const TurnClockLabel({
+    super.key,
+    required this.clock,
+    this.aborted = false,
+    this.onTap,
+  });
+
+  /// 标签顶端比气泡边框高 8dp，命中区落在气泡内的部分仍有 44dp。
+  static const double tapHeight = 52;
+
+  final ValueListenable<TurnClockView?> clock;
+
+  /// 本轮被中止：标签换成「已中止 12.4s」。
+  final bool aborted;
+
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = context.colors;
+    final style = theme.textTheme.labelSmall?.copyWith(
+      fontSize: 11,
+      height: 1.2,
+      fontWeight: FontWeight.w600,
+      color: colors.accent,
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap == null
+          ? null
+          : () {
+              HapticFeedback.selectionClick();
+              onTap!();
+            },
+      child: SizedBox(
+        height: tapHeight,
+        child: Align(
+          alignment: Alignment.topLeft,
+          // 只留标签自己的宽度：整条气泡宽的透明热区会把别处的点击也吃掉。
+          widthFactor: 1,
+          child: Container(
+            // 标签底色取聊天区底色，才能把 1px 描边压断。
+            color: theme.scaffoldBackgroundColor,
+            // 固定最小宽度：`9.9s→10.0s` 或阶段名切换时不挤动骑缝位置。
+            constraints: const BoxConstraints(minWidth: 96),
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            child: ValueListenableBuilder<TurnClockView?>(
+              valueListenable: clock,
+              builder: (context, view, _) => Semantics(
+                button: onTap != null,
+                label: view == null
+                    ? '阶段明细'
+                    : '阶段明细 ${turnLineLabel(view, aborted: aborted)}',
+                excludeSemantics: true,
+                child: Text(
+                  view == null
+                      ? ''
+                      : turnLineLabel(view, aborted: aborted),
+                  maxLines: 1,
+                  style: style,
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
