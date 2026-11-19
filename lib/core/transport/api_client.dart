@@ -32,6 +32,18 @@ class ApiClient {
 
   static const _timeout = Duration(seconds: 15);
 
+  /// SSE 空闲判死：20s 内没有任何一行（含 `: ping` 心跳）就认为链路半死。
+  /// 取 20s 而不是 15s：契约允许首帧 20s，统一用一个更长一档的阈值既能容纳首帧，
+  /// 也远大于服务端 15s 心跳。交给 `Stream.timeout` 抛 ApiFailure，上层既有退避负责重连。
+  static const _sseIdle = Duration(seconds: 20);
+
+  /// 错误响应体读取上限时间：反代把 502 错误页分块发出后不收尾时，
+  /// 不能让 `sse()` 永久挂在 `bytesToString()` 上（连重连都排不上）。
+  static const _errorBodyTimeout = Duration(milliseconds: 1500);
+
+  /// 单帧上限：坏服务端/半截帧不能把 100MB 一次塞进内存再 JSON 解码。
+  static const _maxFrameBytes = 4 * 1024 * 1024;
+
   Map<String, String> get _headers => {
     'accept': 'application/json',
     if (token != null && token!.isNotEmpty) 'authorization': 'Bearer $token',
@@ -63,7 +75,7 @@ class ApiClient {
       if (res.statusCode != 200) {
         throw ApiFailure('NETWORK', 'health ${res.statusCode}', status: res.statusCode);
       }
-      final json = jsonDecode(res.body);
+      final json = jsonDecode(utf8.decode(res.bodyBytes, allowMalformed: true));
       if (json is! Map) throw ApiFailure('NETWORK', 'unexpected health payload');
       return Health(
         json['ok'] == true,
@@ -132,14 +144,42 @@ class ApiClient {
       });
     final response = await _client.send(request).timeout(const Duration(seconds: 20));
     if (response.statusCode >= 400) {
-      final text = await response.stream.bytesToString();
+      // 401/403 不必等 body：凭证失效要立刻收敛，body 卡住会把 UNAUTHORIZED
+      // 拖成 TIMEOUT，页面就会当成网络抖动继续重试。
+      if (response.statusCode == 401 || response.statusCode == 403) {
+        throw _failureOf(response.statusCode, '');
+      }
+      // 错误页的 body 也可能半死：超时按网络错误处理，让上层退避重连。
+      final String text;
+      try {
+        final bytes = await response.stream
+            .toBytes()
+            .timeout(_errorBodyTimeout);
+        text = utf8.decode(bytes, allowMalformed: true);
+      } on TimeoutException {
+        throw ApiFailure(
+          'TIMEOUT',
+          '读取错误响应超时（HTTP ${response.statusCode}）',
+          status: response.statusCode,
+        );
+      }
       throw _failureOf(response.statusCode, text);
     }
     String? event;
     String? id;
     final data = StringBuffer();
-    await for (final line
-        in response.stream.transform(utf8.decoder).transform(const LineSplitter())) {
+    // 任何一行都重置空闲计时（注释心跳也算）：15s 一行都没有才算链路死了。
+    final lines = response.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .timeout(
+          _sseIdle,
+          onTimeout: (sink) {
+            sink.addError(ApiFailure('TIMEOUT', 'SSE 空闲超时'));
+            sink.close();
+          },
+        );
+    await for (final line in lines) {
       if (line.isEmpty) {
         final payload = data.toString();
         if (payload.isNotEmpty) {
@@ -175,6 +215,9 @@ class ApiClient {
           id = value;
         case 'data':
           if (data.isNotEmpty) data.write('\n');
+          if (data.length + value.length > _maxFrameBytes) {
+            throw ApiFailure('INTERNAL', 'SSE 帧过大');
+          }
           data.write(value);
       }
     }
@@ -183,9 +226,12 @@ class ApiClient {
   Future<Object?> _send(Future<http.Response> Function() run) async {
     try {
       final res = await run().timeout(_timeout);
-      if (res.statusCode >= 400) throw _failureOf(res.statusCode, res.body);
-      if (res.statusCode == 204 || res.body.isEmpty) return null;
-      return jsonDecode(res.body);
+      // 固定按 UTF-8 解码：`http.Response.body` 在缺 charset 时会退回 latin1，
+      // 中文标题/正文会变成乱码（反代与原服务端都可能不给 charset）。
+      final text = utf8.decode(res.bodyBytes, allowMalformed: true);
+      if (res.statusCode >= 400) throw _failureOf(res.statusCode, text);
+      if (res.statusCode == 204 || text.isEmpty) return null;
+      return jsonDecode(text);
     } on ApiFailure {
       rethrow;
     } on TimeoutException {

@@ -1,4 +1,5 @@
 import '../../core/model/models.dart';
+import 'message_logic.dart';
 
 /// 框架块与平台消息的「同一条」窗口：正文压空白后相同、时间相差 3s 内的算同一条。
 const Duration _noticeDedupeWindow = Duration(seconds: 3);
@@ -11,8 +12,16 @@ const Duration anchorTick = Duration(milliseconds: 1);
 
 final RegExp _spaces = RegExp(r'\s+');
 
+/// 正文不可变：压空白的结果按正文缓存，时间线每次重算（分页/流帧）不必
+/// 对每条消息再跑一次正则替换。键就是正文本身，不复制字符串。
+final MemoCache<String> _noticeKeys = MemoCache<String>(capacity: 800);
+
+/// 清掉正文对齐键缓存：页面切后台/退出时释放。
+void clearNoticeKeys() => _noticeKeys.clear();
+
 /// 正文对齐键：压掉所有空白（换行/缩进不影响「同一条」判定）。
-String noticeKey(String text) => text.replaceAll(_spaces, '');
+String noticeKey(String text) =>
+    _noticeKeys.value(text, () => text.replaceAll(_spaces, ''));
 
 /// 时间线上的一条框架消息：正文、折叠键与对齐用的时间。
 class TimelineNotice {

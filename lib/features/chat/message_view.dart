@@ -72,6 +72,18 @@ class MessageView extends StatelessWidget {
   static const double _avatarGap = 8;
   static const double _maxWidthRatio = 0.82;
 
+  /// 正文的确定性解析结果：气泡每次重建都不重算（键就是正文本身，
+  /// 同一条消息换实例也命中；内存只多存一份引用，不复制字符串）。
+  static final MemoCache<CommandHelp?> _helpMemo = MemoCache<CommandHelp?>(capacity: 200);
+  static final MemoCache<bool> _placeholderMemo = MemoCache<bool>(capacity: 200);
+
+  /// 清掉正文解析缓存：切后台/退出详情页时把 Dart 堆里的解析结果一并释放。
+  static void clearCaches() {
+    _helpMemo.clear();
+    _placeholderMemo.clear();
+    _clearFrameworkCaches();
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -83,7 +95,9 @@ class MessageView extends StatelessWidget {
     }
 
     // 有媒体时，正文只剩 `[图片]` 这类占位就是重复信息：媒体块已经把它表达完了。
-    final showBody = body.isNotEmpty && !(media.isNotEmpty && isPlaceholderOnly(body));
+    final showBody =
+        body.isNotEmpty &&
+        !(media.isNotEmpty && _placeholderMemo.value(body, () => isPlaceholderOnly(body)));
 
     // 框架消息不参与左右布局：先短路，省掉整棵 markdown 构建。
     if (message.isFramework) {
@@ -104,7 +118,7 @@ class MessageView extends StatelessWidget {
     final mutedForeground = outbound ? colors.bubbleOutMuted : colors.bubbleInMuted;
 
     // bot 把 `chatluna` 的帮助清单发成一整段文本：排版成卡片，其余正文一律走原路径。
-    final help = showBody ? CommandHelp.parse(body) : null;
+    final help = showBody ? _helpMemo.value(body, () => CommandHelp.parse(body)) : null;
 
     final content = <Widget>[
       if (reasoning.isNotEmpty)
@@ -287,13 +301,7 @@ class _HumanAvatar extends StatelessWidget {
     if (url == null || url.trim().isEmpty) return fallback;
     return SizedBox.square(
       dimension: size,
-      child: ClipOval(
-        child: Image.network(
-          url,
-          fit: BoxFit.cover,
-          errorBuilder: (_, _, _) => fallback,
-        ),
-      ),
+      child: ClipOval(child: AvatarPhoto(url: url, placeholder: fallback)),
     );
   }
 }
@@ -359,14 +367,12 @@ class ConversationAvatar extends StatelessWidget {
     if (url.isEmpty) return fallback;
     return SizedBox.square(
       dimension: size,
-      child: ClipOval(
-        child: Image.network(url, fit: BoxFit.cover, errorBuilder: (_, _, _) => fallback),
-      ),
+      child: ClipOval(child: AvatarPhoto(url: url, placeholder: fallback)),
     );
   }
 }
 
-class _Markdown extends StatelessWidget {
+class _Markdown extends StatefulWidget {
   const _Markdown({
     required this.data,
     required this.base,
@@ -382,22 +388,55 @@ class _Markdown extends StatelessWidget {
   final Color? foreground;
 
   @override
+  State<_Markdown> createState() => _MarkdownState();
+}
+
+class _MarkdownState extends State<_Markdown> {
+  /// 解析好的整棵 markdown 子树。`MarkdownWidget` 在 `didUpdateWidget` 里
+  /// 无条件重新解析正文，所以父级重建时必须把同一个实例交回去——Flutter 对
+  /// 相同实例直接跳过这棵子树，解析只在正文/配色真正变化时发生一次。
+  Widget? _tree;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 主题/文字缩放等依赖变了：旧树里的颜色与字号已经过期。
+    _tree = null;
+  }
+
+  @override
+  void didUpdateWidget(covariant _Markdown oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.data != widget.data ||
+        oldWidget.foreground != widget.foreground ||
+        oldWidget.base != widget.base ||
+        !identical(oldWidget.headers, widget.headers)) {
+      _tree = null;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final cached = _tree;
+    if (cached != null) return cached;
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final colors = context.colors;
-    final color = foreground;
+    final color = widget.foreground;
     final textStyle = (theme.textTheme.bodyMedium?.copyWith(height: 1.5, color: color)) ??
         TextStyle(fontSize: 14, height: 1.5, color: color);
-    return MarkdownWidget(
-      data: data,
+    return _tree = MarkdownWidget(
+      data: widget.data,
       shrinkWrap: true,
       selectable: true,
       config: MarkdownConfig(
         configs: [
           PConfig(textStyle: textStyle),
           ImgConfig(
-            builder: (url, _) => _ChatImage(url: url, resolve: _resolve, headers: headers),
+            // 请求头不在外层决定：`_ChatImage` 会按每张图的最终 URI 重算一次
+            // （同源 `/files`、`/api/workspace` 才带 Bearer，外链一律不带）。
+            builder: (url, _) =>
+                _ChatImage(url: url, base: widget.base, headers: widget.headers),
           ),
           PreConfig(
             // 代码块：11sp 等宽、surface_l2 底、4dp 圆角。
@@ -419,13 +458,59 @@ class _Markdown extends StatelessWidget {
               decoration: TextDecoration.underline,
               decorationColor: color ?? scheme.primary,
             ),
+            // 消息正文来自对方/第三方，不能让任意 scheme（intent:/file:/tel:）直接进系统。
+            // 只放行 http(s)；其余复制到剪贴板并提示，畸形 URL 也不会抛 FormatException。
+            onTap: (url) => _openLink(context, url),
           ),
         ],
       ),
     );
   }
 
-  Uri _resolve(String url) => _resolveAsset(base, url);
+  /// 只允许 http(s) 交给系统浏览器；其余（相对路径、intent:、file:、mailto:…
+  /// 以及解析失败）都只复制链接，绝不调用 `launchUrl`。
+  void _openLink(BuildContext context, String raw) {
+    final parsed = Uri.tryParse(raw.trim());
+    final explicit = parsed?.scheme ?? '';
+    // 非 http(s) 的显式 scheme 不进入 `_resolveAsset`：它会把 `intent:` 当成相对路径
+    // 改写成实例工作区地址，等于绕过白名单。原样复制给用户即可。
+    if (explicit.isNotEmpty && explicit != 'http' && explicit != 'https') {
+      unawaited(Clipboard.setData(ClipboardData(text: raw)));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('链接已复制（仅支持打开 http/https 链接）')),
+      );
+      return;
+    }
+    final Uri resolved;
+    try {
+      resolved = _resolveAsset(widget.base, raw.trim());
+    } catch (_) {
+      // 畸形 URL（`http://[`、坏 data URI 等）：只复制，绝不把异常抛给点击回调。
+      unawaited(Clipboard.setData(ClipboardData(text: raw)));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('链接无法识别，已复制')),
+      );
+      return;
+    }
+    final web = resolved.scheme == 'http' || resolved.scheme == 'https';
+    if (!web) {
+      unawaited(Clipboard.setData(ClipboardData(text: resolved.toString())));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('链接已复制（仅支持打开 http/https 链接）')),
+      );
+      return;
+    }
+    unawaited(
+      launchUrl(resolved, mode: LaunchMode.externalApplication).catchError((Object _) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('无法打开链接')),
+          );
+        }
+        return false;
+      }),
+    );
+  }
 }
 
 /// `chatluna` 指令帮助卡片：bot 把子命令清单发成一整段文本时，按行排版成「命令 + 说明」。
@@ -548,7 +633,8 @@ class _CommandHelpCardState extends State<_CommandHelpCard> {
 /// 其余相对路径是 agent 工作区（data/chatluna/agents-work）里的文件，由 companion 插件以 Bearer 提供。
 Uri _resolveAsset(Uri base, String url) {
   if (url.startsWith('http://') || url.startsWith('https://')) {
-    return Uri.parse(url);
+    // 畸形绝对地址（`http://[`）只让这张图失败，不能把整个气泡的构建炸掉。
+    return Uri.tryParse(url) ?? Uri(scheme: 'http', path: url);
   }
   if (url.startsWith('data:')) {
     // `Uri.parse` 会校验 data URI 的 base64 载荷：坏载荷直接抛 `FormatException`，
@@ -563,12 +649,20 @@ Uri _resolveAsset(Uri base, String url) {
   return base.replace(path: '/api/workspace', queryParameters: {'path': name});
 }
 
-/// 图片请求要不要带实例的 Bearer：只有解回本实例的 `/files` 与工作区需要。
-/// 插件给的外部图床不能收到我们的 token。
-bool _needsAuth(Uri base, Uri uri) =>
-    uri.host == base.host &&
-    uri.port == base.port &&
-    (uri.path.startsWith('/files/') || uri.path.startsWith('/api/'));
+/// 图片请求要不要带实例的 Bearer：只有解回**本实例同源**的 `/files` 与
+/// `/api/workspace` / `/api/platform/media` 需要。插件给的外部图床、以及同 host:port
+/// 但换了 scheme 的地址（https 实例里的 `http://` 明文链接）都不能收到我们的 token。
+bool _needsAuth(Uri base, Uri uri) {
+  if (uri.scheme != base.scheme || uri.host != base.host || uri.port != base.port) {
+    return false;
+  }
+  final path = uri.path;
+  return path.startsWith('/files/') ||
+      path == '/api/workspace' ||
+      path.startsWith('/api/workspace/') ||
+      path == '/api/platform/media' ||
+      path.startsWith('/api/platform/media/');
+}
 
 /// 媒体图片的取头：先把源归一成真实地址（`base64://` → `data:`），再决定要不要带 Bearer。
 Map<String, String> _authHeadersFor(Uri base, String raw, Map<String, String> headers) {
@@ -576,17 +670,30 @@ Map<String, String> _authHeadersFor(Uri base, String raw, Map<String, String> he
   return _needsAuth(base, uri) ? headers : const <String, String>{};
 }
 
+/// 清掉框架卡片正文的解析缓存：页面切后台/退出时调用（见 [MessageView.clearCaches]）。
+void _clearFrameworkCaches() => _FrameworkNoticeState.clearCaches();
+
 class _ChatImage extends StatefulWidget {
-  const _ChatImage({required this.url, required this.resolve, required this.headers});
+  const _ChatImage({required this.url, required this.base, required this.headers});
 
   final String url;
-  final Uri Function(String) resolve;
+  final Uri base;
+
+  /// 实例的原始请求头。**不当成可直接注入的取图头**：每次解析出 URI 后都要经
+  /// [`_authHeadersFor`] 过滤，外链图片的情况下这里会是空表。
   final Map<String, String> headers;
+
+  /// 两个源前缀只编译一次：图片气泡每次 build/重试都会走到这里。
+  static final RegExp _inlineMarker = RegExp(
+    r'^data:image/[^;,]+;base64,',
+    caseSensitive: false,
+  );
+  static final RegExp _base64Marker = RegExp(r'^base64:(?://)?');
 
   /// `data:image/...;base64,` 走内存解码；`Image.network` 不支持 data scheme。
   static Uint8List? _inlineBytes(String source) {
     if (!source.startsWith('data:')) return null;
-    final marker = RegExp(r'^data:image/[^;,]+;base64,', caseSensitive: false).firstMatch(source);
+    final marker = _inlineMarker.firstMatch(source);
     if (marker == null) return null;
     try {
       return base64Decode(source.substring(marker.end));
@@ -598,7 +705,7 @@ class _ChatImage extends StatefulWidget {
   /// `base64://<payload>` 没有 mime，按图片内容解码即可（mime 不参与 Flutter 解码）。
   static String _normalizeSource(String source) {
     if (!source.startsWith('base64:')) return source;
-    final marker = RegExp(r'^base64:(?://)?').firstMatch(source);
+    final marker = _base64Marker.firstMatch(source);
     if (marker == null) return source;
     return 'data:image/png;base64,${source.substring(marker.end)}';
   }
@@ -620,12 +727,22 @@ class _ChatImageState extends State<_ChatImage> {
   ImageProvider? _measured;
   ImageStream? _stream;
   ImageStreamListener? _listener;
-  bool _inBuild = false;
+
+  /// 正在生命周期回调里发起测量：命中缓存时回调是同步的，此时不能 setState
+  /// （会在 build 前多排一帧），直接写字段即可，紧接着的那次 build 就读到。
+  bool _measuring = false;
 
   @override
   void initState() {
     super.initState();
     _prepare();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 解码宽度依赖 MediaQuery（dpr）：放在这里量，build 不发起解码。
+    _measureIfNeeded();
   }
 
   @override
@@ -636,6 +753,7 @@ class _ChatImageState extends State<_ChatImage> {
       _measured = null;
       _size = null;
       _prepare();
+      _measureIfNeeded();
     }
   }
 
@@ -659,16 +777,27 @@ class _ChatImageState extends State<_ChatImage> {
     _stream = null;
   }
 
-  int _cacheWidth(BuildContext context) =>
-      (_maxWidth * MediaQuery.devicePixelRatioOf(context)).round();
+  int _cacheWidth(BuildContext context) => imageDecodeWidthFor(context, _maxWidth);
+
+  /// 声明了 data URI 却解不出来：没有可测量的像素，直接给占位。
+  bool get _broken => _source.startsWith('data:') && _bytes == null;
+
+  void _measureIfNeeded() {
+    if (!mounted || _broken) return;
+    _measure(context, _resolveAsset(widget.base, _source));
+  }
 
   /// markdown 的 `WidgetSpan` 给子节点的高度是无界的，`BoxConstraints.maxHeight` 会被忽略；
   /// 所以自己解码一次拿真实宽高，再给出确定的 `SizedBox` 尺寸。
+  /// 只在依赖变化（dpr）与换图时调用；同一个 provider 已经量过就不再解析。
   void _measure(BuildContext context, Uri uri) {
     final width = _cacheWidth(context);
     final provider = _bytes != null
         ? ResizeImage(MemoryImage(_bytes!), width: width)
-        : ResizeImage(NetworkImage(uri.toString(), headers: widget.headers), width: width);
+        : ResizeImage(
+            NetworkImage(uri.toString(), headers: _headersFor(uri)),
+            width: width,
+          );
     if (provider == _measured) return;
     _detach();
     _measured = provider;
@@ -678,21 +807,29 @@ class _ChatImageState extends State<_ChatImage> {
         final image = info.image;
         final natural = Size(image.width.toDouble(), image.height.toDouble());
         info.dispose();
+        // 尺寸量到了就断开测量订阅：继续挂着会让这张解码结果一直是 ImageCache
+        // 的 live entry（页面滚动回收后仍常驻）。图片本身由渲染用的
+        // `_RetryableImage` 自己解析，命中的是同一份缓存。
+        _detach();
         if (!mounted) return;
         final fitted = _fit(natural);
         if (fitted == _size) return;
-        if (_inBuild) {
-          // 解码命中缓存时回调是同步的：本帧直接按真实比例排，别在 build 期间 setState。
+        if (_measuring) {
           _size = fitted;
         } else {
           setState(() => _size = fitted);
         }
       },
-      onError: (error, stack) {},
+      onError: (error, stack) => _detach(),
     );
     _stream = stream;
     _listener = listener;
-    stream.addListener(listener);
+    _measuring = true;
+    try {
+      stream.addListener(listener);
+    } finally {
+      _measuring = false;
+    }
   }
 
   /// 按比例收进 260 × 320：小图不放大，长图收到 320 高，`BoxFit.cover` 不再有裁切。
@@ -709,30 +846,33 @@ class _ChatImageState extends State<_ChatImage> {
   void _remeasure() {
     _detach();
     _measured = null;
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    _measureIfNeeded();
+    setState(() {});
   }
+
+  /// 按解析后的地址重算：只有本实例同源附件才带 Bearer。
+  Map<String, String> _headersFor(Uri uri) =>
+      _needsAuth(widget.base, uri) ? widget.headers : const <String, String>{};
 
   @override
   Widget build(BuildContext context) {
     final source = _source;
-    final uri = widget.resolve(source);
+    final uri = _resolveAsset(widget.base, source);
     final bytes = _bytes;
     // 声明了 data URI 却解不出来：直接给占位，别让 Image.network 抛 unsupported scheme。
-    final broken = source.startsWith('data:') && bytes == null;
+    final broken = _broken;
 
-    var size = _size ?? const Size(_maxWidth, _maxHeight);
-    if (!broken) {
-      _inBuild = true;
-      try {
-        _measure(context, uri);
-      } finally {
-        _inBuild = false;
-      }
-      size = _size ?? size;
-    }
+    // 尺寸来自 didChangeDependencies / _remeasure 的解码测量；build 只读，不发起解码。
+    final size = _size ?? const Size(_maxWidth, _maxHeight);
     final double width = broken ? 200 : size.width;
     final double height = broken ? 120 : size.height;
-    final image = _ImageSource(source: source, uri: uri, headers: widget.headers, bytes: bytes);
+    final image = _ImageSource(
+      source: source,
+      uri: uri,
+      headers: _headersFor(uri),
+      bytes: bytes,
+    );
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -919,7 +1059,7 @@ class _RetryableImageState extends State<_RetryableImage> {
         cacheWidth: widget.cacheWidth,
         fit: widget.fit,
         frameBuilder: _frame,
-        errorBuilder: (context, _, _) => _failure(context),
+        errorBuilder: (context, error, _) => _failure(context, error),
       );
     }
     return Image.network(
@@ -931,7 +1071,7 @@ class _RetryableImageState extends State<_RetryableImage> {
       cacheWidth: widget.cacheWidth,
       fit: widget.fit,
       frameBuilder: _frame,
-      errorBuilder: (context, _, _) => _failure(context),
+      errorBuilder: (context, error, _) => _failure(context, error),
     );
   }
 
@@ -954,7 +1094,11 @@ class _RetryableImageState extends State<_RetryableImage> {
     );
   }
 
-  Widget _failure(BuildContext context) {
+  Widget _failure(BuildContext context, Object? error) {
+    // 404 = `storage://` 引用已经失效：自动重试再多次也不会回来，给明确文案并停手。
+    if (error is NetworkImageLoadException && error.statusCode == 404) {
+      return _notice(context, label: '附件已过期', icon: Icons.link_off);
+    }
     _afterFailure();
     return _notice(
       context,
@@ -1053,11 +1197,7 @@ class _MediaBlock extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         if (imageUrls.length == 1)
-          _ChatImage(
-            url: imageUrls.first,
-            resolve: (url) => _resolveAsset(base, url),
-            headers: _authHeadersFor(base, imageUrls.first, headers),
-          )
+          _ChatImage(url: imageUrls.first, base: base, headers: headers)
         else if (imageUrls.length > 1)
           _ImageGrid(urls: imageUrls, base: base, headers: headers),
         for (var i = 0; i < rest.length; i++) ...[
@@ -1168,7 +1308,7 @@ class _ImageGridState extends State<_ImageGrid> {
             source: _sources[index],
             width: side,
             height: side,
-            cacheWidth: (side * MediaQuery.devicePixelRatioOf(context)).round(),
+            cacheWidth: imageDecodeWidthFor(context, side),
             compact: true,
           ),
         ),
@@ -1202,6 +1342,10 @@ class _ImageViewerState extends State<_ImageViewer> {
   @override
   Widget build(BuildContext context) {
     final images = widget.images;
+    // 全屏页以前不传 cacheWidth：原图整张进 ImageCache（4k 照片 ~60MB），
+    // 关掉查看器后仍按 LRU 占着，把正常缩略图挤出去。按屏宽 × dpr 解码，
+    // 1× 缩放下仍是一比一像素；再大的图只会让内存无上限。
+    final decodeWidth = imageDecodeWidthFor(context, MediaQuery.sizeOf(context).width);
     return Dialog.fullscreen(
       backgroundColor: Colors.black,
       child: Stack(
@@ -1212,7 +1356,7 @@ class _ImageViewerState extends State<_ImageViewer> {
               itemCount: images.length,
               onPageChanged: (index) => setState(() => _index = index),
               itemBuilder: (context, index) =>
-                  InteractiveViewer(child: Center(child: _page(images[index]))),
+                  InteractiveViewer(child: Center(child: _page(images[index], decodeWidth))),
             ),
           ),
           Positioned(
@@ -1250,8 +1394,12 @@ class _ImageViewerState extends State<_ImageViewer> {
   }
 
   /// 全屏页与缩略图/格子走同一个重试壳：失败也能点一下重来，不靠退回消息列表。
-  Widget _page(_ImageSource image) =>
-      _RetryableImage(source: image, fit: BoxFit.contain, onDark: true);
+  Widget _page(_ImageSource image, int decodeWidth) => _RetryableImage(
+    source: image,
+    cacheWidth: decodeWidth,
+    fit: BoxFit.contain,
+    onDark: true,
+  );
 }
 
 /// 视频 / 音频 / 文件 / 只有 ref 的附件：一行胶囊（图标 + 名称）。
@@ -1414,21 +1562,62 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
   static const _previewLines = 2;
   static const _maxOpenLines = 200;
 
+  /// 框架正文的解析结果只依赖 [widget.text]：整页/气泡重建时不再重跑
+  /// `split`、逐行正则与 `jsonDecode`。键是正文本身，因此滚动回收后还命中。
+  static final MemoCache<Notice> _noticeMemo = MemoCache<Notice>(capacity: 200);
+  static final MemoCache<String?> _monoMemo = MemoCache<String?>(capacity: 300);
+
+  /// 清掉框架正文的解析缓存（切后台/退出详情页时由页面调用）。
+  static void clearCaches() {
+    _noticeMemo.clear();
+    _monoMemo.clear();
+  }
+
+  late List<String> _paragraphs;
+  late int _hidden;
+  late String _meta;
+  late String _preview;
+  late String _title;
+  late bool _memoryTag;
+
   bool get _open => widget.open[widget.foldKey] ?? false;
 
   void _toggle() => setState(() => widget.open[widget.foldKey] = !_open);
 
   @override
+  void initState() {
+    super.initState();
+    _parse();
+  }
+
+  @override
+  void didUpdateWidget(covariant _FrameworkNotice oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text) _parse();
+  }
+
+  /// 解析一次，把 build 里要用的派生结果全部算好。
+  void _parse() {
+    final notice = _noticeMemo.value(widget.text, () => Notice.parse(widget.text));
+    final lines = notice.lines;
+    final openLines = lines.length > _maxOpenLines
+        ? lines.sublist(0, _maxOpenLines)
+        : lines;
+    _hidden = lines.length - openLines.length;
+    _paragraphs = Notice.paragraphs(openLines);
+    _meta = notice.meta;
+    _preview = Notice.preview(lines, _previewLines);
+    _title = notice.title;
+    _memoryTag = notice.tag.toLowerCase().contains('memory');
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = context.colors;
-    final notice = Notice.parse(widget.text);
     final open = _open;
-    final openLines = notice.lines.length > _maxOpenLines
-        ? notice.lines.sublist(0, _maxOpenLines)
-        : notice.lines;
-    final hidden = notice.lines.length - openLines.length;
-    final paragraphs = Notice.paragraphs(openLines);
+    final hidden = _hidden;
+    final paragraphs = _paragraphs;
     final titleStyle =
         theme.textTheme.bodySmall?.copyWith(
           fontWeight: FontWeight.w500,
@@ -1445,12 +1634,12 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
     // 后缀：合并块先报条数（`· 2 条`），再报正文行数（`· 6 行`）。
     final meta = [
       if (widget.count > 1) '· ${widget.count} 条',
-      notice.meta,
+      _meta,
     ].where((part) => part.isNotEmpty).join(' ');
-    final preview = Notice.preview(notice.lines, _previewLines);
+    final preview = _preview;
     final bodyStyle = _bodyStyle(theme, colors);
     // 记忆类消息用 memory 图标，其余框架消息（wake / 工具 / 同步）用终端图标。
-    final icon = notice.tag.toLowerCase().contains('memory') ? Icons.memory : Icons.terminal;
+    final icon = _memoryTag ? Icons.memory : Icons.terminal;
     return Padding(
       // 上下各 6：卡片之间、卡片与气泡之间都只隔一道呼吸缝。
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -1481,7 +1670,7 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            notice.title,
+                            _title,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: titleStyle,
@@ -1556,8 +1745,11 @@ class _FrameworkNoticeState extends State<_FrameworkNotice> {
   /// 等宽块自带 `surface_l2` 底与 4dp 圆角，与正文分开。
   /// 段内换行原样保留：`[memory update]` 的 `- [ch-03 …]` 列表行各占一行。
   Widget _paragraph(String text, ThemeData theme, AppColors colors) {
-    final json = Notice.prettyJson(text);
-    final mono = json ?? (Notice.isUrlList(text) ? text : null);
+    // JSON 重排与逐行链接判定都只依赖这一段文字：展开态反复重建时不再重跑。
+    final mono = _monoMemo.value(text, () {
+      final json = Notice.prettyJson(text);
+      return json ?? (Notice.isUrlList(text) ? text : null);
+    });
     if (mono == null) return SelectableText(text, style: _bodyStyle(theme, colors));
     return Container(
       width: double.infinity,
@@ -1710,6 +1902,8 @@ class Notice {
 
   /// 整段是一行一个的裸链接。
   static bool isUrlList(String text) {
+    // 先做一次 O(1) 前缀检查：绝大多数段落不是链接列表，不必 split 再逐行匹配。
+    if (!text.trimLeft().startsWith('http')) return false;
     final links = [
       for (final line in text.split('\n'))
         if (line.trim().isNotEmpty) line.trim(),

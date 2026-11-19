@@ -33,4 +33,54 @@ void main() {
       expect(isPlaceholderOnly('[文件] —— 见附件'), isFalse);
     });
   });
+
+  group('MemoCache', () {
+    test('同一个键只计算一次；命中后仍然返回同一个结果', () {
+      final cache = MemoCache<List<int>>(capacity: 4);
+      var calls = 0;
+      List<int> compute() {
+        calls += 1;
+        return [calls];
+      }
+
+      expect(cache.value('a', compute), [1]);
+      expect(cache.value('a', compute), [1]);
+      expect(calls, 1);
+      expect(cache.length, 1);
+    });
+
+    test('可缓存 null（解析失败的结果也要记住）', () {
+      final cache = MemoCache<String?>(capacity: 4);
+      var calls = 0;
+      String? compute() {
+        calls += 1;
+        return null;
+      }
+
+      expect(cache.value('x', compute), isNull);
+      expect(cache.value('x', compute), isNull);
+      expect(calls, 1);
+    });
+
+    test('超过容量淘汰最久未用的一项', () {
+      final cache = MemoCache<int>(capacity: 2);
+      cache.value('a', () => 1);
+      cache.value('b', () => 2);
+      // 命中 a：b 变成最久未用。
+      cache.value('a', () => 1);
+      cache.value('c', () => 3);
+      expect(cache.length, 2);
+      expect(cache.value('a', () => 10), 1);
+      expect(cache.value('b', () => 20), 20);
+    });
+
+    test('clear 之后重新计算', () {
+      final cache = MemoCache<int>(capacity: 2);
+      var calls = 0;
+      int compute() => ++calls;
+      cache.value('a', compute);
+      cache.clear();
+      expect(cache.value('a', compute), 2);
+    });
+  });
 }

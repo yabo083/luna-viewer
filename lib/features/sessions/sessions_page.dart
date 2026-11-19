@@ -39,7 +39,7 @@ class SessionsPage extends StatefulWidget {
   State<SessionsPage> createState() => _SessionsPageState();
 }
 
-class _SessionsPageState extends State<SessionsPage> {
+class _SessionsPageState extends State<SessionsPage> with WidgetsBindingObserver {
   late final ApiClient _api = ApiClient(base: widget.connection.base, token: widget.connection.token);
   late final SessionsRepository _repo = SessionsRepository(_api);
   late final PlatformRepository _platform = PlatformRepository(_api);
@@ -77,21 +77,50 @@ class _SessionsPageState extends State<SessionsPage> {
   String? _error;
   bool _showDevInfo = false;
 
-  /// 已加载表最近一次对齐时间：流帧触发的 `/api/sessions` 补齐最多 5s 一次。
+  /// 401 之后停掉后台表与流，只提示一次「重新连接」。
+  bool _authFailed = false;
+
+  /// 列表页是否在栈顶：被详情页盖住时为 false（那时不该再订阅平台流）。
+  bool _routeVisible = true;
+
+  /// 已加载表最近一次对齐时间。
   DateTime? _loadedSyncedAt;
+
+  /// 帧驱动的补表间隔：15s 起，连续两拍没有任何变化就翻倍到 60s。
+  /// 旧实现是「每帧最多 5s 一次」，静置列表仍每 5s 新建一条 `/api/sessions`
+  /// 短 TCP（复测 §7.4 的「偶发第 2 条连接」）。
+  Duration _loadedSyncGap = _loadedSyncMinGap;
+  static const Duration _loadedSyncMinGap = Duration(seconds: 15);
+  static const Duration _loadedSyncMaxGap = Duration(seconds: 60);
+  bool _loadedSyncing = false;
 
   /// 活跃/归档切分的时间基准：挂载时取一次，列表开着期间不随重建漂移。
   late final DateTime _mountedAt;
+
+  /// 主列表滚动控制器：只负责「到底了再补一页」，替代 build 里的 postFrame 回调。
+  final ScrollController _scroll = ScrollController();
+  bool _loadMoreQueued = false;
+
+  /// 行/分组结果的缓存：`_rows` 要遍历会话并按运行中+时间排序，`_partition` 再切两段。
+  /// 会话表或已加载表变了才失效（见 [_invalidateRows]），其余重建直接复用。
+  List<SessionRow>? _rowsCache;
+  (List<SessionRow>, List<SessionRow>)? _partitionCache;
+
+  /// 前台且在栈顶才算可见：被详情页盖住时断掉平台流（详情页自己订阅了一条）。
+  bool _foreground = true;
 
   @override
   void initState() {
     super.initState();
     _mountedAt = DateTime.now();
+    _scroll.addListener(_onScroll);
     // 同实例取过一次就直接用，不等 WS 再回一遍；换实例后缓存自动作废。
     _bot = BotIdentity.profileFor(widget.connection.base);
     _botAvatar = BotIdentity.avatarFor(widget.connection.base);
+    WidgetsBinding.instance.addObserver(this);
     _refresh();
-    _startStream();
+    // 平台流的启动交给 `didChangeDependencies`（要按路由可见性判断），
+    // 它在首帧前一定会跑一次。
     _checkUpdate();
     _loadBot();
     _loadUiPrefs();
@@ -145,10 +174,55 @@ class _SessionsPageState extends State<SessionsPage> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // `ModalRoute.of` 依赖当前路由的 isCurrent：被详情页盖住 / 返回时都会重走进来。
+    _routeVisible = ModalRoute.of(context)?.isCurrent ?? true;
+    _ensureStream();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground) {
+      _ensureStream();
+    } else {
+      // 列表页也订阅实时流：后台广播帧会持续唤醒 isolate 解析 JSON，和详情页一样断流。
+      _pauseStream();
+      // 排着的「2s 后补一次会话表」也不该在后台发出去。
+      _syncTimer?.cancel();
+      _syncTimer = null;
+    }
+  }
+
+  /// 只在「前台 + 栈顶」订阅平台流：
+  /// - 被详情页盖住时列表不需要实时帧（详情页自己订阅了一条），多一条常驻连接
+  ///   就是服务端与手机各多一份开销——实测详情页 3 条里的第三条就是它；
+  /// - 回到列表时重建流，`PlatformStream` 会重放每个会话最近几条，行状态随之补齐
+  ///   （`_open` 返回时还会补一次会话表元数据）。
+  void _ensureStream() {
+    if (!_foreground || !_routeVisible || _authFailed) {
+      _pauseStream();
+      return;
+    }
+    _startStream();
+  }
+
+  void _pauseStream() {
+    _streamSub?.cancel();
+    _streamSub = null;
+    _stream?.dispose();
+    _stream = null;
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _syncTimer?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
     _search.dispose();
     _api.close();
     super.dispose();
@@ -181,18 +255,20 @@ class _SessionsPageState extends State<SessionsPage> {
         _conversations
           ..clear()
           ..addAll(conversations);
+        _invalidateRows();
       });
       // 全量对齐之后算一次「刚同步过」，避免紧接着的流帧再补一遍会话表。
       _syncedAt = DateTime.now();
       _loadedSyncedAt = DateTime.now();
+      _loadedSyncGap = _loadedSyncMinGap;
     } on ApiFailure catch (e) {
       if (e.isUnauthorized) {
-        await widget.onDisconnect();
+        _handleAuthFailure();
         return;
       }
-      if (mounted) setState(() => _error = '${e.code}：${e.message}');
-    } catch (e) {
-      if (mounted) setState(() => _error = '加载失败：$e');
+      if (mounted) setState(() => _error = _displayFailure(e));
+    } catch (_) {
+      if (mounted) setState(() => _error = '加载失败，请稍后重试');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -219,33 +295,55 @@ class _SessionsPageState extends State<SessionsPage> {
     try {
       final conversations = await _platform.conversations();
       if (!mounted) return;
-      setState(() => _conversations
-        ..clear()
-        ..addAll(conversations));
-    } on ApiFailure {
-      // 列表已经有内容：这一拍补齐失败就等下一页/下拉刷新，不弹错。
+      setState(() {
+        _conversations
+          ..clear()
+          ..addAll(conversations);
+        _invalidateRows();
+      });
+    } on ApiFailure catch (e) {
+      // 列表已经有内容：这一拍补齐失败就等下一页/下拉刷新，不弹错；401 例外。
+      if (e.isUnauthorized) _handleAuthFailure();
+    } catch (_) {
+      // 坏字段只影响这一拍。
     } finally {
       _syncing = false;
     }
   }
 
   /// `/api/sessions` 对齐：QQ 里发一条消息 → 服务端建会话 → agent 认领，
-  /// 最多 5s 就能把 `session` 挂到对应行上（绿点、状态、操作菜单、进详情的 `/live`），
-  /// 不用下拉刷新。只对齐第一页；分页拿到的旧行原样保留，游标不动。
-  void _syncLoaded({bool force = false}) {
+  /// 认领后行上才有 `session`（绿点、状态、操作菜单、进详情的 `/live`）。
+  ///
+  /// **只在真的需要时请求**：调用方用 [needed] 判断这一拍有没有可能改变列表
+  /// （行还没挂 `session`、行在跑、对方刚发来消息）。机器人回复且状态早已静止的
+  /// 帧不发请求，空闲列表因此没有任何轮询。
+  ///
+  /// 限流：最快 [_loadedSyncMinGap] 一次；连续两拍没有任何行变化就 2× 退避到
+  /// [_loadedSyncMaxGap]，一有变化立刻回到 15s。[force] 只给「用户刚返回列表」
+  /// 这种一次性动作，不参与退避。
+  void _syncLoaded({bool force = false, bool needed = true}) {
+    if (!force && !needed) return;
+    if (_loadedSyncing) return;
     final now = DateTime.now();
     final last = _loadedSyncedAt;
-    if (!force && last != null && now.difference(last) < const Duration(seconds: 5)) {
-      return;
-    }
+    if (!force && last != null && now.difference(last) < _loadedSyncGap) return;
     _loadedSyncedAt = now;
-    unawaited(_reloadLoaded());
+    _loadedSyncing = true;
+    unawaited(_reloadLoaded().then((changed) {
+      if (changed) {
+        _loadedSyncGap = _loadedSyncMinGap;
+      } else if (_loadedSyncGap < _loadedSyncMaxGap) {
+        _loadedSyncGap = _loadedSyncGap * 2;
+      }
+    }).whenComplete(() => _loadedSyncing = false));
   }
 
-  Future<void> _reloadLoaded() async {
+  /// 重取第一页并与手上的表合并；返回「是否有行发生了变化」。
+  Future<bool> _reloadLoaded() async {
+    final before = _loadedSignature();
     try {
       final page = await _repo.list();
-      if (!mounted) return;
+      if (!mounted) return false;
       final fresh = {for (final session in page.items) session.id};
       setState(() {
         final merged = <SessionSummary>[
@@ -256,20 +354,90 @@ class _SessionsPageState extends State<SessionsPage> {
         _loaded
           ..clear()
           ..addAll(merged);
+        _invalidateRows();
       });
-    } on ApiFailure {
-      // 列表已经有内容：这一拍对齐失败就等下一次流帧或下拉刷新。
+      return _loadedSignature() != before;
+    } on ApiFailure catch (e) {
+      // 列表已经有内容：这一拍对齐失败就等下一次流帧或下拉刷新；401 例外。
+      if (e.isUnauthorized) _handleAuthFailure();
+    } catch (_) {
+      // 坏字段只影响这一拍。
     }
+    return false;
+  }
+
+  /// 这个（归一化后的）会话键挂到的已加载会话；没有就是 null。
+  SessionSummary? _sessionFor(String normalizedKey) {
+    for (final session in _loaded) {
+      if (normalizeConversationKey(session.id) == normalizedKey) return session;
+    }
+    return null;
+  }
+
+  /// 行状态的指纹：有哪些已加载会话 + 各自是否在跑。用它判断补表有没有带来变化。
+  String _loadedSignature() {
+    final items = [
+      for (final session in _loaded) '${session.id}:${session.running ? 1 : 0}',
+    ]..sort();
+    return items.join(',');
   }
 
   /// 列表页也订阅实时流：新消息让对应行自己更新，不用下拉刷新。
   void _startStream() {
+    if (_authFailed || _streamSub != null) return;
+    // 后台或被详情页盖住时不连：详情页自己有一条，列表不需要第二条常驻连接。
+    if (!_foreground || !_routeVisible) return;
     final token = widget.connection.token;
     if (token.isEmpty) return;
     final stream = PlatformStream(widget.connection.base, token);
     _stream = stream;
-    // 断线退避在 PlatformStream 内部，这里只收帧。
-    _streamSub = stream.events.listen(_onBeat, onError: (Object _) {});
+    // 断线退避在 PlatformStream 内部；401 会以错误送上来。
+    _streamSub = stream.events.listen(_onBeat, onError: (Object error) {
+      _streamSub = null;
+      if (error is ApiFailure && error.isUnauthorized) _handleAuthFailure();
+    });
+  }
+
+  /// 401：停表、停流，只提示一次。凭证不会自己恢复，继续重试只会一直打服务端。
+  void _handleAuthFailure() {
+    if (_authFailed) return;
+    _authFailed = true;
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    _streamSub?.cancel();
+    _streamSub = null;
+    _stream?.dispose();
+    _stream = null;
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('登录已失效'),
+        content: const Text('实例的访问 token 已失效。重新连接并输入新的 token 后才能继续。'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              unawaited(widget.onDisconnect());
+            },
+            child: const Text('重新连接'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 错误页/HTML 正文不进 UI：只给稳定的短文案。
+  static String _displayFailure(ApiFailure failure) {
+    final message = failure.message;
+    final looksLikePage =
+        message.contains('<') || message.contains('\n') || message.length > 160;
+    if (looksLikePage) {
+      final status = failure.status == null ? '' : '（HTTP ${failure.status}）';
+      return '${failure.code}：服务器返回了错误$status';
+    }
+    return '${failure.code}：$message';
   }
 
   void _onBeat(PlatformEvent event) {
@@ -294,8 +462,15 @@ class _SessionsPageState extends State<SessionsPage> {
     // 重连会回放各会话最近 5 条：比手上的最后一条更早就不改这一行。
     if (last != null && !message.time.isAfter(last.time)) return;
     _conversations[index] = current.copyWith(count: current.count + 1, last: message);
-    // 已有会话的新消息同样可能刚把 agent 叫醒：顺手对齐一次已加载表（5s 一次）。
-    _syncLoaded();
+    _invalidateRows();
+    // 已有会话的新消息：不每帧补表（旧实现是 5s 一次，静置列表也在轮询）。
+    // 只有「这一条可能改变行的状态」时才问：
+    // - 还没被 agent 认领（`session == null`，等绿点/状态/进详情的能力）；
+    // - 行在跑，这条可能就是这一轮的最后一条（`running` 要跟着变 false）；
+    // - 对方刚发来消息，agent 可能刚刚被叫醒（我们手上还是 running=false）。
+    // 其余情况一个请求都不发：空闲列表零轮询。
+    final session = _sessionFor(key);
+    _syncLoaded(needed: session == null || session.running || !message.outbound);
     // 同一帧内到多帧只重建一次：回放阶段连续 setState 会把手指下的点击也拖慢。
     if (_beatScheduled) return;
     _beatScheduled = true;
@@ -320,11 +495,15 @@ class _SessionsPageState extends State<SessionsPage> {
       setState(() {
         _loaded.addAll(fresh);
         _cursor = page.nextCursor;
+        _invalidateRows();
       });
       // 游标没前进又没有新行：服务端不会再给东西了，停手——否则每次重建都会空转一次请求。
       if (fresh.isEmpty && _cursor == requested) _cursor = null;
-    } on ApiFailure {
+    } on ApiFailure catch (e) {
       // 静默停手：这是后台补齐，不该在列表上反复弹错（也避免每次重建都重试）。
+      if (e.isUnauthorized) _handleAuthFailure();
+      _cursor = null;
+    } catch (_) {
       _cursor = null;
     } finally {
       _loadingMore = false;
@@ -551,6 +730,8 @@ class _SessionsPageState extends State<SessionsPage> {
           avatarUrl: _botAvatar,
           botName: _bot?.name,
           showDeveloperInfo: _showDevInfo,
+          // 详情页拿到 401 时先退回列表，再由根节点清凭证切到连接页。
+          onAuthExpired: widget.onDisconnect,
         ),
       ),
     );
@@ -611,6 +792,8 @@ class _SessionsPageState extends State<SessionsPage> {
         await _refresh();
       } on ApiFailure catch (e) {
         _toast('改名失败 ${e.code}');
+      } catch (_) {
+        _toast('改名失败');
       }
     } else if (action == 'delete') {
       await HapticFeedback.mediumImpact();
@@ -620,6 +803,8 @@ class _SessionsPageState extends State<SessionsPage> {
         _toast('已从本地移除；平台历史未删除，刷新后可能重新出现');
       } on ApiFailure catch (e) {
         _toast('移除失败 ${e.code}');
+      } catch (_) {
+        _toast('移除失败');
       }
     }
   }
@@ -751,6 +936,8 @@ class _SessionsPageState extends State<SessionsPage> {
   /// 列表全集：插件会话在前（每行可能挂着一份已加载会话），已加载但插件里没有的接在后面。
   /// 排序：运行中优先，其后按最后一条消息时间倒序。
   List<SessionRow> get _rows {
+    final cached = _rowsCache;
+    if (cached != null) return cached;
     final loadedByKey = <String, SessionSummary>{};
     for (final session in _loaded) {
       final key = normalizeConversationKey(session.id);
@@ -793,13 +980,43 @@ class _SessionsPageState extends State<SessionsPage> {
       if (a.running != b.running) return a.running ? -1 : 1;
       return b.time.compareTo(a.time);
     });
+    _rowsCache = rows;
     return rows;
+  }
+
+  /// 会话表/已加载表变了：行与分组都要重算。其余重建（搜索输入、主题、流帧合并）
+  /// 直接复用缓存，不再每次 build 遍历 + 排序 + 切两段。
+  void _invalidateRows() {
+    _rowsCache = null;
+    _partitionCache = null;
   }
 
   /// 一次遍历把行分成「活跃」与「归档」：运行中或最后一条消息在 [activeWindow] 内算活跃。
   /// 时间基准是挂载快照，列表开着期间不会因为流帧重建而漂移。
-  (List<SessionRow>, List<SessionRow>) _partition() =>
-      partitionSessions(_rows, now: _mountedAt);
+  (List<SessionRow>, List<SessionRow>) _partition() {
+    final cached = _partitionCache;
+    if (cached != null) return cached;
+    return _partitionCache = partitionSessions(_rows, now: _mountedAt);
+  }
+
+  /// 滚动到底附近补一页已加载会话（搜索要覆盖全部会话，所以搜索时由 build 侧踢一脚）。
+  void _onScroll() {
+    if (_archiveOpen || !_scroll.hasClients) return;
+    if (_scroll.position.extentAfter > 480) return;
+    if (_cursor == null || _loadingMore) return;
+    unawaited(_loadMore());
+  }
+
+  /// 排一帧补页（同一时刻只排一次）：搜索态结果不足一屏时使用。
+  void _kickLoadMore() {
+    if (_loadMoreQueued || _cursor == null) return;
+    _loadMoreQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadMoreQueued = false;
+      if (!mounted) return;
+      unawaited(_loadMore());
+    });
+  }
 
   Widget _content() {
     if (_archiveOpen) return _archiveContent();
@@ -852,8 +1069,8 @@ class _SessionsPageState extends State<SessionsPage> {
         onAction: _clearSearch,
       );
     }
-    // 已加载会话是分页取的：列表走到末尾就补下一页，搜索要覆盖全部会话。
-    if (_cursor != null) WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    // 已加载会话是分页取的：搜索态结果不足一屏时排一帧补页（滚动补页见 [_onScroll]）。
+    if (query.isNotEmpty) _kickLoadMore();
     // 全集已经按「运行中 → 时间」排好，这里只切两段。
     final active = [
       for (final row in shown)
@@ -865,26 +1082,42 @@ class _SessionsPageState extends State<SessionsPage> {
     ];
     // 时间标签一次算好传给每行：滚动时不会为每一行重新读设备时钟。
     final now = DateTime.now();
-    return ListView(
+    final entries = <_SessionEntry>[
+      if (active.isNotEmpty) ...[
+        _HeaderEntry('运行中会话', active.length, highlighted: true, topPadding: 8),
+        for (final row in active) _RowEntry(row),
+      ],
+      if (rest.isNotEmpty) ...[
+        _HeaderEntry(
+          active.isEmpty ? '全部会话' : '其他会话',
+          rest.length,
+          topPadding: active.isEmpty ? 8 : 12,
+        ),
+        for (final row in rest) _RowEntry(row),
+      ],
+      // 归档入口固定在列表底部：弱化一行，与「运行中/其他」的分组头区分开。
+      if (archived.isNotEmpty) _ArchiveEntryRow(archived.length),
+      _GapEntry(72 + MediaQuery.paddingOf(context).bottom),
+    ];
+    // 只按可见范围构建：会话数 50+ 时首帧与每次刷新不再一次性搭出全部行
+    // （头像解码、时间格式、Material/InkWell 都在 itemBuilder 里发生）。
+    return ListView.builder(
+      controller: _scroll,
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.only(top: 4),
-      children: [
-        if (active.isNotEmpty) ...[
-          _SectionHeader(label: '运行中会话', count: active.length, highlighted: true, topPadding: 8),
-          for (final row in active) _tile(row, now),
-        ],
-        if (rest.isNotEmpty) ...[
+      itemCount: entries.length,
+      itemBuilder: (context, index) => switch (entries[index]) {
+        _HeaderEntry(:final label, :final count, :final highlighted, :final topPadding) =>
           _SectionHeader(
-            label: active.isEmpty ? '全部会话' : '其他会话',
-            count: rest.length,
-            topPadding: active.isEmpty ? 8 : 12,
+            label: label,
+            count: count,
+            highlighted: highlighted,
+            topPadding: topPadding,
           ),
-          for (final row in rest) _tile(row, now),
-        ],
-        // 归档入口固定在列表底部：弱化一行，与「运行中/其他」的分组头区分开。
-        if (archived.isNotEmpty) _ArchiveEntry(count: archived.length, onTap: _openArchive),
-        SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
-      ],
+        _RowEntry(:final row) => _tile(row, now),
+        _ArchiveEntryRow(:final count) => _ArchiveEntry(count: count, onTap: _openArchive),
+        _GapEntry(:final height) => SizedBox(height: height),
+      },
     );
   }
 
@@ -902,14 +1135,27 @@ class _SessionsPageState extends State<SessionsPage> {
       );
     }
     final now = DateTime.now();
-    return ListView(
+    final entries = <_SessionEntry>[
+      _HeaderEntry('归档会话', rows.length, topPadding: 8),
+      for (final row in rows) _RowEntry(row),
+      _GapEntry(72 + MediaQuery.paddingOf(context).bottom),
+    ];
+    return ListView.builder(
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.only(top: 4),
-      children: [
-        _SectionHeader(label: '归档会话', count: rows.length, topPadding: 8),
-        for (final row in rows) _tile(row, now),
-        SizedBox(height: 72 + MediaQuery.paddingOf(context).bottom),
-      ],
+      itemCount: entries.length,
+      itemBuilder: (context, index) => switch (entries[index]) {
+        _HeaderEntry(:final label, :final count, :final highlighted, :final topPadding) =>
+          _SectionHeader(
+            label: label,
+            count: count,
+            highlighted: highlighted,
+            topPadding: topPadding,
+          ),
+        _RowEntry(:final row) => _tile(row, now),
+        _ArchiveEntryRow(:final count) => _ArchiveEntry(count: count, onTap: _openArchive),
+        _GapEntry(:final height) => SizedBox(height: height),
+      },
     );
   }
 
@@ -948,6 +1194,44 @@ String _relativeTime(DateTime time, DateTime now) {
   if (day == today) return '今天 $hm';
   if (today.difference(day).inDays == 1) return '昨天 $hm';
   return '${time.month.toString().padLeft(2, '0')}-${time.day.toString().padLeft(2, '0')} $hm';
+}
+
+/// 虚拟化列表的一项：分组头 / 会话行 / 归档入口 / 底部留白。
+/// 只描述「是什么」，对应的 Widget 由 `ListView.builder` 按可见性构建。
+sealed class _SessionEntry {
+  const _SessionEntry();
+}
+
+class _HeaderEntry extends _SessionEntry {
+  const _HeaderEntry(
+    this.label,
+    this.count, {
+    this.highlighted = false,
+    this.topPadding = 8,
+  });
+
+  final String label;
+  final int count;
+  final bool highlighted;
+  final double topPadding;
+}
+
+class _RowEntry extends _SessionEntry {
+  const _RowEntry(this.row);
+
+  final SessionRow row;
+}
+
+class _ArchiveEntryRow extends _SessionEntry {
+  const _ArchiveEntryRow(this.count);
+
+  final int count;
+}
+
+class _GapEntry extends _SessionEntry {
+  const _GapEntry(this.height);
+
+  final double height;
 }
 
 class _SectionHeader extends StatelessWidget {

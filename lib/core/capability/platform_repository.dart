@@ -30,12 +30,21 @@ class PlatformRepository {
   Future<List<PlatformConversation>> conversations() async {
     final json = await api.getJson('/api/platform/conversations');
     if (json is! Map) throw ApiFailure('INTERNAL', '平台会话返回体异常');
-    final items = <PlatformConversation>[];
-    for (final item in (json['items'] as List?) ?? const []) {
-      final conversation = PlatformConversation.fromJson(item);
-      if (conversation != null) items.add(conversation);
+    try {
+      final items = <PlatformConversation>[];
+      final raw = json['items'];
+      if (raw is! List) return items;
+      for (final item in raw) {
+        final conversation = PlatformConversation.fromJson(item);
+        if (conversation != null) items.add(conversation);
+      }
+      return items;
+    } on ApiFailure {
+      rethrow;
+    } catch (_) {
+      // 字段漂移（`count:"12"` 等）收敛成 ApiFailure：页面只认识它。
+      throw ApiFailure('INTERNAL', '平台会话返回体字段异常');
     }
-    return items;
   }
 
   /// 一个会话的消息页，时间升序。
@@ -53,13 +62,31 @@ class PlatformRepository {
       if (before != null) 'before': '${before.millisecondsSinceEpoch}',
     });
     if (json is! Map) throw ApiFailure('INTERNAL', '平台消息返回体异常');
-    final items = <PlatformMessage>[];
-    for (final item in (json['items'] as List?) ?? const []) {
-      final message = PlatformMessage.fromJson(item);
-      if (message != null) items.add(message);
+    try {
+      final raw = json['items'];
+      final items = <PlatformMessage>[
+        if (raw is List)
+          for (final item in raw) ?PlatformMessage.fromJson(item),
+      ];
+      // 契约是升序；万一服务端换了顺序，分页游标与倒序渲染都会错位，这里先兜住。
+      items.sort((a, b) => a.time.compareTo(b.time));
+      return PlatformMessagePage(items, _asBool(json['hasMore']));
+    } on ApiFailure {
+      rethrow;
+    } catch (_) {
+      throw ApiFailure('INTERNAL', '平台消息返回体字段异常');
     }
-    // 契约是升序；万一服务端换了顺序，分页游标与倒序渲染都会错位，这里先兜住。
-    items.sort((a, b) => a.time.compareTo(b.time));
-    return PlatformMessagePage(items, json['hasMore'] == true);
+  }
+
+  /// `hasMore` 接受 bool、数字与字符串（`1` / `"true"` / `"1"`）：
+  /// 只认 `== true` 会让翻页在字段漂移时提前结束。
+  static bool _asBool(Object? value) {
+    if (value is bool) return value;
+    if (value is num) return value != 0;
+    if (value is String) {
+      final text = value.trim().toLowerCase();
+      return text == 'true' || text == '1' || text == 'yes';
+    }
+    return false;
   }
 }

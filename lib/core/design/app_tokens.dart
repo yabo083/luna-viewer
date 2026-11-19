@@ -184,3 +184,27 @@ extension AppColorsX on BuildContext {
   AppColors get colors =>
       Theme.of(this).extension<AppColors>() ?? AppColors.of(Theme.of(this).brightness);
 }
+
+/// 列表/气泡里图片的解码宽度：按显示的逻辑宽度 × 像素比，上限 `dp × dpr × 1.5`。
+///
+/// 解码内存按像素面积增长：按原图分辨率解一张 4000px 的照片就是 ~60MB，并且会
+/// 常驻 `ImageCache`（退页也不释放）。1.5 倍只用来吸收圆形裁切/轻微缩放，
+/// 再高的分辨率在手机屏上没有可见收益。
+int imageDecodeWidthFor(BuildContext context, double logicalWidth) {
+  final dpr = MediaQuery.devicePixelRatioOf(context);
+  final needed = logicalWidth * dpr;
+  final cap = logicalWidth * dpr * 1.5;
+  return (needed <= cap ? needed : cap).ceil();
+}
+
+/// 头像在应用里的最大展示尺寸：列表行 40dp，气泡/顶栏 28–32dp。
+const double kAvatarMaxDisplaySize = 40;
+
+/// 头像的统一解码宽度：**固定**按最大展示尺寸算，不随所在位置变化。
+///
+/// 头像显示在 28/32/40dp 三种位置；如果各按自己的尺寸解码，同一个 URL 会在
+/// `ImageCache` 里占三条 entry（@dpr3 是 84/96/120 px），LRU 压力凭空 ×3，
+/// 而且从列表点进详情还要按新尺寸重新解码。统一到最大档位后一个 URL 只有一条，
+/// 尺寸比像素略大的位置由 `BoxFit.cover` 缩放，肉眼无差。
+int avatarDecodeWidthFor(BuildContext context) =>
+    imageDecodeWidthFor(context, kAvatarMaxDisplaySize);

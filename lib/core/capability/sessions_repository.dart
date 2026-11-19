@@ -16,12 +16,14 @@ class SessionsRepository {
       'cursor': ?cursor,
     });
     if (json is! Map) throw ApiFailure('INTERNAL', '会话列表返回体异常');
-    final items = <SessionSummary>[];
-    for (final item in (json['items'] as List?) ?? const []) {
-      if (item is Map) items.add(SessionSummary.fromJson(item.cast<String, Object?>()));
-    }
-    final next = json['nextCursor'];
-    return Page(items, next is String ? next : null);
+    return _parsing('会话列表', () {
+      final items = <SessionSummary>[];
+      for (final item in (json['items'] as List?) ?? const []) {
+        if (item is Map) items.add(SessionSummary.fromJson(item.cast<String, Object?>()));
+      }
+      final next = json['nextCursor'];
+      return Page(items, next is String ? next : null);
+    });
   }
 
   /// 只对 web 来源会话有效（服务端 renameWebSession 的约束）。
@@ -35,34 +37,53 @@ class SessionsRepository {
   Future<Transcript> transcript(String id) async {
     final json = await api.getJson('/api/sessions/${Uri.encodeComponent(id)}/messages');
     if (json is! Map) throw ApiFailure('INTERNAL', '消息返回体异常');
-    final messages = <ChatMessage>[];
-    for (final item in (json['messages'] as List?) ?? const []) {
-      if (item is Map) messages.add(ChatMessage.fromJson(item.cast<String, Object?>()));
+    return _parsing('会话日志', () {
+      final messages = <ChatMessage>[];
+      for (final item in (json['messages'] as List?) ?? const []) {
+        if (item is Map) messages.add(ChatMessage.fromJson(item.cast<String, Object?>()));
+      }
+      final breaks = <Map<String, Object?>>[];
+      for (final item in (json['cacheBreaks'] as List?) ?? const []) {
+        if (item is Map) breaks.add(item.cast<String, Object?>());
+      }
+      return Transcript(messages, (json['length'] as num?)?.toInt() ?? messages.length, breaks);
+    });
+  }
+
+  /// 把解析期的 `TypeError`/`FormatException` 收敛成 `ApiFailure`：
+  /// 页面只认识 ApiFailure，坏字段才不会以未捕获异常逃进 Zone / 轮询循环。
+  /// 文案固定，不回显服务端正文（可能含 HTML / 敏感内容）。
+  static T _parsing<T>(String what, T Function() parse) {
+    try {
+      return parse();
+    } on ApiFailure {
+      rethrow;
+    } catch (_) {
+      throw ApiFailure('INTERNAL', '$what返回体字段异常');
     }
-    final breaks = <Map<String, Object?>>[];
-    for (final item in (json['cacheBreaks'] as List?) ?? const []) {
-      if (item is Map) breaks.add(item.cast<String, Object?>());
-    }
-    return Transcript(messages, (json['length'] as num?)?.toInt() ?? messages.length, breaks);
   }
 
   /// 实例当前可用的聊天模型，按 provider 分组（`GET /api/models`）。
   Future<Map<String, List<ModelOption>>> models() async {
     final json = await api.getJson('/api/models');
     if (json is! Map) throw ApiFailure('INTERNAL', '模型列表返回体异常');
-    final grouped = <String, List<ModelOption>>{};
-    for (final item in (json['providers'] as List?) ?? const []) {
-      if (item is! Map) continue;
-      final provider = item['provider'];
-      if (provider is! String || provider.isEmpty) continue;
-      final options = <ModelOption>[];
-      for (final raw in (item['models'] as List?) ?? const []) {
-        final option = ModelOption.fromJson(raw);
-        if (option != null) options.add(option);
+    return _parsing('模型列表', () {
+      final grouped = <String, List<ModelOption>>{};
+      final providers = json['providers'];
+      if (providers is! List) return grouped;
+      for (final item in providers) {
+        if (item is! Map) continue;
+        final provider = item['provider'];
+        if (provider is! String || provider.isEmpty) continue;
+        final rawModels = item['models'];
+        final options = <ModelOption>[
+          if (rawModels is List)
+            for (final raw in rawModels) ?ModelOption.fromJson(raw),
+        ];
+        grouped[provider] = options;
       }
-      grouped[provider] = options;
-    }
-    return grouped;
+      return grouped;
+    });
   }
 
   /// 切换会话模型；服务端立即解析成 `provider:model` 并回写会话。
@@ -122,17 +143,25 @@ class SessionsRepository {
       '/api/sessions/${Uri.encodeComponent(id)}/events',
       lastEventId: since,
     )) {
-      final event = _sessionEvent(id, sse);
+      // 单帧坏形状只丢这一帧：一条解析缺口不能把整条事件流（计时）打断。
+      final SessionEvent? event;
+      try {
+        event = _sessionEvent(id, sse);
+      } catch (_) {
+        continue;
+      }
       if (event != null) yield event;
     }
   }
 
   /// 帧形状（实测）：`{n,time,kind,seq,type}` + 载荷；消息在 `message`，mark 在 `name`/`data`。
-  /// 服务端给帧 `id`，没有就用 `sessionId:n` 复现同一种形式，供 `Last-Event-ID` 续传。
+  /// 帧自带 `n` 时优先用它生成 `sessionId:n`：服务端漏写 `id` 时 SSE 规范会沿用上一帧的
+  /// `id`，直接拿它去重会把下一帧当成重复吞掉。`sse.id` 只在没有 `n` 时兜底。
   static SessionEvent? _sessionEvent(String sessionId, SseEvent sse) {
     final frame = sse.data;
     final n = frame?['n'];
-    final id = sse.id ?? (n is num ? '$sessionId:${n.toInt()}' : null);
+    final seq = n is num ? n.toInt() : (n is String ? int.tryParse(n.trim()) : null);
+    final id = seq != null ? '$sessionId:$seq' : sse.id;
     switch (sse.event) {
       case 'truncated':
         return const SessionEvent.truncated();
@@ -171,6 +200,18 @@ class SessionsRepository {
     }
   }
 
-  static DateTime? _frameTime(Object? raw) =>
-      raw is num ? DateTime.fromMillisecondsSinceEpoch(raw.toInt()) : null;
+  /// mark 的 `time` 可能是数字毫秒、数字字符串或 ISO 串（旧数据/发版差异）。
+  /// 解析不出来时返回 null：调用方会把它当成「没有时间」的帧，而不是用上一轮的起点。
+  static DateTime? _frameTime(Object? raw) {
+    if (raw is num) return DateTime.fromMillisecondsSinceEpoch(raw.toInt()).toLocal();
+    if (raw is! String) return null;
+    final text = raw.trim();
+    if (text.isEmpty) return null;
+    final epoch = int.tryParse(text);
+    if (epoch != null) {
+      final ms = epoch < 100000000000 ? epoch * 1000 : epoch;
+      return DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+    }
+    return DateTime.tryParse(text)?.toLocal();
+  }
 }

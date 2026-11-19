@@ -23,9 +23,10 @@ class ConnectionStore {
 
   final _secure = const FlutterSecureStorage(
     aOptions: AndroidOptions(),
+    // 不要 userPresence：未录入生物识别或首次解锁前读取会让钥匙串直接失败，
+    // 用户每次启动都要重贴 token。`first_unlock_this_device` 已保证锁屏时读不到。
     iOptions: IOSOptions(
       accessibility: KeychainAccessibility.first_unlock_this_device,
-      accessControlFlags: [AccessControlFlag.userPresence],
     ),
   );
 

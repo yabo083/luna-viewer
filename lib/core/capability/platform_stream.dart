@@ -39,7 +39,9 @@ class PlatformStream {
   StreamSubscription<SseEvent>? _sse;
   Timer? _retry;
   final Set<String> _seen = {};
-  int _backoff = 1;
+  static const int _retryFloorSeconds = 15;
+  static const int _retryCeilSeconds = 120;
+  int _backoff = _retryFloorSeconds;
   bool _retrying = false;
   bool _closed = false;
 
@@ -53,8 +55,8 @@ class PlatformStream {
         .sse('/api/platform/stream', includeComments: true)
         .listen(
           (event) {
-            // 任何帧都证明链路健康（`: ping` 也走这里）：退避回到 1s。
-            _backoff = 1;
+            // 任何帧都证明链路健康（`: ping` 也走这里）：退避回到下限。
+            _backoff = _retryFloorSeconds;
             if (event.event == 'comment') return;
             final data = event.data;
             if (data == null) return;
@@ -63,19 +65,50 @@ class PlatformStream {
             if (key is! String || key.isEmpty || message == null) return;
             _collect(PlatformEvent(key, message));
           },
-          // 401 之类也走同一条退避：不在能力层跳页，页面生命周期由调用方管。
-          onError: (Object _) => _scheduleRetry(),
+          onError: (Object error) {
+            // 凭证失效不重试：按退避反复打 401 也不会自己恢复，只会耗电。
+            // 把错误交给页面，由页面提示「重新连接」。
+            if (error is ApiFailure && error.isUnauthorized) {
+              _failAuth(error);
+              return;
+            }
+            _scheduleRetry();
+          },
           onDone: _scheduleRetry,
           cancelOnError: true,
         );
   }
 
-  /// 断线退避 1→2→4→8→16→30s，封顶后不再涨。
+  /// 401：停掉退避表，把错误原样送给订阅方，然后像 [dispose] 一样收尾连接。
+  void _failAuth(ApiFailure error) {
+    if (_closed) return;
+    _closed = true;
+    _retry?.cancel();
+    _retry = null;
+    _retrying = false;
+    final sub = _sse;
+    _sse = null;
+    unawaited(sub?.cancel().catchError((Object _) {}));
+    if (!_controller.isClosed) {
+      // 没有订阅方时不要再 addError（会变成未处理异常）；关闭照做。
+      if (_controller.hasListener) _controller.addError(error);
+      _controller.close();
+    }
+    Future<void>.delayed(const Duration(milliseconds: 80), () {
+      try {
+        _api.close();
+      } catch (_) {}
+    });
+  }
+
+  /// 断线退避 15→30→60→120s，封顶后不再涨。
+  /// 下限 15s：空闲时每次重连都是一条新 TCP，1s 起步会在服务端抖动时刷出一串连接；
+  /// 断线期间列表/详情本来就没有帧可看，等 15s 不影响内容（重连会回放最近消息）。
   void _scheduleRetry() {
     if (_closed || _retrying) return;
     _retrying = true;
     final seconds = _backoff;
-    _backoff = seconds >= 16 ? 30 : seconds * 2;
+    _backoff = seconds >= _retryCeilSeconds ? _retryCeilSeconds : seconds * 2;
     _retry?.cancel();
     _retry = Timer(Duration(seconds: seconds), () {
       _retrying = false;

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -8,6 +10,13 @@ import 'features/sessions/sessions_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 解码后的位图是 PSS 里最大的一块「可控」内存：ImageCache 默认允许
+  // 100MB / 1000 张，长会话滚一遍就把整段历史缩略图全留在内存里（退页也不还）。
+  // 48MB / 80 张 = 当前屏 + 前后一两屏；配合各处的 `cacheWidth`，
+  // 长会话的峰值由「字节上限」决定，而不是由图片数量决定。
+  final imageCache = PaintingBinding.instance.imageCache;
+  imageCache.maximumSize = 80;
+  imageCache.maximumSizeBytes = 48 << 20;
   final store = ConnectionStore();
   final connection = await store.load();
   final prefs = await SharedPreferences.getInstance();
@@ -30,20 +39,49 @@ class ChatLunaApp extends StatefulWidget {
   State<ChatLunaApp> createState() => _ChatLunaAppState();
 }
 
-class _ChatLunaAppState extends State<ChatLunaApp> {
+class _ChatLunaAppState extends State<ChatLunaApp> with WidgetsBindingObserver {
   Connection? _connection;
   late final ValueNotifier<ThemeMode> _themeMode = ValueNotifier(widget.themeMode);
+
+  /// 切后台后 60s 才丢解码位图：短时间的 HOME/切到别的 App 不清缓存，
+  /// 回来时头像与气泡图片仍在，不会「重新下载 + 重新解码」闪一遍。
+  Timer? _backgroundTrim;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _connection = widget.initial;
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _backgroundTrim?.cancel();
     _themeMode.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _backgroundTrim?.cancel();
+      _backgroundTrim = null;
+      return;
+    }
+    if (state != AppLifecycleState.paused) return;
+    _backgroundTrim ??= Timer(const Duration(seconds: 60), () {
+      _backgroundTrim = null;
+      // 真后台超过 60s：屏幕不可见，清掉 LRU 里的解码位图；正在显示的
+      // Widget 仍持有自己的 ImageInfo，所以回来第一帧不会变空。
+      PaintingBinding.instance.imageCache.clear();
+    });
+  }
+
+  @override
+  void didHaveMemoryPressure() {
+    // 系统已经在回收：解码位图是最大的一块可控内存，直接交还。
+    PaintingBinding.instance.imageCache.clear();
   }
 
   Future<void> _setTheme(ThemeMode mode) async {

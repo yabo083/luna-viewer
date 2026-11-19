@@ -83,15 +83,25 @@ class SessionSummary {
 
   bool get writable => origin == 'web';
 
-  factory SessionSummary.fromJson(Map<String, Object?> json) => SessionSummary(
-    id: (json['id'] ?? json['sessionId'] ?? '') as String,
-    title: (json['title'] as String?) ?? '(未命名)',
-    createdAt: DateTime.fromMillisecondsSinceEpoch((json['createdAt'] as num?)?.toInt() ?? 0),
-    origin: (json['origin'] as String?) ?? 'web',
-    running: (json['running'] as bool?) ?? false,
-    engine: (json['engine'] as String?) ?? '',
-    model: ModelRef.fromJson(json['model']),
-  );
+  factory SessionSummary.fromJson(Map<String, Object?> json) {
+    final rawId = json['id'] ?? json['sessionId'];
+    final title = json['title'];
+    final origin = json['origin'];
+    final engine = json['engine'];
+    return SessionSummary(
+      // 展示/身份字段做类型容错；`createdAt`/`running` 是排序与状态的关键事实，
+      // 漂移时由仓储层收敛成 ApiFailure，不能让错误类型静默变成「1970 / 未运行」。
+      id: rawId is String ? rawId : '',
+      title: title is String && title.isNotEmpty ? title : '(未命名)',
+      createdAt: DateTime.fromMillisecondsSinceEpoch(
+        (json['createdAt'] as num?)?.toInt() ?? 0,
+      ),
+      origin: origin is String && origin.isNotEmpty ? origin : 'web',
+      running: (json['running'] as bool?) ?? false,
+      engine: engine is String ? engine : '',
+      model: ModelRef.fromJson(json['model']),
+    );
+  }
 }
 
 class Page<T> {
@@ -379,16 +389,19 @@ String? absoluteResourceUrl(Uri? base, String? raw) {
 }
 
 /// 平台时间戳：毫秒（13 位）/ 秒（10 位）数字或 ISO 串都接受。
+/// 统一转本地时区：服务端给 `...Z` 时，展示层直接读 `hour/minute` 才不会偏一个时区。
 DateTime _platformTime(Object? raw) {
   if (raw is num) {
     final value = raw.toInt();
-    return DateTime.fromMillisecondsSinceEpoch(value < 100000000000 ? value * 1000 : value);
+    return DateTime.fromMillisecondsSinceEpoch(
+      value < 100000000000 ? value * 1000 : value,
+    ).toLocal();
   }
   final text = raw?.toString().trim() ?? '';
   if (text.isEmpty) return DateTime.fromMillisecondsSinceEpoch(0);
   final epoch = int.tryParse(text);
   if (epoch != null) return _platformTime(epoch);
-  return DateTime.tryParse(text) ?? DateTime.fromMillisecondsSinceEpoch(0);
+  return (DateTime.tryParse(text) ?? DateTime.fromMillisecondsSinceEpoch(0)).toLocal();
 }
 
 /// 可选时间：缺失或解析成 0 时返回 null，调用方据此降级（不画时间、按顺序兜底）。
@@ -404,7 +417,12 @@ class ChatBlock {
   final String type;
   final Map<String, Object?> data;
 
-  String? get text => data['text'] as String?;
+  /// 文本可缺省、也可能被服务端写成数字：非字符串时按「没有文本」处理，
+  /// 不能让一条坏块把整条消息的渲染打断。
+  String? get text {
+    final value = data['text'];
+    return value is String ? value : null;
+  }
 }
 
 class ChatMessage {
@@ -459,13 +477,15 @@ class ChatMessage {
     } else if (raw is String) {
       blocks.add(ChatBlock('text', {'text': raw}));
     }
-    final form = (json['form'] as String?) ?? '';
+    final rawForm = json['form'];
+    final form = rawForm is String ? rawForm : '';
     final source = json['source'];
     final sourceKind = source is Map ? source['kind'] : null;
     final rawId = json['id'];
+    final rawRole = json['role'];
     return ChatMessage(
       id: rawId is String && rawId.isNotEmpty ? rawId : (fallbackId ?? ''),
-      role: (json['role'] as String?) ?? 'assistant',
+      role: rawRole is String && rawRole.isNotEmpty ? rawRole : 'assistant',
       blocks: blocks,
       form: form,
       isFramework: (form.isNotEmpty && form != 'message') || sourceKind == 'plugin',
@@ -488,17 +508,40 @@ class ChatMessage {
     // 多数回合的答复是通过 `reply` 工具发出的，assistant 自身没有 text 块。
     if (raw.trim().isEmpty) raw = _replyContent();
     if (raw.trim().isEmpty) return '';
-    final parts = RegExp(r'<message>([\s\S]*?)</message>').allMatches(raw).map((m) => m.group(1) ?? '').toList();
+    final parts = _messageTagPattern.allMatches(raw).map((m) => m.group(1) ?? '').toList();
     var body = parts.isEmpty ? raw : parts.join('\n');
     body = body.replaceAllMapped(
-      RegExp(r'''<img[^>]*src\s*=\s*["']([^"']+)["'][^>]*>''', caseSensitive: false),
+      _imgTagPattern,
       (m) => '\n![](${m.group(1)})\n',
     );
-    body = body.replaceAll(RegExp(r'<status[\s\S]*?(/>|</status>)'), '');
-    body = body.replaceAll(RegExp(r'</(turn|status|message|mood|bond|state)>'), '');
-    body = body.replaceAll(RegExp(r'<(?!br\s*/?>)(/?[a-zA-Z][^>]*)>'), '');
+    body = body.replaceAll(_statusTagPattern, '');
+    // 只剥「明确的 HTML/平台标签」：标签名必须在白名单里，属性必须是 `name=value`
+    // 形态。用户正文里的 `a<b && c>d`、`vector<int>`、`<T>` 因此原样保留；
+    // `<div>` 这类真的是 HTML 的片段仍按旧行为清理。`<br>` 保留（markdown 换行）。
+    body = body.replaceAll(_knownTagPattern, '');
     return body.trim();
   }
+
+  /// 正文清洗用的三个正则只编译一次：每条消息第一次读 `bodyMarkdown` 都会用到。
+  static final RegExp _messageTagPattern = RegExp(r'<message>([\s\S]*?)</message>');
+  static final RegExp _imgTagPattern = RegExp(
+    r'''<img[^>]*src\s*=\s*["']([^"']+)["'][^>]*>''',
+    caseSensitive: false,
+  );
+  static final RegExp _statusTagPattern = RegExp(r'<status[\s\S]*?(/>|</status>)');
+
+  /// 可识别的标签：HTML 常见标签 + 角色引擎的包裹标签（`message`/`status`/…）。
+  /// 属性部分不接受 `&&`、`+` 之类正文符号，避免把比较表达式当成标签。
+  static final RegExp _knownTagPattern = RegExp(
+    r'</?(?:a|b|i|u|s|p|div|span|strong|em|small|big|font|center|hr|'
+    r'html|head|body|meta|link|script|style|table|thead|tbody|tfoot|tr|td|th|'
+    r'ul|ol|li|dl|dt|dd|blockquote|pre|code|img|section|article|header|footer|'
+    r'turn|status|message|mood|bond|state)'
+    r'(?:\s+[a-zA-Z_:][-a-zA-Z0-9_:]*'
+    r'(?:\s*=\s*(?:"[^"]*"|\x27[^\x27]*\x27|[^\s>"\x27]+))?)*'
+    r'\s*/?>',
+    caseSensitive: false,
+  );
 
   /// 指令类文本：只认用户角色（避免把模型正文里引用命令的帮助文字误判成指令）。
   /// - 首行（trim 后）以 `chatluna ` 开头：单条命令或单行说明；
@@ -589,15 +632,19 @@ class ChatMessage {
   /// 正文是否真的含 markdown 语法。纯散文消息直接走 Text，省掉整棵 markdown widget 的构建。
   late final bool hasMarkup = _hasMarkup(bodyMarkdown);
 
+  /// 语法探测只编译一次：每条消息在第一次访问 `hasMarkup` 时都会用到它。
+  static final RegExp _markupPattern = RegExp(
+    r'(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|\|)'
+    r'|```'
+    r'|`[^`\n]+`'
+    r'|\*\*|__'
+    r'|!\['
+    r'|\[[^\]]+\]\([^)]+\)',
+  );
+
   static bool _hasMarkup(String text) {
     if (text.isEmpty) return false;
-    return RegExp(r'(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|\|)'
-            r'|```'
-            r'|`[^`\n]+`'
-            r'|\*\*|__'
-            r'|!\['
-            r'|\[[^\]]+\]\([^)]+\)')
-        .hasMatch(text);
+    return _markupPattern.hasMatch(text);
   }
 
   String _replyContent() {
@@ -960,7 +1007,10 @@ class LiveEvent {
         return null;
       case 'agent/assistant-settled':
         final outcome = data?['outcome'];
-        final reason = outcome is Map ? outcome['reason'] as String? : null;
+        // 服务端字段漂移（数字/对象）时降级成 null，别让一条坏帧打断整条 `/live`。
+        final reason = outcome is Map && outcome['reason'] is String
+            ? outcome['reason'] as String
+            : null;
         return LiveEvent.settled(reason);
       case 'lagged':
         return const LiveEvent.lagged();

@@ -51,6 +51,7 @@ class ChatPage extends StatefulWidget {
     this.avatarUrl,
     this.botName,
     this.showDeveloperInfo = false,
+    this.onAuthExpired,
   });
 
   /// 已加载会话的操作入口（中止/压缩/分叉/换模型）；不是消息来源。
@@ -83,6 +84,10 @@ class ChatPage extends StatefulWidget {
   /// 设置里的「显示平台/引擎/性能信息」，由会话列表页传入。
   final bool showDeveloperInfo;
 
+  /// 凭证失效（401）且用户确认重新连接时调用：由根节点清 token 并回连接页。
+  /// 为 null 时只在页内提示，不再重试。
+  final Future<void> Function()? onAuthExpired;
+
   @override
   State<ChatPage> createState() => _ChatPageState();
 }
@@ -110,8 +115,16 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 已加载的消息，时间升序（最新在末尾；倒序列表把它按 index 反过来渲染）。
   List<PlatformMessage> _messages = const [];
 
+  /// [PlatformMessage] 列表的版本号：每次换列表都 `+1`，时间线按它判断要不要重算。
+  /// 只换列表内容、不换对象（如脚注时间戳）时不递增也不影响时间线结构。
+  int _messagesRev = 0;
+
   /// 已入列的消息 id：分页、实时帧、重载三条路都靠它去重。
   final Set<String> _ids = {};
+
+  /// 已确认连续的最早时间：翻页游标用它，而不是 `_messages.first.time`。
+  /// 实时流会补发比当前最早一条更早的消息，用数组首元素会让游标倒退、反复取同一段。
+  DateTime? _earliest;
 
   /// 框架消息（wake/memory/工具摘要等）：只对已加载会话从 `/api/sessions/:id/messages`
   /// 与 `/events` 取。平台消息里没有这些，所以单独一条时间线，渲染成居中单卡片。
@@ -119,13 +132,30 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   List<TimelineNotice> _framework = const [];
   final Set<String> _frameworkIds = {};
 
+  /// [TimelineNotice] 列表的版本号（见 [_messagesRev]）。
+  int _frameworkRev = 0;
+
+  /// 时间线的记忆化结果：`build()` 不再全量合并排序（300 条时是每帧 O(n log n)）。
+  /// 流式 tick 只更新 `_streamingText`，不进 `build`，因此这里不会失效。
+  List<TimelineItem>? _items;
+  int _itemsMessagesRev = -1;
+  int _itemsFrameworkRev = -1;
+
   /// 框架块上限：长开页面只留最近的，避免无限增长。
   static const int _frameworkCap = 400;
 
   StreamSubscription<SessionEvent>? _eventsSub;
   bool _eventsStarted = false;
   Timer? _eventsRetry;
+  /// `/events` 断线退避 1→2→4→8→30s（401 时停表）。
+  int _eventsBackoff = 1;
+  /// `/events` 空闲判死：服务端连 `: ping` 都不发时，订阅会永远挂着。
+  Timer? _eventsIdleTimer;
+  static const _eventsIdle = Duration(seconds: 20);
   bool _frameworkStarted = false;
+
+  /// `truncated` 帧触发的全量重取合并：短时间多帧只重取一次。
+  Timer? _truncatedRefresh;
 
   /// `/events` 的续传游标（`<sessionId>:<n>`）：订阅时只补日志 head 之后的帧。
   /// 不带它会把整段历史重放一遍，上一轮的 mark 会被当成这一轮的起点。
@@ -142,7 +172,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 时间线项的 Widget 缓存：同一条消息在后续 setState 里复用同一个实例，
   /// `ListView` 因此跳过整棵 markdown 重建（滚动之外的主要开销）。
+  /// 上限 [ _itemCacheCap ] 条，按最近使用淘汰：长开大群时不再无限保留整棵 markdown。
   final Map<String, Widget> _itemCache = {};
+  static const int _itemCacheCap = 200;
 
   bool _loading = true;
   bool _loadingMore = false;
@@ -158,7 +190,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   StreamSubscription<LiveEvent>? _liveSub;
   Timer? _snapshotTimer;
+  /// `/live` 每帧重置的空闲计时器：首帧之后半死（不再出帧也不 FIN）时主动判死重连。
+  Timer? _liveIdleTimer;
+  static const _liveIdle = Duration(seconds: 20);
   bool _liveStarted = false;
+  DateTime? _liveDownAt;
+
+  /// 401 之后所有后台表都必须停：继续重试不会恢复，只会一直打服务端。
+  bool _authFailed = false;
 
   /// 状态轮询表：未加载时探测会话，`/live` 掉线时兜底读 running。
   /// 页面不可见（App 后台 / 被别的路由盖住）或已加载且流在线时停表。
@@ -359,6 +398,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _eventsStarted = false;
     _eventsRetry?.cancel();
     _eventsRetry = null;
+    _eventsIdleTimer?.cancel();
+    _eventsIdleTimer = null;
+    _truncatedRefresh?.cancel();
+    _truncatedRefresh = null;
+    _runningCheck?.cancel();
+    _runningCheck = null;
+    _liveIdleTimer?.cancel();
+    _liveIdleTimer = null;
     _streamSub?.cancel();
     _streamSub = null;
     _stream?.dispose();
@@ -368,6 +415,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _flushTimer = null;
     _streaming.clear();
     _streamingText.value = '';
+    // 后台没有屏幕可看：把这一页的 Widget/解析缓存放掉。
+    // 历史消息本身不删，回前台按需重建（当前屏的几颗气泡）。
+    // 解码位图**不在这里清**：切一次后台就清会让回前台的头像/图片全部重新解码
+    // （甚至重新下载），是「头像反复加载」的直接诱因。整进程的清理交给
+    // `main.dart` 的 60s 后台计时器与内存压力回调。
+    _itemCache.clear();
+    MessageView.clearCaches();
+    clearNoticeKeys();
   }
 
   @override
@@ -386,11 +441,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _streamingText.dispose();
     _unseen.dispose();
     _liveSub?.cancel();
+    _liveIdleTimer?.cancel();
     _eventsSub?.cancel();
     _eventsRetry?.cancel();
+    _eventsIdleTimer?.cancel();
+    _truncatedRefresh?.cancel();
     _streamSub?.cancel();
     _stream?.dispose();
     _snapshotTimer?.cancel();
+    _itemCache.clear();
+    // 这一页的正文解析结果与对齐键随页面释放（进程级缓存，退出详情页不该常驻）。
+    MessageView.clearCaches();
+    clearNoticeKeys();
     _scroll.dispose();
     super.dispose();
   }
@@ -410,7 +472,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// - 页面不可见（App 后台 / 被别的路由盖住）→ 停表；
   /// - 已加载且流在线 → 停表。
   void _ensurePolling() {
-    final needed = _foreground && _routeVisible && (!_loaded || _polling);
+    final needed = !_authFailed && _foreground && _routeVisible && (!_loaded || _polling);
     if (needed) {
       _pollTimer ??= Timer.periodic(
         _pollInterval,
@@ -448,8 +510,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         if (!running) _clock.stopped();
         _setLive(running ? LiveState.thinking : LiveState.idle);
       }
-    } on ApiFailure {
-      // 探测与兜底都是后台补齐：网络抖动等下一拍，不弹错、不影响消息流。
+    } on ApiFailure catch (e) {
+      // 凭证失效不会自己恢复：停表并提示重新连接；其余网络抖动等下一拍。
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      }
+    } catch (_) {
+      // 坏字段/未预期异常同样只算这一拍失败，不能逃进 Zone。
     } finally {
       _pollInFlight = false;
       if (mounted) _ensurePolling();
@@ -537,8 +604,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       } else if (_streaming.isEmpty) {
         _setLive(LiveState.thinking);
       }
-    } on ApiFailure {
+    } on ApiFailure catch (e) {
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      }
       // 兜底也是尽力而为：网络抖动等下一拍。
+    } catch (_) {
+      // 同上：单拍失败不影响消息流。
     } finally {
       _pollInFlight = false;
     }
@@ -586,6 +658,70 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _itemCache.clear();
   }
 
+  /// 401：停掉轮询、探测与三路流，只提示一次「重新连接」。
+  /// 继续按原节奏重试只会永远 401（token 被轮换 / 设备被踢），并且耗电。
+  void _handleAuthFailure() {
+    if (_authFailed) return;
+    _authFailed = true;
+    _stopPolling();
+    _stopProbe();
+    _liveStarted = false;
+    _liveSub?.cancel();
+    _liveSub = null;
+    _liveIdleTimer?.cancel();
+    _liveIdleTimer = null;
+    _snapshotTimer?.cancel();
+    _snapshotTimer = null;
+    _liveRetryTimer?.cancel();
+    _liveRetryTimer = null;
+    _eventsStarted = false;
+    _eventsSub?.cancel();
+    _eventsSub = null;
+    _eventsRetry?.cancel();
+    _eventsRetry = null;
+    _eventsIdleTimer?.cancel();
+    _eventsIdleTimer = null;
+    _truncatedRefresh?.cancel();
+    _truncatedRefresh = null;
+    _streamSub?.cancel();
+    _streamSub = null;
+    _stream?.dispose();
+    _stream = null;
+    if (mounted) _setLive(LiveState.idle);
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('登录已失效'),
+        content: const Text('实例的访问 token 已失效。重新连接并输入新的 token 后才能继续。'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              // 详情页是压栈路由：先回到列表，再由根节点清凭证切到连接页。
+              Navigator.of(context).popUntil((route) => route.isFirst);
+              unawaited(widget.onAuthExpired?.call() ?? Future<void>.value());
+            },
+            child: const Text('重新连接'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 错误页/HTML 正文不进 UI：只给稳定的短文案，原正文留在 ApiFailure 里供调试。
+  static String _displayFailure(ApiFailure failure) {
+    final message = failure.message;
+    final looksLikePage =
+        message.contains('<') || message.contains('\n') || message.length > 160;
+    if (looksLikePage) {
+      final status = failure.status == null ? '' : '（HTTP ${failure.status}）';
+      return '${failure.code}：服务器返回了错误$status';
+    }
+    return '${failure.code}：$message';
+  }
+
   // ---------------------------------------------------------------- 消息加载
 
   /// 最新一页（首次进入、重载、失败重试共用）。已经通过实时流进来的更新消息不会被丢掉。
@@ -605,15 +741,19 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       });
     } on ApiFailure catch (e) {
       if (!mounted) return;
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+        return;
+      }
       setState(() {
         _loading = false;
-        _error = '${e.code}：${e.message}';
+        _error = _displayFailure(e);
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = '加载失败：$e';
+        _error = '加载失败，请稍后重试';
       });
     } finally {
       // 首页结果出来后再补框架块：这样日志里的平台消息能给框架条目当时间锚点。
@@ -623,15 +763,21 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 用最新一页对齐：页内的消息以服务端为准，页外更新的（流式期间刚到的）保留在后面。
   void _mergeNewest(PlatformMessagePage page) {
-    final pageIds = {for (final message in page.items) message.id};
-    final newest = page.items.isEmpty ? null : page.items.last.time;
+    // 页内也可能重复给同一条（服务端拼接两段）：按 id 只留第一条。
+    final pageIds = <String>{};
+    final items = <PlatformMessage>[
+      for (final message in page.items)
+        if (pageIds.add(message.id)) message,
+    ];
+    final newest = items.isEmpty ? null : items.last.time;
     final newer = <PlatformMessage>[
       for (final message in _messages)
         if (!pageIds.contains(message.id) &&
             (newest == null || message.time.isAfter(newest)))
           message,
     ];
-    _messages = [...page.items, ...newer];
+    _setMessages([...items, ...newer]);
+    _earliest = items.isEmpty ? null : items.first.time;
     _ids
       ..clear()
       ..addAll(pageIds)
@@ -645,7 +791,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 未加载的会话没有日志可拉，直接不显示框架块。
   Future<void> _loadFramework({bool force = false}) async {
     final session = _session;
-    if (session == null) return;
+    if (_authFailed || session == null) return;
     if (_frameworkStarted && !force) return;
     _frameworkStarted = true;
     try {
@@ -653,8 +799,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (!mounted) return;
       // 不带游标订阅：`/messages` 的 `length` 不是日志 `n`（实测 167 vs 380），
       // 拿它当 Last-Event-ID 会让服务端卡在空窗口里什么都不发。
-      // 历史重放由 [_onSessionEvent] 按帧时间过滤。
+      // 历史重放由 [_onSessionEvent] 按帧时间过滤；强制重载时把过滤基准也前移，
+      // 否则重新打开游标后重放的历史 mark 会被当成本轮。
       _eventsSince = null;
+      if (force) _eventsOpenedAt = DateTime.now();
       final log = transcript.messages;
       // 平台消息正文 → 时间：日志里的平台消息有时没时戳，框架块也要靠它定锚。
       final platformTimes = <String, DateTime>{};
@@ -704,13 +852,16 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           for (final entry in _framework)
             if (!ids.contains(entry.id)) entry,
         ];
-        _framework = orderNotices([...entries, ...tail]);
+        _setFramework(orderNotices([...entries, ...tail]));
         _frameworkIds
           ..clear()
           ..addAll(_framework.map((entry) => entry.id));
       });
-    } on ApiFailure {
-      // 框架块只是补充：拿不到就只显示平台消息，不弹错。
+    } on ApiFailure catch (e) {
+      // 框架块只是补充：拿不到就只显示平台消息，不弹错；401 仍要收敛。
+      if (e.isUnauthorized) _handleAuthFailure();
+    } catch (_) {
+      // 坏字段同样只影响框架块，不影响平台消息。
     } finally {
       // 有没有日志都要接 `/events`：没拿到 head 就退回全量重放（只影响罕见的失败路径）。
       _transcriptLoaded = true;
@@ -748,10 +899,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final id = 'local-${DateTime.now().microsecondsSinceEpoch}';
     if (!_frameworkIds.add(id)) return;
     setState(() {
-      _framework = orderNotices([
-        ..._framework,
-        TimelineNotice(id: id, text: text, time: _afterLatest()),
-      ]);
+      _setFramework(
+        orderNotices([
+          ..._framework,
+          TimelineNotice(id: id, text: text, time: _afterLatest()),
+        ]),
+      );
     });
     _followIfAtBottom();
   }
@@ -760,14 +913,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 等日志 head 到手再订阅：不带游标的重放会让上一轮的 mark 变成这一轮的起点。
   void _startEvents() {
     final session = _session;
-    if (_eventsStarted || session == null || !_transcriptLoaded) return;
+    if (_authFailed || _eventsStarted || session == null || !_transcriptLoaded) {
+      return;
+    }
     _eventsStarted = true;
     _eventsOpenedAt = DateTime.now();
+    _touchEventsIdle();
     _eventsSub = widget.repo
         .events(session.id, since: _eventsSince)
         .listen(
           (event) {
             if (!mounted) return;
+            _touchEventsIdle();
+            // 收到帧就说明链路健康：下一次断线从 1s 重新退避。
+            _eventsBackoff = 1;
             // 续传游标：任何一帧都推进它，断线重连不会把上一轮的 mark 再放一遍。
             final id = event.id;
             if (id != null && id.isNotEmpty) _eventsSince = id;
@@ -778,31 +937,64 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           },
           onError: (Object error) {
             _eventsSub = null;
+            _eventsIdleTimer?.cancel();
+            _eventsIdleTimer = null;
+            if (error is ApiFailure && error.isUnauthorized) {
+              _handleAuthFailure();
+              return;
+            }
             _restartEvents();
           },
           onDone: () {
             _eventsSub = null;
+            _eventsIdleTimer?.cancel();
+            _eventsIdleTimer = null;
             _restartEvents();
           },
           cancelOnError: true,
         );
   }
 
-  /// 事件流断了就重来（`/events` 是长连接，切网/半死对它无解）：
+  /// `/events` 空闲判死：连接还在、但一行都不来（也不 FIN）时主动 cancel 走退避。
+  /// 20s 比服务端 15s 心跳多留一档余量；每收到一帧就重置。
+  void _touchEventsIdle() {
+    _eventsIdleTimer?.cancel();
+    _eventsIdleTimer = Timer(_eventsIdle, () {
+      _eventsIdleTimer = null;
+      if (!mounted || !_eventsStarted) return;
+      _eventsSub?.cancel();
+      _eventsSub = null;
+      _eventsStarted = false;
+      _restartEvents();
+    });
+  }
+
+  /// 事件流断了按 1→2→4→8→30s 退避重来（`/events` 是长连接，切网/半死对它无解）：
   /// 游标是最后收到的帧 id，重放只补断口之后的条目。
   void _restartEvents() {
-    if (!mounted || _eventsRetry != null) return;
-    _eventsRetry = Timer(const Duration(seconds: 2), () {
+    if (!mounted || _authFailed || _eventsRetry != null) return;
+    final seconds = _eventsBackoff;
+    _eventsBackoff = seconds >= 8 ? 30 : seconds * 2;
+    _eventsRetry = Timer(Duration(seconds: seconds), () {
       _eventsRetry = null;
-      if (!mounted) return;
+      if (!mounted || _authFailed) return;
       _eventsStarted = false;
       _startEvents();
     });
   }
 
   void _onSessionEvent(SessionEvent event) {
-    // 增量窗口失效：服务端随后会补最后 N 条，这里不用重取日志。
-    if (event.truncated) return;
+    // 增量窗口失效：本地增量不可信，重取全量；重放过滤基准同步前移，
+    // 否则服务端补发的历史 mark 会被当成本轮的起点。
+    if (event.truncated) {
+      _eventsSince = null;
+      _eventsOpenedAt = DateTime.now();
+      _truncatedRefresh ??= Timer(const Duration(milliseconds: 300), () {
+        _truncatedRefresh = null;
+        if (mounted && !_authFailed) unawaited(_loadFramework(force: true));
+      });
+      return;
+    }
     // mark：轮次与阶段的权威打点（`agent/input-enqueued` / `engine/activity` / …）。
     final mark = event.name;
     if (mark != null) {
@@ -844,9 +1036,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         ..._framework,
         TimelineNotice(id: id, text: text, time: time),
       ]);
-      _framework = next.length > _frameworkCap
-          ? next.sublist(next.length - _frameworkCap)
-          : next;
+      _setFramework(
+        next.length > _frameworkCap
+            ? next.sublist(next.length - _frameworkCap)
+            : next,
+      );
     });
   }
 
@@ -858,7 +1052,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       final page = await widget.platform.messages(
         widget.conversationKey,
         limit: _pageSize,
-        before: _messages.first.time,
+        before: _earliest ?? _messages.first.time,
       );
       if (!mounted) return;
       // 时间相同的两条可能同时落在两页里，id 去重后只留一条。
@@ -867,12 +1061,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           if (_ids.add(message.id)) message,
       ];
       setState(() {
-        _messages = [...fresh, ..._messages];
+        _setMessages([...fresh, ..._messages]);
+        // 游标跟着服务端这一页的最早一条走，不受实时补发的旧消息影响。
+        if (page.items.isNotEmpty) _earliest = page.items.first.time;
         // 服务端说没有了，或这一页没有新东西（游标没生效）就停手，避免空转。
         _hasMore = page.hasMore && fresh.isNotEmpty;
       });
     } on ApiFailure catch (e) {
-      if (mounted) _toast('加载更早的消息失败 ${e.code}：${e.message}');
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      } else if (mounted) {
+        _toast('加载更早的消息失败 ${_displayFailure(e)}');
+      }
+    } catch (_) {
+      if (mounted) _toast('加载更早的消息失败');
     } finally {
       _loadingMore = false;
     }
@@ -884,15 +1086,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// 详情页只拿到 `ApiClient.authHeaders`，从同一个头里取回 token 自建客户端。
   void _startStream() {
     // 回前台会重走这里；已有订阅就不再开第二条（PlatformStream 自己不带幂等）。
-    if (_streamSub != null) return;
+    if (_authFailed || _streamSub != null) return;
     final token = _bearer;
     if (token == null || token.isEmpty) return;
     final stream = PlatformStream(widget.base, token);
     _stream = stream;
     _streamSub = stream.events.listen(
       _onPlatformEvent,
-      // 断线退避在 PlatformStream 内部：这里只收消息，不把页面拖垮。
-      onError: (Object _) {},
+      // 断线退避在 PlatformStream 内部；401 会以错误送上来，这里停掉整页重试。
+      onError: (Object error) {
+        _streamSub = null;
+        if (error is ApiFailure && error.isUnauthorized) {
+          _handleAuthFailure();
+        }
+      },
     );
   }
 
@@ -953,7 +1160,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   bool _insertMessage(PlatformMessage message) {
     final last = _messages.isEmpty ? null : _messages.last;
     if (last == null || !message.time.isBefore(last.time)) {
-      _messages = [..._messages, message];
+      _setMessages([..._messages, message]);
       return true;
     }
     final next = [..._messages];
@@ -961,7 +1168,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       (existing) => existing.time.isAfter(message.time),
     );
     next.insert(index < 0 ? next.length : index, message);
-    _messages = next;
+    _setMessages(next);
     return false;
   }
 
@@ -981,7 +1188,15 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// `/live` 只对已加载会话有意义（未加载的会话没有 agent，只会 404）。
   void _startLive() {
     final session = _session;
-    if (_liveStarted || session == null || !mounted) return;
+    if (_authFailed || _liveStarted || session == null || !mounted) return;
+    // 主题切换等重建会重走 `_ensurePolling` 的即时重连：给退避表一个最小间隔，
+    // 不要每次重建都绕过 9s 直接打服务端。
+    final downAt = _liveDownAt;
+    if (_liveRetryTimer != null &&
+        downAt != null &&
+        DateTime.now().difference(downAt) < _liveRetryDelay) {
+      return;
+    }
     _liveStarted = true;
     // 新连接=新握手：重连后的第一个 snapshot 必须重新等，否则看门狗从此失效。
     _snapshotSeen = false;
@@ -995,6 +1210,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (!mounted || _snapshotSeen) return;
       _liveDown();
     });
+    // 首帧之外的看门狗：每帧都重置；生成中途流半死（不再出帧、也不 FIN）时判死重连。
+    _touchLiveIdle();
     _liveSub?.cancel();
     _liveSub = widget.repo
         .live(session.id)
@@ -1002,6 +1219,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           (event) {
             if (!mounted) return;
             _lastLiveAt = DateTime.now();
+            _touchLiveIdle();
             // 流在说话：兜底探测立刻让位。
             if (_probeStartedAt != null || _probeDelay != null) _stopProbe();
             _liveMs ??= _since();
@@ -1113,8 +1331,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _setLive(LiveState.idle);
             }
           },
-          onError: (Object _) {
+          onError: (Object error) {
             if (!mounted) return;
+            // 401 不重连：token 不会自己恢复，交给页面提示重新连接。
+            if (error is ApiFailure && error.isUnauthorized) {
+              _handleAuthFailure();
+              return;
+            }
             // `/live` 断了就没法知道具体阶段：退回 3s 轮询读 running，
             // 信息栏显示「轮询中」，消息仍由平台流补上。
             _liveDown();
@@ -1127,11 +1350,25 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         );
   }
 
+  /// 空闲判死：20s 没有 `/live` 帧就主动结束当前订阅，走 9s 退避重连。
+  /// 20s 比服务端 15s 心跳多留一档余量；注释心跳在 ApiClient 里也会触发帧级判活。
+  void _touchLiveIdle() {
+    _liveIdleTimer?.cancel();
+    _liveIdleTimer = Timer(_liveIdle, () {
+      _liveIdleTimer = null;
+      if (!mounted || !_liveStarted) return;
+      _liveDown();
+    });
+  }
+
   /// `/live` 掉线：轮询接管状态，9s 后再试一次流。
   /// 轮询的停止条件与探测共用一张表：页面不可见、或流重新接上（snapshot）即停。
   void _liveDown() {
     _liveStarted = false;
+    _liveDownAt = DateTime.now();
     _stopProbe();
+    _liveIdleTimer?.cancel();
+    _liveIdleTimer = null;
     // 先掐掉旧连接：半死连接可能还在吐帧，不能让它和新连接同时改状态。
     _liveSub?.cancel();
     _liveSub = null;
@@ -1177,8 +1414,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         final match = await _lookupSession();
         if (!mounted) return;
         if (match != null && !match.running) _clock.stopped();
-      } on ApiFailure {
-        // 尽力而为：下一次外发或轮询还会再问。
+      } on ApiFailure catch (e) {
+        // 尽力而为：下一次外发或轮询还会再问；401 仍要停表。
+        if (e.isUnauthorized) _handleAuthFailure();
+      } catch (_) {
+        // 读状态失败不影响已落库的消息。
       }
     });
   }
@@ -1389,9 +1629,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _skeletonAborted = false;
       _removeSkeleton();
     } on ApiFailure catch (e) {
-      if (mounted) _toast('重新发送失败 ${e.code}：${e.message}');
-    } catch (e) {
-      if (mounted) _toast('重新发送失败：$e');
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      } else if (mounted) {
+        _toast('重新发送失败 ${_displayFailure(e)}');
+      }
+    } catch (_) {
+      if (mounted) _toast('重新发送失败');
     } finally {
       if (mounted) setState(() => _cancelling = false);
     }
@@ -1464,9 +1708,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _streamingText.value = '';
       _setLive(LiveState.idle);
     } on ApiFailure catch (e) {
-      _toast('取消失败 ${e.code}：${e.message}');
-    } catch (e) {
-      _toast('取消失败：$e');
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      } else {
+        _toast('取消失败 ${_displayFailure(e)}');
+      }
+    } catch (_) {
+      _toast('取消失败');
     } finally {
       if (mounted) setState(() => _cancelling = false);
     }
@@ -1479,7 +1727,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       final result = await widget.repo.compact(session.id);
       _toast('已压缩：${result ?? '完成'}');
     } on ApiFailure catch (e) {
-      _toast('压缩失败 ${e.code}：${e.message}');
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      } else {
+        _toast('压缩失败 ${_displayFailure(e)}');
+      }
+    } catch (_) {
+      _toast('压缩失败');
     }
   }
 
@@ -1490,7 +1744,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       final child = await widget.repo.fork(session.id);
       _toast('已分叉：${child.sessionId}（${child.length} 条）');
     } on ApiFailure catch (e) {
-      _toast('分叉失败 ${e.code}：${e.message}');
+      if (e.isUnauthorized) {
+        _handleAuthFailure();
+      } else {
+        _toast('分叉失败 ${_displayFailure(e)}');
+      }
+    } catch (_) {
+      _toast('分叉失败');
     }
   }
 
@@ -1554,9 +1814,52 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     ];
   }
 
+  /// 换消息列表的唯一入口：顺带推进版本号，时间线只在这时重算。
+  void _setMessages(List<PlatformMessage> next) {
+    _messages = next;
+    _messagesRev += 1;
+  }
+
+  /// 换框架块列表的唯一入口（同上）。
+  void _setFramework(List<TimelineNotice> next) {
+    _framework = next;
+    _frameworkRev += 1;
+  }
+
   /// 时间线：平台消息 + 框架块合并成一条（规则见 [mergeTimeline]）。
   /// 框架块的锚点在加载时就已经定下，所以这里只做排序与分组，翻页后位置不漂。
-  List<TimelineItem> _timeline() => mergeTimeline(_messages, _framework);
+  ///
+  /// 结果按两个列表的版本号记忆化：`build()` 每帧都会走这里，300 条时
+  /// 原来每帧都要建索引 Map、排序、生成三个新列表；现在只有消息/框架块
+  /// 真正变化时才重算一次。流式正文走 `ValueNotifier`，不会让 `build` 进来。
+  List<TimelineItem> _timeline() {
+    final cached = _items;
+    if (cached != null &&
+        _itemsMessagesRev == _messagesRev &&
+        _itemsFrameworkRev == _frameworkRev) {
+      return cached;
+    }
+    final items = mergeTimeline(_messages, _framework);
+    _items = items;
+    _itemsMessagesRev = _messagesRev;
+    _itemsFrameworkRev = _frameworkRev;
+    return items;
+  }
+
+  /// 日期分隔条的标签：今天 / 昨天 / `YYYY-MM-DD`。
+  /// 在时间线项第一次构建时算好（随后进 Widget 缓存），不随每帧读系统时钟。
+  static String _dayLabel(DateTime day) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final diff = today.difference(day).inDays;
+    return switch (diff) {
+      0 => '今天',
+      1 => '昨天',
+      _ =>
+        '${day.year}-${day.month.toString().padLeft(2, '0')}-'
+            '${day.day.toString().padLeft(2, '0')}',
+    };
+  }
 
   /// 时间线上的一项 → Widget。缓存键包含渲染所需的全部可变输入（id / 是否显示头部），
   /// 因此同一个实例可以安全复用；状态（折叠、图片解码）都在子 widget 自己的 State 里。
@@ -1564,7 +1867,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final (cacheKey, build) = switch (item) {
       DayDividerItem(:final day) => (
         'd:${day.toIso8601String()}',
-        () => _DayDivider(day: day),
+        // 标签在缓存未命中时算一次：日期条不随每帧重建去读系统时钟。
+        () => _DayDivider(label: _dayLabel(day)),
       ),
       NoticeItem(:final notice) => (
         'n:${notice.id}',
@@ -1599,7 +1903,22 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         ),
       ),
     };
-    return _itemCache[cacheKey] ??= build();
+    return _cachedItem(cacheKey, build);
+  }
+
+  /// 有上限的最近使用缓存：命中后挪到队尾，超限淘汰最久没用的那一项。
+  Widget _cachedItem(String key, Widget Function() build) {
+    final cached = _itemCache.remove(key);
+    if (cached != null) {
+      _itemCache[key] = cached;
+      return cached;
+    }
+    final widget = build();
+    _itemCache[key] = widget;
+    if (_itemCache.length > _itemCacheCap) {
+      _itemCache.remove(_itemCache.keys.first);
+    }
+    return widget;
   }
 
   /// 列表末格：骨架气泡（灰条占位 + 描边上的计时标签 + 中止后的重新发送）。
@@ -2088,24 +2407,15 @@ class _SkeletonBarsState extends State<_SkeletonBars>
 enum _SkeletonPhase { none, running, holding, fading }
 
 /// 日期分隔条：今天 / 昨天 / `YYYY-MM-DD`，弱化居中。
+/// [label] 由时间线层预算好：分隔条不读系统时钟，避免每帧对每个分隔条做一次日期差。
 class _DayDivider extends StatelessWidget {
-  const _DayDivider({required this.day});
+  const _DayDivider({required this.label});
 
-  final DateTime day;
+  final String label;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final diff = today.difference(day).inDays;
-    final label = switch (diff) {
-      0 => '今天',
-      1 => '昨天',
-      _ =>
-        '${day.year}-${day.month.toString().padLeft(2, '0')}-'
-            '${day.day.toString().padLeft(2, '0')}',
-    };
     final colors = context.colors;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: Space.x12),
