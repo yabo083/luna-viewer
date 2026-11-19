@@ -4,11 +4,31 @@
   "description": "Platform message store and authenticated workspace file bridge for ChatLuna v2 mobile clients.",
   "type": "module",
   "main": "index.mjs",
-  "files": ["index.mjs", "README.md"],
-  "keywords": ["chatluna", "cordis", "koishi", "media", "bridge"],
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "chatluna",
+    "cordis",
+    "koishi",
+    "media",
+    "bridge"
+  ],
   "license": "MIT",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "peerDependencies": {
     "cordis": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yabo083/luna-viewer.git",
+    "directory": "packages/chatluna-plugin-media-bridge"
+  },
+  "homepage": "https://github.com/yabo083/luna-viewer#readme",
+  "bugs": {
+    "url": "https://github.com/yabo083/luna-viewer/issues"
   }
 }

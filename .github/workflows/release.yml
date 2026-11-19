@@ -24,6 +24,26 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Configure signing (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "storeFile=$RUNNER_TEMP/release.jks"
+              echo "storePassword=$KEYSTORE_PASSWORD"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "keyPassword=$KEY_PASSWORD"
+            } > android/key.properties
+            echo "signing configured"
+          else
+            echo "no keystore secrets; the release will be debug-signed (internal only)"
+          fi
+
       - name: Build APKs
         run: |
           flutter pub get
@@ -39,8 +59,3 @@ jobs:
           files: build/app/outputs/flutter-apk/app-*-release.apk
           generate_release_notes: true
 
-# 签名：release 默认用仓库内的 debug keystore 之外的方式签名会失败。
-# 开源版建议两条路：
-# 1) 不签名分发：改成 `flutter build apk --debug`（体积大、性能差，仅内测）；
-# 2) 配置签名：把 keystore 转 base64 存到 Secrets（KEYSTORE_B64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），
-#    在 build 前解出 android/key.properties 与 .jks（见 docs/release.md）。

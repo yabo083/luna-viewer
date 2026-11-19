@@ -1,6 +1,22 @@
 # Luna Viewer
 
+[![ci](https://github.com/yabo083/luna-viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/yabo083/luna-viewer/actions/workflows/ci.yml)
+[![release](https://github.com/yabo083/luna-viewer/actions/workflows/release.yml/badge.svg)](https://github.com/yabo083/luna-viewer/actions/workflows/release.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 个人自用的 ChatLuna v2 会话查看器（v0.1.0）：会话列表、流式对话、会话级配置。
+
+## 安装
+
+从 [Releases](https://github.com/yabo083/luna-viewer/releases) 下载 `app-arm64-v8a-release.apk`（arm64 设备）安装即可。
+
+服务端需要一个 ChatLuna v2 实例；平台消息与控制接口由仓库内插件 `packages/chatluna-plugin-media-bridge` 提供：
+
+```bash
+npm install -g chatluna-plugin-media-bridge   # 或从源码 file:// 引用
+```
+
+在实例 `chatluna.yml` 里加一个插件节点指向它，重启后 `/api/platform/*` 生效（详见插件 README）。
 
 `docs/` 是协议与交互契约，`AGENTS.md` 是本仓库的编码约束。
 
