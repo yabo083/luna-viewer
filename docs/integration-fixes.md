@@ -35,3 +35,19 @@
 ## 回归
 
 `flutter analyze` 零问题；`flutter test` 136 项全绿（含新增 `turn_label_test.dart`）。
+
+## 真机验证（2026-11-19 22:43–22:57）
+
+设备 `10CF8403GA0049P`（V2425A，USB），服务端 `192.168.0.107:5028`。
+
+| 项 | 方法 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 构建 | `flutter build apk --debug --target-platform android-arm64` | 成功；`app-debug.apk` 162,211,903 B，mtime 22:43:44 | `build/app/outputs/flutter-apk/app-debug.apk` |
+| 静默安装 | `adb push … /data/local/tmp/clm.apk` + `pm install -r -t`，`verifier_verify_adb_installs=0` | `Success`（整条命令 31.6 s）；`lastUpdateTime=2026-11-19 22:53:22` 与构建时间对得上；未 uninstall / pm clear | `dumpsys package love.mikumiku.chatluna_mobile` |
+| 凭证保留 | 冷启动（force-stop 后 `am start`） | 直接进「会话」列表，`全部会话 10`，无登录/连接页 | `tmp/verify-r3/01-launch.png`、`03-relaunch-list.png` |
+| 打开会话（未加载态） | 列表点「webui」（platform `web`，key `r-90887e65ce6d`） | 详情页显示 `angela / web / · 未加载`，仅一条平台历史消息；无 Flutter 异常（logcat 过滤 `exception|error|fatal` 为空） | `tmp/verify-r3/02-conversation.png`、`04-conversation-final.png` |
+| 状态灯「思考中」 | 需已加载会话 + `POST /api/sessions/:id/steer` | **未覆盖**：22:52:10 `GET /api/sessions` → `{"items":[]}`（200）、`GET /api/agents` → `[]`（200）；`POST /api/sessions` 创建 web 会话 → `403 {"code":"FORBIDDEN","message":"this route is disabled"}`（全局路由 `chat.engine.mode: silent`）；对 unloaded id 直接 `POST /api/sessions/r-90887e65ce6d/steer` → `404 session does not exist or is not loaded` | 服务端 curl（本条时间戳 22:52–22:56） |
+| 骑缝标签点开阶段明细 | 同上，需一轮真实生成产生骨架 | **未覆盖**（同一原因） | — |
+| 404 降级回归 | 需「先已加载、后被服务端卸载」的会话 | **未覆盖**（当前没有已加载会话） | — |
+
+结论：构建、静默安装、凭证保留、未加载态渲染在真机上通过；状态灯与阶段明细两项修复**未取得真机证据**，原因是服务端当前没有任何已加载会话，且 web 会话创建被路由配置禁用（`403 this route is disabled`）。待下一次 QQ agent 认领会话（bot 实际参与一轮对话后 `GET /api/sessions` 出现 `items`）时，按 `integration-report.md` 第 5 节最小复现补测：steer 后 1–3 s 内截图看状态灯、点骨架骑缝读秒标签看明细弹层。
