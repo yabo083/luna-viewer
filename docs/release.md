@@ -1,4 +1,4 @@
-# 发布
+# 发布（Luna Viewer）
 
 ## Android APK（GitHub Releases）
 

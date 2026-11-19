@@ -1,6 +1,6 @@
-# chatluna-mobile
+# Luna Viewer
 
-ChatLuna v2 的移动端客户端（v0.1.0）：会话列表、流式对话、会话级配置、预设编辑。
+个人自用的 ChatLuna v2 会话查看器（v0.1.0）：会话列表、流式对话、会话级配置。
 
 `docs/` 是协议与交互契约，`AGENTS.md` 是本仓库的编码约束。
 

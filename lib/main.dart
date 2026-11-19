@@ -158,7 +158,7 @@ class _ChatLunaAppState extends State<ChatLunaApp> with WidgetsBindingObserver {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: _themeMode,
       builder: (context, mode, _) => MaterialApp(
-        title: 'ChatLuna',
+        title: 'Luna Viewer',
         debugShowCheckedModeBanner: false,
         theme: _theme(Brightness.light),
         darkTheme: _theme(Brightness.dark),
