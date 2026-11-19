@@ -15,9 +15,9 @@
 
 | APK | 大小 | SHA-256 |
 | --- | --- | --- |
-| `app-arm64-v8a-release.apk`（装机用） | 20,960,780 B | `85d6b563d138ccb7209b7615590e852f556d454da2965abe0deca1eba3321359` |
-| `app-armeabi-v7a-release.apk` | — | `aff0b933a54e46d165a72d08a87bc2fec669e07bf3414618451b7870158b3ba2` |
-| `app-x86_64-release.apk` | — | `e39eea89a29381d652b7fc6f7a6d42662cec3a2f0f8e628efae07640c7420132` |
+| `app-arm64-v8a-release.apk`（装机用） | 20,960,780 B | `4b044bb835969dbbcb7444744ebef20fe21c12c14af5d8935eeebc17a634b190` |
+| `app-armeabi-v7a-release.apk` | 18,908,424 B | `419163534f6609ceb34ff83108bc0c86c2ae7de5a18746152be78c242c143e55` |
+| `app-x86_64-release.apk` | 22,327,264 B | `ed7ac927ee90e406062cf36b5bc7055944467a7e0a4f092f06fc5a8851c39715` |
 
 ## 签名
 
@@ -37,7 +37,7 @@ SHA-256: BB:F0:F5:BA:42:D8:9F:3F:B9:ED:58:9B:55:E3:22:7F:7A:1C:90:A6:70:D2:B1:04
 adb push build/app/outputs/flutter-apk/app-arm64-v8a-release.apk /data/local/tmp/luna.apk
 adb shell pm install -r -t /data/local/tmp/luna.apk   → Success
 adb shell dumpsys package love.mikumiku.chatluna_mobile
-  versionName=0.1.0  versionCode=2001  lastUpdateTime=2026-11-19 23:51:46
+  versionName=0.1.0  versionCode=2001  lastUpdateTime=2026-11-20 00:58:45
 ```
 
 装前设备上已有的同名 release 直接被 `-r` 覆盖升级（签名相同），没有 uninstall / `pm clear`，登录前旧凭证已不存在，因此从连接页重新登录。
@@ -58,3 +58,9 @@ adb shell dumpsys package love.mikumiku.chatluna_mobile
 ## 标签
 
 `git tag -a v0.1.0 -m "Luna Viewer 0.1.0"`（本地，未推远端）。
+
+## 0.1.0 终版修复（同日稍后）
+
+- **骨架抖动**：`settle` 不再被当成整轮终点（draw 执行期无 attempt），`resolveTurnEnd` 要求「外发已落库 + 生成已停」；流式正文格空态返回 0 高；骑缝标签定宽 132 + `FittedBox`。真机 pixel 比对：全程 y 偏移 0（仅骨架插入/气泡落库两次一次性位移）。
+- **骨架中途消失**：整轮 44.0 s 连续在场 89/89 帧，跨 draw 执行期与轮询 `running=false`，重新插入 0 次。
+- 标签 `v0.1.0` 指向 `18fa228` 之后的文档提交；上述 APK 即该提交构建。
