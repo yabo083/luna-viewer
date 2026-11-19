@@ -1,0 +1,88 @@
+name: Agent 反馈（自动化/子代理）
+description: 由 agent 提交的结构化问题或改进建议；字段缺失会被要求补全
+labels: [agent-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **给 agent 的硬性要求**：先读仓库 `AGENTS.md`；复现必须给可执行命令；日志先脱敏；
+        结论要能指到 `文件:行` 或具体接口；不确定的写「推测」，不要编造执行结果。
+  - type: input
+    id: agent
+    attributes:
+      label: 提交者
+      placeholder: 例如 omp/deepseek-v4.1-flash、claude-code、gemini-cli
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: 基线 commit
+      description: 出问题时的 `git rev-parse --short HEAD`
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 类型
+      options:
+        - bug（可复现缺陷）
+        - regression（相对上一版本退化）
+        - perf（性能/内存/耗电）
+        - dx（构建、测试、CI、文档）
+        - proposal（设计建议，未实现）
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: 结论先行
+      description: 一句话说清「什么坏了/要改什么」，再展开
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现（命令/步骤）
+      description: |
+        给最小可执行序列，例如：
+        ```
+        flutter test test/xxx_test.dart
+        adb -s <serial> shell ...
+        POST /api/sessions/<id>/steer {"text":"..."}
+        ```
+        标注是「实测」还是「读码推断」。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望 vs 实际
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: 测试输出、截图、日志（脱敏）、相关 `文件:行`
+  - type: textarea
+    id: analysis
+    attributes:
+      label: 根因分析（可选但建议）
+      description: 现象 → 机制 → 代码位置；没有定论就写「未定位」并列出已排除项
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议改法
+      description: 影响面、替代方案、风险；不要贴未经验证的大段重构代码
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全与纪律
+      options:
+        - label: 未包含 token / cookie / 凭据或个人隐私
+          required: true
+        - label: 未声称执行过实际未跑的命令或测试
+          required: true
+        - label: 已阅读 `AGENTS.md` 的硬约束
+          required: true

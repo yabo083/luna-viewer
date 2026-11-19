@@ -1,0 +1,27 @@
+name: 功能请求（人类）
+description: 新的交互、渲染或运维能力
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 先写场景与现状，不要先写实现
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望的形态
+      description: 越具体越好；如果涉及协议，注明需要实例侧提供什么
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案与代价
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 范围
+      options:
+        - label: 只涉及 App（不改实例/插件）
+        - label: 需要实例或插件侧配合

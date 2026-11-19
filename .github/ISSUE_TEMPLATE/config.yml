@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用与连接问题 / Setup & connection
+    url: https://github.com/yabo083/luna-viewer#安装
+    about: 先看 README 的安装与服务端插件说明；实例侧 API 由 chatluna-plugin-media-bridge 提供。
+  - name: ChatLuna v2 相关协议问题
+    url: https://github.com/ChatLunaLab/v2-mirror/issues
+    about: /live、/events 等协议行为归上游或实例侧；本仓库只消费。

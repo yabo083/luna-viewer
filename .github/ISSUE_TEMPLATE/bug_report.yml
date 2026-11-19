@@ -1,0 +1,60 @@
+name: Bug 报告（人类）
+description: 界面、交互、消息渲染、连接等可复现问题
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请确认：**这不是你的实例或插件的问题**（`/api/platform/*` 用 curl 能 200），且已用最新 release 复现。
+        **不要粘贴 token、cookie、完整 URL 里的 `?token=`。**
+  - type: input
+    id: version
+    attributes:
+      label: App 版本
+      placeholder: 0.1.1（设置 → 关于 里可复制）
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: 设备与系统
+      placeholder: vivo V2425A / Android 16
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出问题的区域
+      options:
+        - 会话列表
+        - 会话详情（气泡/媒体/骨架）
+        - 实时状态（状态灯/计时/中止）
+        - 连接与鉴权
+        - 主题与设置
+        - 其它
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 …
+        2. 点 …
+        3. 期望 …，实际 …
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: 截图/录屏（可拖拽上传）；日志请先脱敏
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 已确认不是实例侧问题（`/api/platform/conversations` 可 200）
+          required: true
+        - label: 内容中不含 token / cookie / 账号凭据
+          required: true
