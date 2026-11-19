@@ -298,18 +298,15 @@ class TurnPhaseLog {
 /// 本轮终点：生成已停 + 最后一条 bot 外发已落库，取更晚的那个。
 ///
 /// - 生成还在跑 → null（投递只是这一轮里的一条消息，不是终点）；
-/// - 已停但投递还没到 → 等 [grace]，超时按停止时刻收尾（空回复、投递失败也要收表）；
+/// - 已停但投递还没到 → null：`settle` / `running=false` 只说明模型这一步说完了，
+///   异步工具（draw 等）可能正在跑、下一步要几分钟后才开。按「停了 N 秒」提前收表，
+///   会让骨架在用户等首个 token 时消失——那是最不该消失的时候；
 /// - 都到齐 → `max(stoppedAt, deliveredAt)`：停表之后再落库的 1–2s 也算进本轮。
 Duration? resolveTurnEnd({
   required Duration? stoppedAt,
   required Duration? deliveredAt,
-  required Duration now,
-  required Duration grace,
 }) {
-  if (stoppedAt == null) return null;
-  if (deliveredAt == null) {
-    return now - stoppedAt >= grace ? stoppedAt : null;
-  }
+  if (stoppedAt == null || deliveredAt == null) return null;
   return deliveredAt > stoppedAt ? deliveredAt : stoppedAt;
 }
 
@@ -332,14 +329,14 @@ Duration turnStartLead(
 ///
 /// - 起点：[start]（mark / active snapshot / `running`）可重复调用，只接受更早的起点；
 /// - 阶段：[phase] / [endPhase] / [phaseFinished] 维护 [TurnPhaseLog]；
-/// - 终点：[stopped]（生成停）+ [delivered]（最后一条外发落库）都到齐才收表；
+/// - 终点：[stopped]（生成停）+ [delivered]（最后一条外发落库）都到齐才收表，
+///   而且这一轮不能还有 attempt 在跑、工具还没收（见 [attemptStarted] / [finishTool]）；
 /// - 时钟是单调的 [Stopwatch]，页面切后台不停表：只停 tick，回前台按真实墙钟重算。
 class TurnClock {
   TurnClock({
     Duration Function()? now,
     this.tickInterval = const Duration(milliseconds: 100),
     this.hold = const Duration(seconds: 2),
-    this.deliveryGrace = const Duration(seconds: 3),
   }) : _now = now ?? _stopwatchNow();
 
   /// 只有这一枚小字监听它，页面和列表不随 tick 重建。
@@ -353,14 +350,16 @@ class TurnClock {
   /// 结束后冻结时长：够看清一眼，又不至于一直占着信息栏。
   final Duration hold;
 
-  /// 生成停了但外发还没落库时的等待上限（空回复、投递失败也要收表）。
-  final Duration deliveryGrace;
-
   final Duration Function() _now;
   final TurnPhaseLog _phases = TurnPhaseLog();
 
-  /// 本轮里哪些阶段是工具：`settled` 只收掉模型侧的阶段，工具仍在跑（异步产物还没回来）。
-  final Set<String> _toolPhases = <String>{};
+  /// 本轮还没被下一步收掉的工具阶段（`phase(tool: true)` 开，[finishTool] 关）。
+  /// 非空 = 工具（draw 等）还在执行；`settle` 不是这一轮的终点。
+  final Set<String> _openTools = <String>{};
+
+  /// `/live` 此刻有 attempt 在跑（快照 active / delta / tool-input / reasoning 开，
+  /// `settled` 或空 attempt 的快照关）。
+  bool _attemptActive = false;
 
   Duration? _start;
   Duration? _stopAt;
@@ -404,7 +403,8 @@ class TurnClock {
     _end = null;
     _previous = false;
     _phases.clear();
-    _toolPhases.clear();
+    _openTools.clear();
+    _attemptActive = false;
     _publish();
     _startTick();
   }
@@ -416,7 +416,7 @@ class TurnClock {
     if (!running) start();
     _stopAt = null;
     final normalized = normalizeTurnPhase(name);
-    if (tool) _toolPhases.add(normalized);
+    if (tool) _openTools.add(normalized);
     _phases.enter(_now(), normalized);
     _publish();
   }
@@ -447,6 +447,7 @@ class TurnClock {
         : _phases.current;
     if (target == null) return null;
     _phases.leave(_now(), target);
+    _openTools.remove(target);
     _publish();
     return target;
   }
@@ -459,8 +460,28 @@ class TurnClock {
     // 它的生命周期终点是下一个 step 开始，不能在这里被收掉。
     final now = _now();
     for (final name in _phases.activeNames.toList(growable: false)) {
-      if (!_toolPhases.contains(name)) _phases.leave(now, name);
+      if (!_openTools.contains(name)) _phases.leave(now, name);
     }
+    _attemptActive = false;
+    _publish();
+  }
+
+  /// `/live` 报「有 attempt 在跑」（active 快照 / delta / tool-input / reasoning）：
+  /// 这一轮还有活在干。表没开就先开表——帧本身就是「在跑」的证据。
+  /// 上一步的 `settle` 到此作废，终点重新等。
+  void attemptStarted() {
+    if (_frozen) return;
+    if (!running) start();
+    _attemptActive = true;
+    _stopAt = null;
+  }
+
+  /// attempt 结束（`agent/assistant-settled` / 空 attempt 的快照）：投递可能马上就到，
+  /// 让 `_maybeFinish` 试一次。工具还开着的话它照样不会收表。
+  void attemptEnded() {
+    if (!_attemptActive) return;
+    _attemptActive = false;
+    _maybeFinish();
     _publish();
   }
 
@@ -525,15 +546,20 @@ class TurnClock {
   void _maybeFinish() {
     final start = _start;
     if (start == null || _end != null) return;
+    // 还在干活就不收表：attempt 在跑，或工具（draw 等）还没把结果交回模型。
+    // `settle` 是「这一步说完了」，不是「这一轮结束了」——异步工具执行期间引擎
+    // 完全可以一个 attempt 都没有，按它收表会让骨架在等首个 token 时消失。
+    if (_attemptActive || _openTools.isNotEmpty) return;
+    // 终点必须有真实外发：本轮一条 bot 气泡都还没落库时，任何「停了」都不算终点。
     final end = resolveTurnEnd(
       stoppedAt: _stopAt,
       deliveredAt: _deliveredAt,
-      now: _now(),
-      grace: deliveryGrace,
     );
     if (end == null) return;
     _end = end;
     _phases.leaveAll(end);
+    _openTools.clear();
+    _attemptActive = false;
     _stopTick();
     _publish();
     _holdTimer?.cancel();
@@ -546,7 +572,8 @@ class TurnClock {
 
   void _startTick() {
     _tick ??= Timer.periodic(tickInterval, (_) {
-      // 停了但没有外发：过了等待期就在这里收表（空回复、投递失败）。
+      // 每拍都试一次收表：外发落库/工具收表可能来得比最后一个信号早，
+      // 条件齐了就在这一拍结束（见 [_maybeFinish]）。
       _maybeFinish();
       _publish();
     });

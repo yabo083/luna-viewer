@@ -48,15 +48,11 @@ void main() {
   });
 
   group('resolveTurnEnd', () {
-    const grace = Duration(seconds: 3);
-
     test('生成没停就没有终点', () {
       expect(
         resolveTurnEnd(
           stoppedAt: null,
           deliveredAt: const Duration(seconds: 5),
-          now: const Duration(seconds: 10),
-          grace: grace,
         ),
         isNull,
       );
@@ -69,8 +65,6 @@ void main() {
         resolveTurnEnd(
           stoppedAt: stoppedEarly,
           deliveredAt: deliveredLate,
-          now: const Duration(seconds: 10),
-          grace: grace,
         ),
         deliveredLate,
       );
@@ -78,32 +72,18 @@ void main() {
         resolveTurnEnd(
           stoppedAt: const Duration(seconds: 9),
           deliveredAt: const Duration(seconds: 7),
-          now: const Duration(seconds: 10),
-          grace: grace,
         ),
         const Duration(seconds: 9),
       );
     });
 
-    test('停了但一直没有外发：等满 grace 再按停止时刻收表', () {
-      const stopped = Duration(seconds: 9);
+    test('停了但一直没有外发：不算终点，等多久都不算', () {
       expect(
         resolveTurnEnd(
-          stoppedAt: stopped,
+          stoppedAt: const Duration(seconds: 9),
           deliveredAt: null,
-          now: const Duration(seconds: 11),
-          grace: grace,
         ),
         isNull,
-      );
-      expect(
-        resolveTurnEnd(
-          stoppedAt: stopped,
-          deliveredAt: null,
-          now: const Duration(seconds: 13),
-          grace: grace,
-        ),
-        stopped,
       );
     });
   });
@@ -184,6 +164,84 @@ void main() {
       expect(turn.running, isFalse);
       expect(turn.view.value?.total, const Duration(seconds: 8));
       expect(turn.view.value?.previous, isFalse);
+    });
+
+    test('attempt 还在跑时不收表：settle 与投递都到了也等它收尾', () {
+      var clock = Duration.zero;
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start();
+      turn.attemptStarted();
+      clock = const Duration(seconds: 4);
+      turn.delivered();
+      turn.stopped();
+      clock = const Duration(seconds: 10);
+      turn.stopped();
+      expect(turn.running, isTrue);
+      expect(turn.view.value?.finished, isFalse);
+
+      turn.attemptEnded();
+      expect(turn.running, isFalse);
+      expect(turn.view.value?.total, const Duration(seconds: 4));
+    });
+
+    test('draw 执行期间（settle 已到、下一步还没开）不收表', () {
+      var clock = Duration.zero;
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      clock = const Duration(milliseconds: 200);
+      turn.start();
+      turn.attemptStarted();
+      clock = const Duration(seconds: 3);
+      turn.phase('draw', tool: true);
+      turn.attemptEnded();
+      turn.stopped();
+      // 工具执行 + 轮询读到 running=false：整轮一个 attempt 都没有，但活还在干。
+      clock = const Duration(seconds: 90);
+      turn.stopped();
+      expect(turn.running, isTrue);
+      expect(turn.view.value?.finished, isFalse);
+      expect(
+        turn.view.value?.total,
+        const Duration(seconds: 90) - const Duration(milliseconds: 200),
+      );
+
+      // 下一步开跑：工具到下一个 step 才真的收表。
+      clock = const Duration(seconds: 92);
+      turn.attemptStarted();
+      turn.finishTool('draw');
+      expect(turn.view.value?.finished, isFalse);
+
+      clock = const Duration(seconds: 100);
+      turn.attemptEnded();
+      turn.delivered();
+      turn.stopped();
+      expect(turn.running, isFalse);
+      expect(
+        turn.view.value?.total,
+        const Duration(seconds: 100) - const Duration(milliseconds: 200),
+      );
+    });
+
+    test('本轮还没有外发时，停多久都不算终点', () {
+      var clock = Duration.zero;
+      final turn = TurnClock(now: () => clock);
+      addTearDown(turn.dispose);
+
+      turn.start();
+      clock = const Duration(seconds: 2);
+      turn.stopped();
+      clock = const Duration(minutes: 5);
+      turn.stopped();
+      expect(turn.running, isTrue);
+      expect(turn.view.value?.finished, isFalse);
+
+      clock = const Duration(minutes: 5, seconds: 1);
+      turn.delivered();
+      expect(turn.running, isFalse);
+      expect(turn.view.value?.total, const Duration(minutes: 5, seconds: 1));
     });
 
     test('真实一轮的事件序列（2026-11-19 实例 /steer 实测）算出 27.2s', () {

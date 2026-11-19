@@ -474,6 +474,10 @@ class TurnClockLabel extends StatelessWidget {
   /// 标签顶端比气泡边框高 8dp，命中区落在气泡内的部分仍有 44dp。
   static const double tapHeight = 52;
 
+  /// 标签盒子宽度恒定：`9.9s→10.0s`、`draw`→`draw +1` 都不许改尺寸。
+  /// 骑缝标签只要跟着读数变宽，整条骨架气泡的行宽就会跟着变，上一条消息看起来在跳。
+  static const double boxWidth = 132;
+
   final ValueListenable<TurnClockView?> clock;
 
   /// 本轮被中止：标签换成「已中止 12.4s」。
@@ -509,8 +513,7 @@ class TurnClockLabel extends StatelessWidget {
           child: Container(
             // 标签底色取聊天区底色，才能把 1px 描边压断。
             color: theme.scaffoldBackgroundColor,
-            // 固定最小宽度：`9.9s→10.0s` 或阶段名切换时不挤动骑缝位置。
-            constraints: const BoxConstraints(minWidth: 96),
+            width: boxWidth,
             padding: const EdgeInsets.symmetric(horizontal: 6),
             child: ValueListenableBuilder<TurnClockView?>(
               valueListenable: clock,
@@ -520,12 +523,19 @@ class TurnClockLabel extends StatelessWidget {
                     ? '阶段明细'
                     : '阶段明细 ${turnLineLabel(view, aborted: aborted)}',
                 excludeSemantics: true,
-                child: Text(
-                  view == null
-                      ? ''
-                      : turnLineLabel(view, aborted: aborted),
-                  maxLines: 1,
-                  style: style,
+                // 定宽盒子里让文字自己缩：读数比盒子长时整体等比缩小，
+                // 既不裁掉数字，也不把布局推出去。
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    view == null
+                        ? ''
+                        : turnLineLabel(view, aborted: aborted),
+                    maxLines: 1,
+                    softWrap: false,
+                    style: style,
+                  ),
                 ),
               ),
             ),

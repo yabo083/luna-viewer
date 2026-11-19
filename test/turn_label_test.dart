@@ -23,6 +23,40 @@ void main() {
     expect(taps, 1);
   });
 
+  testWidgets('读数变长变短都不改标签尺寸：盒子宽度恒定，文字缩在里面', (tester) async {
+    final clock = ValueNotifier<TurnClockView?>(
+      const TurnClockView(
+        total: Duration(milliseconds: 9900),
+        phase: '思考',
+        phaseElapsed: Duration(milliseconds: 9900),
+      ),
+    );
+    addTearDown(clock.dispose);
+    await tester.pumpWidget(
+      _host(TurnClockLabel(clock: clock, onTap: () {})),
+    );
+    final narrow = tester.getSize(find.byType(TurnClockLabel));
+
+    // `9.9s` → `1m04s`、单阶段 → 多阶段：文字从 14 字长到 20 字。
+    clock.value = const TurnClockView(
+      total: Duration(seconds: 64),
+      phase: 'draw',
+      active: [
+        TurnPhaseRecord('draw', Duration(milliseconds: 21600)),
+        TurnPhaseRecord('reply', Duration(milliseconds: 12300)),
+      ],
+    );
+    await tester.pump();
+
+    expect(narrow.width, TurnClockLabel.boxWidth);
+    expect(tester.getSize(find.byType(TurnClockLabel)), narrow);
+    // 长读数没有被裁掉，还在盒子里等比缩小显示。
+    expect(find.textContaining('1m04s · draw 21.6s'), findsOneWidget);
+    final label = tester.widget<Text>(find.textContaining('1m04s'));
+    expect(label.maxLines, 1);
+    expect(label.softWrap, isFalse);
+  });
+
   testWidgets('没有读数时标签为空，也不拦点击', (tester) async {
     final clock = ValueNotifier<TurnClockView?>(null);
     addTearDown(clock.dispose);

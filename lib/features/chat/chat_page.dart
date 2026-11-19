@@ -1326,7 +1326,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 // 空 attempt 的权威快照 = 这一轮已经停了，交给终点判定等最后的投递。
                 if (event.active) {
                   _clock.start();
+                  _clock.attemptStarted();
                 } else {
+                  // 空 attempt 是权威的「这一刻没有生成在跑」，但只有这一步说完了：
+                  // 工具可能正在执行、下一步还没开，终点仍由计时表自己把门（见 TurnClock）。
+                  _clock.attemptEnded();
                   _clock.stopped();
                 }
                 // 快照里有正文就是「回复中」，否则还在思考/工具阶段。
@@ -1340,6 +1344,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _followIfAtBottom();
               case LiveEventKind.delta:
                 _snapshotTimer?.cancel();
+                _clock.attemptStarted();
                 // 正文到了：模型已经回到说话，任何在跑的工具到此为止。
                 _closeOpenTools();
                 _clock.endPhase(thinkingPhase);
@@ -1356,6 +1361,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
               case LiveEventKind.reasoning:
                 // 只有思考、没有正文：停在「思考中」；正文一到就转「回复中」。
                 _snapshotTimer?.cancel();
+                _clock.attemptStarted();
                 _closeOpenTools();
                 _clock.phase(thinkingPhase);
                 if (_streaming.isEmpty) _setLive(LiveState.thinking);
@@ -1363,6 +1369,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _snapshotTimer?.cancel();
                 // 模型开始吐工具参数：这次调用的阶段从这里开表，思考让位。
                 // 收表点不是 `tool-result`，而是模型下一步真的开始（见 [_closeOpenTools]）。
+                _clock.attemptStarted();
                 _clock.endPhase(thinkingPhase);
                 final tool = event.toolName;
                 final name = (tool == null || tool.isEmpty) ? 'tool' : tool;
@@ -1381,6 +1388,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _snapshotTimer?.cancel();
                 // 转后台不在这里猜：同步工具也是先 settle 再执行，客户端无从判断。
                 // 真正的后台任务完成时，服务端自己会发 `[background …]` 中间块。
+                _clock.attemptEnded();
                 _clock.attemptSettled();
                 _flushTimer?.cancel();
                 _flushTimer = null;
@@ -1546,6 +1554,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       case 'prompt':
         // 每个 step 开始都会打一条：新的 step = 上一步的工具真的走完了。
         _clock.start(lead: lead);
+        _clock.attemptStarted();
         _closeOpenTools();
         _clock.phase(thinkingPhase);
       case 'engine/activity':
@@ -1553,13 +1562,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         switch (data['label']) {
           case 'prepare' || 'generate':
             _clock.start(lead: lead);
+            _clock.attemptStarted();
             _closeOpenTools();
             _clock.phase(thinkingPhase);
           case 'deliver':
             _closeOpenTools();
             _clock.phase(replyPhase);
           case 'settle':
-            // 引擎这一轮收尾 = running=false 的最早证据；投递那条由 `chat/delivered` 补。
+            // 引擎这一步收尾 = running=false 的最早证据；投递那条由 `chat/delivered` 补。
+            // 异步工具（draw）可能正在跑，下一步几分钟后才开——这里只记「停了」，
+            // 收表由计时表按「外发已落库 + 没有 attempt/工具在跑」自己判定。
+            _clock.attemptEnded();
             _clock.stopped();
         }
       case 'chat/delivered':
@@ -1569,6 +1582,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         // 输入被 agent 收下 / 请求已装配：这一轮真的开跑了（也是中止冻结的解锁点）。
         // 开表后立刻挂「思考」：`engine/activity prepare` 可能先于解锁到达、被冻结点掉。
         _clock.start(lead: lead, force: true);
+        _clock.attemptStarted();
         _closeOpenTools();
         _clock.phase(thinkingPhase);
     }
@@ -2034,45 +2048,43 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// 列表首格：流式正文。只有这一格监听 delta，整页不随 token 重建。
   /// 阶段与耗时由末尾的骨架气泡承担，这里不再画「思考中」胶囊。
-  Widget _liveSlot(ThemeData theme) => Padding(
-    padding: const EdgeInsets.only(top: 16),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        if (_live.generating)
-          ValueListenableBuilder<String>(
-            valueListenable: _streamingText,
-            builder: (context, text, _) => text.isEmpty
-                ? const SizedBox.shrink()
-                : Align(
-                    alignment: Alignment.centerRight,
-                    child: Container(
-                      margin: const EdgeInsets.only(top: 6),
-                      constraints: BoxConstraints(
-                        maxWidth: MediaQuery.sizeOf(context).width * 0.86 - 36,
-                      ),
-                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.primary,
-                        borderRadius: const BorderRadius.only(
-                          topLeft: Radius.circular(16),
-                          topRight: Radius.circular(4),
-                          bottomLeft: Radius.circular(16),
-                          bottomRight: Radius.circular(16),
-                        ),
-                      ),
-                      child: SelectableText(
-                        text,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          height: 1.5,
-                          color: theme.colorScheme.onPrimary,
-                        ),
-                      ),
-                    ),
+  ///
+  /// 没有正文时这一格是 **0 高**：每个 step 的 `settled` 都会把 `_live` 打回待机、
+  /// 下一步再点亮。空着也占一条 16dp padding 的话，整段消息会在每个 step 边界
+  /// 上下跳 16dp——用户看到的就是「上一条消息被挤动」。
+  Widget _liveSlot(ThemeData theme) => ValueListenableBuilder<String>(
+    valueListenable: _streamingText,
+    builder: (context, text, _) => text.isEmpty
+        ? const SizedBox.shrink()
+        : Padding(
+            padding: const EdgeInsets.only(top: 16),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Container(
+                margin: const EdgeInsets.only(top: 6),
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.sizeOf(context).width * 0.86 - 36,
+                ),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primary,
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(16),
+                    topRight: Radius.circular(4),
+                    bottomLeft: Radius.circular(16),
+                    bottomRight: Radius.circular(16),
                   ),
+                ),
+                child: SelectableText(
+                  text,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    height: 1.5,
+                    color: theme.colorScheme.onPrimary,
+                  ),
+                ),
+              ),
+            ),
           ),
-      ],
-    ),
   );
 
   @override
