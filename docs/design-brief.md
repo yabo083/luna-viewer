@@ -1,17 +1,19 @@
 # ChatLuna Mobile · 界面美化设计指导稿
 
-> 递交对象：Gemini 3.8 Flash（反重力 / Antigravity），**具备仓库读写能力的 agent**。
+> 递交对象：Gemini 3.8 Flash（反重力 / Antigravity），**只读模式**。
 > 工作目录：`E:\Codes\AI\projects\chatluna-mobile`（Flutter 工程，git 已初始化）。
-> 产出目标：主交付是**可直接落地的视觉改进**（改代码，不是只写建议）；同时**不限制评审范围**——读代码后对性能、架构、可维护性、可测试性提出独立判断，不要求你只谈视觉。
+> 产出目标：读完代码后给出**可落地的改进建议**，由本地负责实施。**不要修改任何文件、不要提交、不要格式化**。
+
+> **只读硬约束**：允许读文件、检索、`flutter analyze` / `flutter test`（只读检查）；禁止 `edit`/`write`/`git commit`/`dart format`/`flutter build`/依赖变更。你的产出是**文本**：诊断、规格、代码片段（放在回复里，不落盘）。
 
 ## 0. 开工须知（先做这几步）
 
 1. 读仓库根 `AGENTS.md`、`docs/ui-spec.md`、`docs/design-brief.md`（本文件）。
 2. 读 `lib/main.dart`（主题）、`lib/features/sessions/`、`lib/features/chat/{chat_page,chat_chrome,message_view}.dart`、`lib/core/model/models.dart`。
-3. 视觉改动前后各跑一次 `flutter analyze` 与 `flutter test`；**不要**跑 `flutter build apk`（真机构建由本地负责，单轮 30 s，别浪费）。
-4. 不加第三方依赖（含 UI 包/图标包/字体包）。不改 Android 工程配置。
-5. 改完按主题分批提交，提交信息用 `design:` 前缀，正文说明「改了什么/为什么/怎么验」。
-6. 不确定现有行为时，先读代码或问我，不猜；猜测必须在交付里标注为推测。
+3. 可以跑 `flutter analyze` / `flutter test` 验证你对现状的判断；**不要**跑 `flutter build apk`（真机构建由本地负责，单轮 30 s）。
+4. 不要新增依赖（含 UI 包/图标包/字体包），不要改 Android 工程配置——这些由本地实施。
+5. 建议按「批次」组织：每批一个主题（配色 / 字体 / 气泡 / 状态表达…），批内给出改动清单与验收点，便于逐批落地。
+6. 不确定现有行为时，先读代码或直接问，不猜；猜测必须在建议里标注为推测。
 
 ---
 
@@ -99,8 +101,8 @@ ChatLuna Mobile 是 ChatLuna v2 的 Android 客户端（Flutter，arm64，个人
 ### C. 线框
 每类屏用 ASCII 或 inline SVG 给出「改前 → 改后」的对照线框，标注关键间距（如 `12`、`8`）；不要截图。
 
-### D. Flutter 片段
-关键改动给最小可粘贴代码，例如：
+### D. Flutter 片段（作为建议，不落盘）
+关键改动给最小可粘贴代码，注明改哪个文件、替换哪段，例如：
 ```dart
 ThemeData _theme(Brightness b) {
   // 你的 token 落地
@@ -115,7 +117,7 @@ ThemeData _theme(Brightness b) {
 
 ## 6. 边界（视觉方案必须遵守；评审意见不受此限）
 
-**改代码时**必须保住：
+**落地方案**（由本地实施）必须保住：
 - 信息架构、页面路由、交互流程、文案含义
 - 功能行为（实时流、计时语义、中止逻辑）
 - 无障碍：点击目标 ≥ 44dp，正文对比度 ≥ 4.5:1（light 下建议 7:1）
