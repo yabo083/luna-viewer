@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 — 2026-11-21
+
+- 修复捕获快照落盘的瞬时内存峰值：先按条计量、把最旧消息丢到 5 MiB 预算内，再只序列化一次。旧实现每丢 20 条就全量 `JSON.stringify`，97.7 MB 语料下单次 flush 峰值 968 MB / 3.86 s，新实现 159 MB / 0.30 s（本机实测，单条文本 turn 的 worker 峰值从 3.16 GiB 降到 471 MiB）。
+
 ## Unreleased · 视觉重做
 
 - 引入语义 token（`lib/core/design/app_tokens.dart`）：分层 surface、内敛外发气泡、四档字阶、4dp 间距、圆角阶梯；主题注入 `AppColors` extension
