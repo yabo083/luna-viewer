@@ -26,10 +26,14 @@ jobs:
         run: npm install -g npm@latest && npm --version
 
       - name: Publish (OIDC, no token)
+        env:
+          # The source repo is private; npm rejects provenance attestations from
+          # private repositories even for public packages. OIDC auth still works.
+          NPM_CONFIG_PROVENANCE: 'false'
         run: |
           version=$(node -p "require('./package.json').version")
           if npm view "chatluna-plugin-media-bridge@$version" version >/dev/null 2>&1; then
             echo "$version is already on the registry; skipping"
           else
-            npm publish --access public --provenance
+            npm publish --access public
           fi
