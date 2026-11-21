@@ -1,6 +1,6 @@
 {
   "name": "chatluna-plugin-media-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Platform message store and authenticated workspace file bridge for ChatLuna v2 mobile clients.",
   "type": "module",
   "main": "index.mjs",

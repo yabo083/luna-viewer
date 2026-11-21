@@ -1437,22 +1437,33 @@ export function apply(ctx) {
   }
 
   // 体积上限 5MB：超了先丢最旧的捕获消息（日志那份还在 DB 里，丢了也能重读）。
+  // chatluna:capture-budget — measure per-message size before the first stringify.
+  // The old loop re-serialized the whole snapshot once per 20 dropped messages.
   const captureJson = (snapshot) => {
-    let json = JSON.stringify(snapshot)
-    if (Buffer.byteLength(json) <= CAPTURE_MAX_BYTES) return json
     const entries = []
+    let bytes = 0
     for (const conversation of snapshot.conversations) {
-      for (const message of conversation.messages) entries.push({ conversation, message })
-    }
-    entries.sort((a, b) => a.message.time - b.message.time)
-    let index = 0
-    while (Buffer.byteLength(json) > CAPTURE_MAX_BYTES && index < entries.length) {
-      for (let step = 0; step < 20 && index < entries.length; step += 1, index += 1) {
-        const { conversation, message } = entries[index]
-        conversation.messages = conversation.messages.filter((candidate) => candidate !== message)
+      for (const message of conversation.messages) {
+        const size = Buffer.byteLength(JSON.stringify(message)) + 48
+        entries.push({ conversation, message, size })
+        bytes += size
       }
-      json = JSON.stringify(snapshot)
     }
+    const budget = CAPTURE_MAX_BYTES - 256 * 1024
+    if (bytes > budget) {
+      entries.sort((a, b) => a.message.time - b.message.time)
+      const drop = new Set()
+      let excess = bytes - budget
+      for (const entry of entries) {
+        if (excess <= 0) break
+        drop.add(entry.message)
+        excess -= entry.size
+      }
+      for (const conversation of snapshot.conversations) {
+        conversation.messages = conversation.messages.filter((message) => !drop.has(message))
+      }
+    }
+    let json = JSON.stringify(snapshot)
     while (Buffer.byteLength(json) > CAPTURE_MAX_BYTES && snapshot.conversations.length > 1) {
       snapshot.conversations.pop()
       json = JSON.stringify(snapshot)
